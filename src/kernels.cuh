@@ -242,10 +242,9 @@ __device__ __forceinline__ void c_to_a(uint32_t (&a)[4][4], const float (&c)[8][
 constexpr int GBK = 32;
 __device__ __forceinline__ int sw32(int r, int c) { return r * 32 + ((c ^ ((r >> 1) & 3)) << 3); }  // 64-byte rows
 
-// acc += A[bm.., :K] * B^T where B tile row r is row brow(r) of B [.][K] (TN, both row-major with K columns).
-template <int BM, int WM, int K, int STAGES, class BRow>
-__device__ __forceinline__ void gemm_tn_loop(float (&acc)[WM / 16][8][4], const bf16* A, int bm, const bf16* B, BRow brow,
-                                             bf16* sm) {
+// acc += A[bm.., :K] * B[:64, :K]^T (TN, both row-major with K columns); B points at the block's first row of B.
+template <int BM, int WM, int K, int STAGES>
+__device__ __forceinline__ void gemm_tn_loop(float (&acc)[WM / 16][8][4], const bf16* A, int bm, const bf16* B, bf16* sm) {
     constexpr int TH = BM / WM * 32, KT = K / GBK;
     static_assert(K % GBK == 0 && KT >= STAGES - 1, "pipeline depth");
     bf16 *as = sm, *bs = sm + STAGES * BM * GBK;
@@ -254,7 +253,7 @@ __device__ __forceinline__ void gemm_tn_loop(float (&acc)[WM / 16][8][4], const 
         for (int i = threadIdx.x; i < BM * 4; i += TH)
             cp16(as + st * BM * GBK + sw32(i >> 2, i & 3), A + (size_t)(bm + (i >> 2)) * K + kt * GBK + (i & 3) * 8);
         for (int i = threadIdx.x; i < 64 * 4; i += TH)
-            cp16(bs + st * 64 * GBK + sw32(i >> 2, i & 3), B + (size_t)brow(i >> 2) * K + kt * GBK + (i & 3) * 8);
+            cp16(bs + st * 64 * GBK + sw32(i >> 2, i & 3), B + (size_t)(i >> 2) * K + kt * GBK + (i & 3) * 8);
     };
 #pragma unroll
     for (int st = 0; st < STAGES - 1; st++) {
@@ -335,7 +334,7 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
     __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
     const int bm = blockIdx.y * GBM, u = blockIdx.x;
     float acc[GWM / 16][8][4] = {};
-    gemm_tn_loop<GBM, GWM, DIM, GST>(acc, x, bm, w, [&](int r) { return u * 64 + r; }, sm);
+    gemm_tn_loop<GBM, GWM, DIM, GST>(acc, x, bm, w + (size_t)u * 64 * DIM, sm);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
     const bool rot = u < HEADS + KV_HEADS;
 #pragma unroll
