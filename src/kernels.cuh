@@ -7,7 +7,7 @@ typedef __nv_bfloat16 bf16;
 typedef __nv_bfloat162 bf162;
 
 static_assert(DIM % 64 == 0 && FFN % 8 == 0 && HEAD_DIM % 16 == 0, "vector widths");
-static_assert(T % ATT_TILE == 0 && VOCAB % (CE_THREADS * 8) == 0, "no tail handling");
+static_assert(T % 64 == 0 && VOCAB % (CE_THREADS * 8) == 0, "no tail handling");
 
 constexpr float LOG2E = 1.4426950408889634f;
 
@@ -145,7 +145,7 @@ __global__ void colsum(float* out, const float* rows) {
 // ---- Tensor cores: mma.sync m16n8k16, bf16 inputs, fp32 accumulate ----
 // Fragments (PTX ISA), lane = 4g + t. A 16x16: {row g, col 2t..}, {g+8, 2t}, {g, 8+2t}, {g+8, 8+2t}.
 // B 16x8 (k x n): {k 2t.., n g}, {k 8+2t.., n g}. C 16x8: {row g, col 2t, 2t+1}, {row g+8, col 2t, 2t+1}.
-static_assert(HEAD_DIM == 64 && ATT_TILE == 64, "attention kernels are written for 64x64 tiles");
+static_assert(HEAD_DIM == 64, "attention kernels are written for 64x64 tiles");
 
 __device__ __forceinline__ uint32_t smem_addr(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 
