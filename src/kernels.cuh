@@ -758,43 +758,98 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd(float* gemb, const float* d
     *g = {cur.x + acc.x, cur.y + acc.y, cur.z + acc.z, cur.w + acc.w};
 }
 
-// Fused AdamW, same math as PyTorch's fused kernel (fp32), then refreshes the bf16 working copy.
-// 4 parameters per thread (memory-bound). Grads come from gmat (bf16 matrices) or gvec (fp32 embedding, norms),
-// following the parameter layout in train.cu.
+// AdamW, same math as PyTorch's fused kernel (fp32). bc1 = 1 - beta1^step, bc2_sqrt = sqrt(1 - beta2^step).
+__device__ __forceinline__ void adamw_update(float& p, float& m, float& v, float g, float bc1, float bc2_sqrt) {
+    p -= LR * WEIGHT_DECAY * p;
+    m = fmaf(BETA1, m, fmaf(-BETA1, g, g));
+    v = fmaf(BETA2, v, fmaf(-BETA2, g * g, g * g));
+    p -= (LR / bc1) * m / (sqrtf(v) / bc2_sqrt + ADAM_EPS);
+}
+
 __global__ void next_step(float* step) { *step += 1.f; }
 
-__global__ void adamw(float* p, bf16* pb, const bf16* gmat, const float* gvec, float* m, float* v,
-                      const float* step_count) {
-    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, j = 4 * i;
-    if (j >= P_TOTAL) return;
-    float4 G;
-    if (j < P_EMBED) {
-        G = *(const float4*)(gvec + j);
-    } else if (j >= P_EMBED + LAYERS * P_LAYER) {
-        G = *(const float4*)(gvec + G_VEC - DIM + (j - P_EMBED - LAYERS * P_LAYER));
-    } else {
-        const size_t l = (j - P_EMBED) / P_LAYER, o = (j - P_EMBED) % P_LAYER;
-        if (o < P_MAT) {
-            const uint2 u = *(const uint2*)(gmat + l * P_MAT + o);
-            const float2 a = __bfloat1622float2(*(const bf162*)&u.x), b = __bfloat1622float2(*(const bf162*)&u.y);
-            G = {a.x, a.y, b.x, b.y};
-        } else {
-            G = *(const float4*)(gvec + P_EMBED + l * 2 * DIM + (o - P_MAT));
+// AdamW for the fp32-grad parameters (embedding, norm weights; gvec layout), 4 per thread. The weight matrices are
+// updated inside their dW GEMMs (dw_adamw). Also refreshes the bf16 working copy.
+__global__ void adamw_vec(float* p, bf16* pb, const float* gvec, float* m, float* v, const float* step_count) {
+    const size_t j = 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
+    if (j >= G_VEC) return;
+    size_t o;  // parameter offset of gvec[j]
+    if (j < P_EMBED) o = j;
+    else if (j < G_VEC - DIM) o = P_EMBED + (j - P_EMBED) / (2 * DIM) * P_LAYER + P_MAT + (j - P_EMBED) % (2 * DIM);
+    else o = P_TOTAL - DIM + (j - (G_VEC - DIM));
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    float4 P = *(float4*)(p + o), G = *(const float4*)(gvec + j), M = *(float4*)(m + o), V = *(float4*)(v + o);
+    adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
+    adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+    adamw_update(P.z, M.z, V.z, G.z, bc1, bc2_sqrt);
+    adamw_update(P.w, M.w, V.w, G.w, bc1, bc2_sqrt);
+    *(float4*)(p + o) = P;
+    *(float4*)(m + o) = M;
+    *(float4*)(v + o) = V;
+    *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
+}
+
+// dW = dY^T X for one weight matrix W [OUT][IN]: reduction over the N tokens with both operands token-major, so both
+// come through ldmatrix.trans. The AdamW update is fused into the epilogue: the grad, rounded to bf16 like PyTorch's
+// dW, updates master, moments and the bf16 copy of W in place while other blocks are still multiplying.
+// gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; 4-stage cp.async.
+constexpr int DW_ST = 4;
+template <int OUT, int IN>
+__global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
+                                                const bf16* X, const float* step_count) {
+    static_assert(OUT % 64 == 0 && IN % 64 == 0 && N % GBK == 0, "whole dW tiles");
+    constexpr int KT = N / GBK;
+    __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
+    bf16 *as = sm, *bs = sm + DW_ST * GBK * 64;  // [GBK tokens][64] tiles of dY and X, 128-byte swizzled rows
+    const int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * 16;
+    auto load = [&](int kt, int st) {
+        for (int i = threadIdx.x; i < GBK * 8; i += 128) {
+            const size_t row = kt * GBK + (i >> 3);
+            cp16(as + st * GBK * 64 + swz(i >> 3, i & 7), dY + row * OUT + bm + (i & 7) * 8);
+            cp16(bs + st * GBK * 64 + swz(i >> 3, i & 7), X + row * IN + bn + (i & 7) * 8);
+        }
+    };
+    float acc[8][4] = {};
+#pragma unroll
+    for (int st = 0; st < DW_ST - 1; st++) {
+        load(st, st);
+        cp_commit();
+    }
+    for (int kt = 0; kt < KT; kt++) {
+        cp_wait<DW_ST - 2>();
+        __syncthreads();
+        if (kt + DW_ST - 1 < KT) load(kt + DW_ST - 1, (kt + DW_ST - 1) % DW_ST);
+        cp_commit();
+        const bf16 *a = as + (kt % DW_ST) * GBK * 64, *b = bs + (kt % DW_ST) * GBK * 64;
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            uint32_t af[4];
+            ldsm4t(af, a + swz(16 * kk + (lane & 7) + ((lane >> 4) << 3), wm0 / 8 + ((lane >> 3) & 1)));
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                uint32_t r[4];
+                ldsm4t(r, b + swz(16 * kk + (lane & 15), 2 * q + (lane >> 4)));
+                mma(acc[2 * q], af, r[0], r[1]);
+                mma(acc[2 * q + 1], af, r[2], r[3]);
+            }
         }
     }
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
-    float4 P = ((float4*)p)[i], M = ((float4*)m)[i], V = ((float4*)v)[i];
-    float *pp = &P.x, *gg = &G.x, *mm = &M.x, *vv = &V.x;
 #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        float pi = pp[k], gi = gg[k];
-        pi -= LR * WEIGHT_DECAY * pi;
-        mm[k] = fmaf(BETA1, mm[k], fmaf(-BETA1, gi, gi));
-        vv[k] = fmaf(BETA2, vv[k], fmaf(-BETA2, gi * gi, gi * gi));
-        pp[k] = pi - (LR / bc1) * mm[k] / (sqrtf(vv[k]) / bc2_sqrt + ADAM_EPS);
-    }
-    ((float4*)p)[i] = P;
-    ((float4*)m)[i] = M;
-    ((float4*)v)[i] = V;
-    ((uint2*)pb)[i] = {pack2(P.x, P.y), pack2(P.z, P.w)};
+    for (int r = 0; r < 2; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const size_t o = (size_t)(bm + wm0 + g + 8 * r) * IN + bn + 8 * j + 2 * t;
+            const bf162 gb = __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
+            if (gout) *(bf162*)(gout + o) = gb;
+            const float2 gf = __bfloat1622float2(gb);
+            float2 P = *(float2*)(p + o), M = *(float2*)(m + o), V = *(float2*)(v + o);
+            adamw_update(P.x, M.x, V.x, gf.x, bc1, bc2_sqrt);
+            adamw_update(P.y, M.y, V.y, gf.y, bc1, bc2_sqrt);
+            *(float2*)(p + o) = P;
+            *(float2*)(m + o) = M;
+            *(float2*)(v + o) = V;
+            *(bf162*)(pb + o) = __floats2bfloat162_rn(P.x, P.y);
+        }
 }

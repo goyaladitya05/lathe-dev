@@ -187,6 +187,7 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         g, u = (t.clone().requires_grad_() for t in d[f"L{l}.gu"].cuda().chunk(2, -1))
         (F.silu(g) * u).backward((dmo @ wdown).to(torch.bfloat16))  # bf16 dact, then PyTorch's bf16 backward
         check("matmul down dX + swiglu bwd", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
+        check("matmul down dW", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), KERNEL_TOL)
         check("matmul gate|up dX", rel(f("dln2"), f("dgu") @ wgu), KERNEL_TOL)
         gate, up = (f("dgu").T @ f("ln2")).chunk(2)
         check("matmul gate|up dW", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),

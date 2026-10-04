@@ -318,8 +318,16 @@ static void backward(State& s, const Lins& L, FILE* df) {
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l);
-        bf16* gm = s.gmat + l * P_MAT;
-        const LayerP<bf16> gr = {gm, gm + P_QKV, gm + P_QKV + P_O, gm + P_QKV + P_O + P_GU, nullptr, nullptr};
+        bf16* gm = s.gmat + l * P_MAT;  // matrix grads are only stored when dumping (tests)
+        const LayerP<bf16> gr = df ? LayerP<bf16>{gm, gm + P_QKV, gm + P_QKV + P_O, gm + P_QKV + P_O + P_GU, nullptr, nullptr}
+                                   : LayerP<bf16>{};
+        // dW of one weight matrix of this layer (at layer offset off) with its AdamW update fused in. Each runs
+        // after the matrix's dX GEMM, the last reader of the old weights in this step.
+        auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
+            const size_t o = P_EMBED + l * P_LAYER + off;
+            kernel<<<dim3(in / 64, out / 64), 128, 0, stream>>>(s.master + o, s.params + o, s.m + o, s.v + o, gout, dy, x,
+                                                               s.step);
+        };
         float* gln = s.gvec + P_EMBED + l * 2 * DIM;
         float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
         bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
@@ -330,16 +338,16 @@ static void backward(State& s, const Lins& L, FILE* df) {
 
         put("dres_out", g.dres, 1, DIM);
         down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
-        gemm(s, L.down.dw, gr.down, act, g.dres_bf);
+        dw(dw_adamw<DIM, FFN>, DIM, FFN, P_QKV + P_O + P_GU, gr.down, g.dres_bf, act);
         put("dgu", g.dgu, 0, 2 * FFN);
         gemm(s, L.gu.dx, g.dln, w.gu, g.dgu);
-        gemm(s, L.gu.dw, gr.gu, ln2, g.dgu);
+        dw(dw_adamw<2 * FFN, DIM>, 2 * FFN, DIM, P_QKV + P_O, gr.gu, g.dgu, ln2);
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         put("dres_mid", g.dres, 1, DIM);
         gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
-        gemm(s, L.o.dw, gr.o, att, g.dres_bf);
+        dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
         put("datt", g.datt, 0, DIM);
         attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
         attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.part, qkv, g.datt, lse, g.dsum);
@@ -347,7 +355,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
                                                                                                        s.rope);
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
-        gemm(s, L.qkv.dw, gr.qkv, ln1, g.dqkv);
+        dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
@@ -358,14 +366,15 @@ static void backward(State& s, const Lins& L, FILE* df) {
     CK(cudaGetLastError());
 }
 
+// Weight matrices are updated by AdamW inside backward (dw_adamw); embedding and norm weights after it.
 static void train_step(State& s, const Lins& L, FILE* df) {
+    next_step<<<1, 1, 0, stream>>>(s.step);
     forward(s, L, df);
     backward(s, L, df);
     dump(df, "gmat", s.gmat, 0, 1, LAYERS * P_MAT);
     dump(df, "gvec", s.gvec, 1, 1, G_VEC);
-    static_assert(P_TOTAL % 4 == 0, "adamw works on float4");
-    next_step<<<1, 1, 0, stream>>>(s.step);
-    adamw<<<cdiv(P_TOTAL / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gmat, s.gvec, s.m, s.v, s.step);
+    static_assert(G_VEC % 4 == 0, "adamw_vec works on float4");
+    adamw_vec<<<cdiv(G_VEC / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gvec, s.m, s.v, s.step);
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
     dump(df, "params", s.params, 0, 1, P_TOTAL);
