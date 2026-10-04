@@ -25,6 +25,13 @@
 #include "targets/sm89.h"
 
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
+// lm_head + cross entropy run over NCHUNK vocab chunks of VCHUNK, each [N][VCHUNK] chunk sized for half of L2.
+constexpr int ce_chunks() {
+    int c = 1;
+    while ((size_t)N * (VOCAB / c) * 2 > L2_BYTES / 2 || VOCAB % c) c *= 2;
+    return c;
+}
+constexpr int NCHUNK = ce_chunks(), VCHUNK = VOCAB / NCHUNK;
 // AdamW, same as ref/model.py make_optimizer.
 constexpr float LR = 3e-4f, BETA1 = 0.9f, BETA2 = 0.95f, ADAM_EPS = 1e-8f, WEIGHT_DECAY = 0.1f;
 #include "kernels.cuh"
@@ -84,7 +91,9 @@ struct Acts {
     bf16* act;        // [LAYERS][N][FFN]
     bf16* lnf;        // [N][DIM]
     bf16* branch;     // [N][DIM] o_proj / down_proj output before the residual add (scratch)
-    bf16* logits;     // [N][VOCAB], overwritten with dlogits by cross_entropy
+    bf16* chunk;      // [N][VCHUNK] logits of one vocab chunk, turned into dlogits in place in backward
+    float2* ce_stats;  // [NCHUNK][N] per-chunk (max, sum exp)
+    float *ce_xt, *ce_lse;  // [N] target logit, full-row logsumexp
     float* losses;    // [N]
     float* loss;      // [1] mean
     int* io;          // [IO_INTS]
@@ -95,6 +104,7 @@ struct Bwd {
     float* dres;     // [N][DIM] grad of the residual stream
     bf16* dres_bf;   // [N][DIM] bf16 copy: grad into the branch outputs
     bf16* dln;       // [N][DIM] grad of a norm output
+    float* dlnf;     // [N][DIM] grad of the final norm output, fp32 sum over vocab chunks
     bf16* datt;      // [N][DIM]
     bf16* dqkv;      // [N][QKV_DIM]
     bf16* dgu;       // [N][2*FFN]
@@ -149,7 +159,10 @@ static void carve(Arena& ar, State& s) {
     a.act = ar.take<bf16>((size_t)LAYERS * N * FFN);
     a.lnf = ar.take<bf16>(ND);
     a.branch = ar.take<bf16>(ND);
-    a.logits = ar.take<bf16>((size_t)N * VOCAB);
+    a.chunk = ar.take<bf16>((size_t)N * VCHUNK);
+    a.ce_stats = ar.take<float2>((size_t)NCHUNK * N);
+    a.ce_xt = ar.take<float>(N);
+    a.ce_lse = ar.take<float>(N);
     a.losses = ar.take<float>(N);
     a.loss = ar.take<float>(1);
     a.io = ar.take<int>(IO_INTS);
@@ -157,6 +170,7 @@ static void carve(Arena& ar, State& s) {
     g.dres = ar.take<float>(ND);
     g.dres_bf = ar.take<bf16>(ND);
     g.dln = ar.take<bf16>(ND);
+    g.dlnf = ar.take<float>(ND);
     g.datt = ar.take<bf16>(ND);
     g.dqkv = ar.take<bf16>((size_t)N * QKV_DIM);
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
@@ -200,19 +214,19 @@ static Gemm make_gemm(bool ta, bool tb, int m, int n, int k, cudaDataType_t dtyp
     return g;
 }
 
-static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf16* b) {
+static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf16* b, bool accumulate = false) {
     const float one = 1.f, zero = 0.f;
-    CKB(cublasLtMatmul(lt, g.desc, &one, a, g.a, b, g.b, &zero, d, g.d, d, g.d, &g.algo, s.workspace,
-                       CUBLAS_WORKSPACE, stream));
+    CKB(cublasLtMatmul(lt, g.desc, &one, a, g.a, b, g.b, accumulate ? &one : &zero, d, g.d, d, g.d, &g.algo,
+                       s.workspace, CUBLAS_WORKSPACE, stream));
 }
 
 // Linear y = x W^T, W [out][in] row-major, x/y [N][features] row-major.
 struct Lin {
     Gemm fwd, dx, dw;
 };
-static Lin make_lin(int out, int in) {
+static Lin make_lin(int out, int in, cudaDataType_t dx_type = CUDA_R_16BF) {
     return {make_gemm(true, false, out, N, in, CUDA_R_16BF),   // y[N][out] = x W^T      (A = W, B = x)
-            make_gemm(false, false, in, N, out, CUDA_R_16BF),  // dx[N][in] = dy W       (A = W, B = dy)
+            make_gemm(false, false, in, N, out, dx_type),      // dx[N][in] = dy W       (A = W, B = dy)
             make_gemm(false, true, in, out, N, CUDA_R_32F)};   // dW[out][in] = dy^T x   (A = x, B = dy), fp32
 }
 struct Lins {
@@ -288,13 +302,17 @@ static void forward(State& s, const Lins& L, FILE* df) {
                                                 last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1);
         put("res_out", res + ND, 1, DIM);
     }
-    gemm(s, L.head.fwd, a.logits, s.params, a.lnf);  // tied embedding
     dump(df, "lnf", a.lnf, 0, N, DIM);
-    dump(df, "logits", a.logits, 0, N, VOCAB);
-    cross_entropy<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, tokens + N);
+    for (int c = 0; c < NCHUNK; c++) {  // tied lm_head, one vocab chunk at a time
+        char nm[48];
+        snprintf(nm, sizeof(nm), "logits.%d", c);
+        gemm(s, L.head.fwd, a.chunk, s.params + (size_t)c * VCHUNK * DIM, a.lnf);
+        dump(df, nm, a.chunk, 0, N, VCHUNK);
+        ce_stats<<<N, CE_THREADS, 0, stream>>>(a.ce_stats, a.ce_xt, a.chunk, tokens + N, c);
+    }
+    ce_loss<<<cdiv(N, 256), 256, 0, stream>>>(a.losses, a.ce_lse, a.ce_stats, a.ce_xt);
     mean_loss<<<1, 1024, 0, stream>>>(a.loss, a.losses);
     CK(cudaGetLastError());
-    dump(df, "dlogits", a.logits, 0, N, VOCAB);
     dump(df, "losses", a.losses, 1, N, 1);
     dump(df, "tokens", a.io, 2, 2, N);
 }
@@ -303,10 +321,18 @@ static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
-    gemm(s, L.head.dx, g.dln, s.params, a.logits);
-    gemm(s, L.head.dw, s.grads, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
-    dump(df, "dlnf", g.dln, 0, N, DIM);
-    rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
+    for (int c = 0; c < NCHUNK; c++) {  // recompute each logits chunk (bit-identical), then its grads
+        char nm[48];
+        snprintf(nm, sizeof(nm), "dlogits.%d", c);
+        const bf16* w = s.params + (size_t)c * VCHUNK * DIM;
+        gemm(s, L.head.fwd, a.chunk, w, a.lnf);
+        ce_grad<<<N, CE_THREADS, 0, stream>>>(a.chunk, a.ce_lse, a.io + N, c);
+        dump(df, nm, a.chunk, 0, N, VCHUNK);
+        gemm(s, L.head.dw, s.grads + (size_t)c * VCHUNK * DIM, a.lnf, a.chunk);  // embed_bwd adds the lookup part
+        gemm(s, L.head.dx, g.dlnf, w, a.chunk, c > 0);
+    }
+    dump(df, "dlnf", g.dlnf, 1, N, DIM);
+    rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dlnf, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
     colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.grads + P_TOTAL - DIM, g.dw_part);
     for (int l = LAYERS - 1; l >= 0; l--) {
@@ -446,12 +472,12 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&ar.base, arena_bytes));
     ar.used = 0;
     carve(ar, s);
-    printf("B=%d T=%d params=%zu arena=%.1f MiB\n", B, T, P_TOTAL, arena_bytes / 1048576.0);
+    printf("B=%d T=%d params=%zu arena=%.1f MiB vocab chunks=%d\n", B, T, P_TOTAL, arena_bytes / 1048576.0, NCHUNK);
 
     load_weights(s, weights);
     init_rope(s);
     const Lins L = {make_lin(QKV_DIM, DIM), make_lin(DIM, DIM), make_lin(2 * FFN, DIM), make_lin(DIM, FFN),
-                    make_lin(VOCAB, DIM)};
+                    make_lin(VCHUNK, DIM, CUDA_R_32F)};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;

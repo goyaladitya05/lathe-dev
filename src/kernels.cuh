@@ -7,7 +7,7 @@ typedef __nv_bfloat16 bf16;
 typedef __nv_bfloat162 bf162;
 
 static_assert(DIM % 64 == 0 && FFN % 8 == 0 && HEAD_DIM % 16 == 0, "vector widths");
-static_assert(T % ATT_TILE == 0 && VOCAB % (CE_THREADS * 8) == 0, "no tail handling");
+static_assert(T % ATT_TILE == 0 && VCHUNK % (CE_THREADS * 8) == 0, "no tail handling");
 
 constexpr float LOG2E = 1.4426950408889634f;
 
@@ -90,8 +90,12 @@ __global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16*
 // to dw_part[block], reduced by colsum. Fixed order everywhere.
 constexpr int NORM_ROWS = 16;
 static_assert(N % NORM_ROWS == 0, "whole norm blocks");
+__device__ __forceinline__ float2 load2(const bf16* p, int i) { return __bfloat1622float2(((const bf162*)p)[i]); }
+__device__ __forceinline__ float2 load2(const float* p, int i) { return ((const float2*)p)[i]; }
+
+template <class DY>
 __global__ void __launch_bounds__(256) rmsnorm_bwd(float* dres, bf16* dres_bf, float* dw_part, const float* dres_in,
-                                                   const bf16* dy, const float* x, const float* w) {
+                                                   const DY* dy, const float* x, const float* w) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     float2 acc[DIM / 64] = {};
     for (int k = 0; k < NORM_ROWS / 8; k++) {
@@ -101,7 +105,7 @@ __global__ void __launch_bounds__(256) rmsnorm_bwd(float* dres, bf16* dres_bf, f
 #pragma unroll
         for (int i = 0; i < DIM / 64; i++) {
             v[i] = ((const float2*)(x + o))[lane + 32 * i];
-            d[i] = __bfloat1622float2(((const bf162*)(dy + o))[lane + 32 * i]);
+            d[i] = load2(dy + o, lane + 32 * i);
             float2 ww = ((const float2*)w)[lane + 32 * i];
             g[i] = {d[i].x * ww.x, d[i].y * ww.y};
             dot += g[i].x * v[i].x + g[i].y * v[i].y;
@@ -545,16 +549,16 @@ __global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
     store8(dgu + (size_t)n * 2 * FFN + FFN + c, du);
 }
 
-// One block per row. losses[n] = logsumexp(x) - x[target] in fp32, then x is overwritten in place
-// with dlogits = (softmax(x) - onehot) / N in bf16 (mean-reduced cross entropy).
-__global__ void __launch_bounds__(CE_THREADS) cross_entropy(float* losses, bf16* logits, const int* targets) {
-    bf16* x = logits + (size_t)blockIdx.x * VOCAB;
-    const int tgt = targets[blockIdx.x];
-    const float xt = __bfloat162float(x[tgt]);
+// Cross entropy over vocab chunks of VCHUNK logits [N][VCHUNK], so the full [N][VOCAB] logits never exist.
+// ce_stats: per row (max, sum exp(x - max)) of chunk c into stats[c][n], and the target logit if it is in chunk c.
+__global__ void __launch_bounds__(CE_THREADS) ce_stats(float2* stats, float* xt, const bf16* logits, const int* targets,
+                                                       int c) {
+    const int n = blockIdx.x;
+    const bf16* x = logits + (size_t)n * VCHUNK;
     float m = -INFINITY, s = 0.f;
-    for (int c = threadIdx.x * 8; c < VOCAB; c += CE_THREADS * 8) {
+    for (int i = threadIdx.x * 8; i < VCHUNK; i += CE_THREADS * 8) {
         float v[8], mc = m;
-        load8(v, x + c);
+        load8(v, x + i);
 #pragma unroll
         for (int k = 0; k < 8; k++) mc = fmaxf(mc, v[k]);
         s *= expf(m - mc);
@@ -569,7 +573,7 @@ __global__ void __launch_bounds__(CE_THREADS) cross_entropy(float* losses, bf16*
         s = s * expf(m - mn) + s2 * expf(m2 - mn);
         m = mn;
     }
-    __shared__ float wm[CE_THREADS / 32], ws[CE_THREADS / 32], lse_s;
+    __shared__ float wm[CE_THREADS / 32], ws[CE_THREADS / 32];
     if (threadIdx.x % 32 == 0) {
         wm[threadIdx.x / 32] = m;
         ws[threadIdx.x / 32] = s;
@@ -581,17 +585,34 @@ __global__ void __launch_bounds__(CE_THREADS) cross_entropy(float* losses, bf16*
             s = s * expf(m - mn) + ws[i] * expf(wm[i] - mn);
             m = mn;
         }
-        lse_s = m + logf(s);
-        losses[blockIdx.x] = lse_s - xt;
+        stats[(size_t)c * N + n] = {m, s};
+        const int t = targets[n] - c * VCHUNK;
+        if (t >= 0 && t < VCHUNK) xt[n] = __bfloat162float(x[t]);
     }
-    __syncthreads();
-    const float lse = lse_s, inv_n = 1.f / N;
-    for (int c = threadIdx.x * 8; c < VOCAB; c += CE_THREADS * 8) {
+}
+
+// Combine the chunk stats: lse[n] = logsumexp of the full row, losses[n] = lse - x[target] (fp32).
+__global__ void ce_loss(float* losses, float* lse, const float2* stats, const float* xt) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    float m = -INFINITY, s = 0.f;
+    for (int c = 0; c < NCHUNK; c++) m = fmaxf(m, stats[(size_t)c * N + n].x);
+    for (int c = 0; c < NCHUNK; c++) s += stats[(size_t)c * N + n].y * expf(stats[(size_t)c * N + n].x - m);
+    lse[n] = m + logf(s);
+    losses[n] = lse[n] - xt[n];
+}
+
+// Chunk c of logits -> dlogits = (softmax - onehot) / N in place, bf16 (mean-reduced cross entropy).
+__global__ void __launch_bounds__(CE_THREADS) ce_grad(bf16* logits, const float* lse, const int* targets, int c) {
+    const int n = blockIdx.x, t = targets[n] - c * VCHUNK;
+    bf16* x = logits + (size_t)n * VCHUNK;
+    const float l = lse[n], inv_n = 1.f / N;
+    for (int i = threadIdx.x * 8; i < VCHUNK; i += CE_THREADS * 8) {
         float v[8];
-        load8(v, x + c);
+        load8(v, x + i);
 #pragma unroll
-        for (int k = 0; k < 8; k++) v[k] = (expf(v[k] - lse) - (c + k == tgt ? 1.f : 0.f)) * inv_n;
-        store8(x + c, v);
+        for (int k = 0; k < 8; k++) v[k] = (expf(v[k] - l) - (i + k == t ? 1.f : 0.f)) * inv_n;
+        store8(x + i, v);
     }
 }
 

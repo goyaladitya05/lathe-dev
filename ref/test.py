@@ -56,6 +56,12 @@ def read_dump(path):
     return out
 
 
+def chunks(d, name):
+    # lathe dumps the lm_head logits / dlogits one vocab chunk at a time.
+    n = sum(k.startswith(name + ".") for k in d)
+    return torch.cat([d[f"{name}.{c}"] for c in range(n)], 1)
+
+
 def run_lathe(B, T, *args):
     out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
     if out.returncode:
@@ -148,8 +154,8 @@ def forward_kernel_checks(d, W, x, y, cfg, B, T):
     lnf = d["lnf"].float().cuda()
     res_l = d[f"L{cfg.layers - 1}.res_out"].float().cuda()
     check("rmsnorm final", rel(lnf, rmsnorm(res_l, W.f[-1], cfg.rms_eps)), KERNEL_TOL)
-    check("matmul lm_head", rel(d["logits"].float().cuda(), lnf @ W.b[0].T), KERNEL_TOL)
-    ce = F.cross_entropy(d["logits"].float().cuda(), y.view(-1).cuda(), reduction="none")
+    check("matmul lm_head", rel(chunks(d, "logits").float().cuda(), lnf @ W.b[0].T), KERNEL_TOL)
+    ce = F.cross_entropy(chunks(d, "logits").float().cuda(), y.view(-1).cuda(), reduction="none")
     check("cross entropy", rel(d["losses"].view(-1).cuda(), ce), F32_TOL)
 
 
@@ -157,12 +163,12 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
     cos, sin = rope_table(cfg, T, "cuda")
     rot = (cfg.heads + cfg.kv_heads) * cfg.head_dim
     eps = cfg.rms_eps
-    logits, lnf = d["logits"].float().cuda(), d["lnf"].float().cuda()
-    dlogits = d["dlogits"].float().cuda()
+    logits, lnf = chunks(d, "logits").float().cuda(), d["lnf"].float().cuda()
+    dlogits = chunks(d, "dlogits").float().cuda()
     onehot = F.one_hot(y.view(-1).cuda(), cfg.vocab).float()
     print(" backward output")
     check("cross entropy bwd", rel(dlogits, (logits.softmax(-1) - onehot) / (B * T)), KERNEL_TOL)
-    check("matmul lm_head dX", rel(d["dlnf"].float().cuda(), dlogits @ W.b[0]), KERNEL_TOL)
+    check("matmul lm_head dX (fp32)", rel(d["dlnf"].float().cuda(), dlogits @ W.b[0]), F32_TOL)
     L = cfg.layers - 1
     dx, dw = rmsnorm_grads(d[f"L{L}.res_out"].float().cuda(), W.f[-1], d["dlnf"].float().cuda(), eps)
     check("rmsnorm final bwd dx", rel(d[f"L{L}.dres_out"].cuda(), dx), F32_TOL)
@@ -217,7 +223,7 @@ def e2e_checks(d, lathe_losses, model, tokens, B, T):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             lg16 = model(x)
         ref = [model(*(t.cuda() for t in get_batch(tokens, i, B, T)))[1].item() for i in range(BIAS_BATCHES)]
-    lg = d["logits"].cuda().view_as(lg32)
+    lg = chunks(d, "logits").cuda().view_as(lg32)
     dl, dl16 = ce(lg) - ce(lg32), ce(lg16) - ce(lg32)
     print(f" end to end   batch 0 loss: fp32 {ce(lg32).mean():.6f}  torch-bf16 {ce(lg16).mean():.6f}  "
           f"lathe {ce(lg).mean():.6f}")
