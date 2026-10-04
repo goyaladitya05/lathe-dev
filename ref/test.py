@@ -132,21 +132,28 @@ def main():
     check("export/load round trip", max((p - q).abs().max().item() for p, q in zip(a.parameters(), b.parameters())), 0)
     subprocess.run(["make", "-s", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
 
+    # Run lathe before this process touches the GPU, so its arena never competes with torch for memory.
+    lathe_losses = {}
+    for name in ["init", "pretrained"]:
+        out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", "--weights", DATA / f"smol135_{name}.bin", "--data",
+                              DATA / "val.bin", "--dump", ROOT / f"build/dump_{name}.bin", "--batches",
+                              str(BIAS_BATCHES)], capture_output=True, text=True)
+        if out.returncode:
+            sys.exit(f"lathe failed on {name} weights:\n{out.stderr}")
+        lathe_losses[name] = [float(v) for v in re.findall(r"batch \d+ loss ([\d.]+)", out.stdout)]
+
     tokens = np.memmap(DATA / "val.bin", dtype=np.uint16, mode="r")
     x, y = get_batch(tokens, 0, B, T)
     for name in ["init", "pretrained"]:
         print(f"\n{name} weights")
-        wpath, dpath = DATA / f"smol135_{name}.bin", ROOT / f"build/dump_{name}.bin"
-        out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", "--weights", wpath, "--data", DATA / "val.bin",
-                              "--dump", dpath, "--batches", str(BIAS_BATCHES)], check=True, capture_output=True, text=True)
-        lathe_losses = [float(v) for v in re.findall(r"batch \d+ loss ([\d.]+)", out.stdout)]
-        d = read_dump(dpath)
+        wpath = DATA / f"smol135_{name}.bin"
+        d = read_dump(ROOT / f"build/dump_{name}.bin")
         check("batch matches get_batch", float((d["tokens"] != torch.stack([x.view(-1), y.view(-1)])).sum()), 0)
         model = Model(cfg)
         load_lathe(model, wpath)
         model.cuda()
         kernel_checks(d, model, x, y)
-        e2e_checks(d, lathe_losses, model, tokens)
+        e2e_checks(d, lathe_losses[name], model, tokens)
 
     print("\nreference sanity: pretrained SmolLM2-135M val loss over 8 batches")
     model.eval()
