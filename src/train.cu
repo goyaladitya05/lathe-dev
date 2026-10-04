@@ -182,22 +182,21 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
 static cudaStream_t stream;
 static cublasLtHandle_t lt;
 
-// Column-major D[m x n] = op(A)[m x k] op(B)[k x n], bf16 inputs, fp32 accumulate. Built once per shape.
+// Column-major D[m x n] = op(A)[m x k] B[k x n], bf16 inputs and output, fp32 accumulate. Built once per shape.
 struct Gemm {
     cublasLtMatmulDesc_t desc;
     cublasLtMatrixLayout_t a, b, d;
     cublasLtMatmulAlgo_t algo;
 };
 
-static Gemm make_gemm(bool ta, bool tb, int m, int n, int k, cudaDataType_t dtype) {
+static Gemm make_gemm(bool ta, int m, int n, int k) {
     Gemm g;
     CKB(cublasLtMatmulDescCreate(&g.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N, opb = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opa, sizeof(opa)));
-    CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opb, sizeof(opb)));
     CKB(cublasLtMatrixLayoutCreate(&g.a, CUDA_R_16BF, ta ? k : m, ta ? m : k, ta ? k : m));
-    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, tb ? n : k, tb ? k : n, tb ? n : k));
-    CKB(cublasLtMatrixLayoutCreate(&g.d, dtype, m, n, m));
+    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, k, n, k));
+    CKB(cublasLtMatrixLayoutCreate(&g.d, CUDA_R_16BF, m, n, m));
     cublasLtMatmulPreference_t pref;
     CKB(cublasLtMatmulPreferenceCreate(&pref));
     size_t ws = CUBLAS_WORKSPACE;
@@ -219,17 +218,14 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
                        CUBLAS_WORKSPACE, stream));
 }
 
-// Linear y = x W^T, W [out][in] row-major, x/y [N][features] row-major.
-struct Lin {
-    Gemm fwd, dx, dw;
-};
-static Lin make_lin(int out, int in, cudaDataType_t dw_type = CUDA_R_16BF) {
-    return {make_gemm(true, false, out, N, in, CUDA_R_16BF),   // y[N][out] = x W^T      (A = W, B = x)
-            make_gemm(false, false, in, N, out, CUDA_R_16BF),  // dx[N][in] = dy W       (A = W, B = dy)
-            make_gemm(false, true, in, out, N, dw_type)};      // dW[out][in] = dy^T x   (A = x, B = dy)
-}
+// The cuBLASLt GEMMs of linears y = x W^T, W [out][in] row-major, x/y [N][features] row-major. The qkv forward,
+// the down dX and every dW are own kernels with fused epilogues (qkv_rope, down_dx_swiglu, dw_adamw).
+// Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
+static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
+static Gemm make_dx(int out, int in) { return make_gemm(false, in, N, out); }
 struct Lins {
-    Lin qkv, o, gu, down, head;
+    Gemm o, gu, down, head;             // forward
+    Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
 };
 
 // Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
@@ -283,23 +279,23 @@ static void forward(State& s, const Lins& L, FILE* df) {
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<dim3(NT, HEADS, B), 128, 0, stream>>>(att, lse, qkv);
         put("att", att, 0, DIM);
-        gemm(s, L.o.fwd, a.branch, w.o, att);
+        gemm(s, L.o, a.branch, w.o, att);
         put("ao", a.branch, 0, DIM);
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2);
         put("res_mid", res_mid, 1, DIM);
         put("ln2", ln2, 0, DIM);
-        gemm(s, L.gu.fwd, gu, w.gu, ln2);
+        gemm(s, L.gu, gu, w.gu, ln2);
         put("gu", gu, 0, 2 * FFN);
         swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu);
         put("act", act, 0, FFN);
-        gemm(s, L.down.fwd, a.branch, w.down, act);
+        gemm(s, L.down, a.branch, w.down, act);
         put("mo", a.branch, 0, DIM);
         // Next layer's input norm, or the final norm.
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(last ? a.lnf : a.ln1 + (l + 1) * ND, res + ND, res_mid, a.branch,
                                                 last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1);
         put("res_out", res + ND, 1, DIM);
     }
-    gemm(s, L.head.fwd, a.logits, s.params, a.lnf);  // tied embedding
+    gemm(s, L.head, a.logits, s.params, a.lnf);  // tied embedding
     dump(df, "lnf", a.lnf, 0, N, DIM);
     dump(df, "logits", a.logits, 0, N, VOCAB);
     cross_entropy<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, tokens + N);
@@ -314,7 +310,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
-    gemm(s, L.head.dx, g.dln, s.params, a.logits);
+    gemm(s, L.head_dx, g.dln, s.params, a.logits);
     {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
         constexpr auto k = dw_adamw<VOCAB, DIM, true>;
         k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, nullptr, a.logits, a.lnf, s.step,
@@ -349,13 +345,13 @@ static void backward(State& s, const Lins& L, FILE* df) {
         down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
         dw(dw_adamw<DIM, FFN>, DIM, FFN, P_QKV + P_O + P_GU, gr.down, g.dres_bf, act);
         put("dgu", g.dgu, 0, 2 * FFN);
-        gemm(s, L.gu.dx, g.dln, w.gu, g.dgu);
+        gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         dw(dw_adamw<2 * FFN, DIM>, 2 * FFN, DIM, P_QKV + P_O, gr.gu, g.dgu, ln2);
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         put("dres_mid", g.dres, 1, DIM);
-        gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
+        gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
         dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
         put("datt", g.datt, 0, DIM);
         attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
@@ -363,7 +359,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
                                                                                                        s.rope);
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
-        gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
+        gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
         dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
         char nm[48];
         snprintf(nm, sizeof(nm), "gmat.%d", l);
@@ -497,8 +493,8 @@ int main(int argc, char** argv) {
 
     load_weights(s, weights);
     init_rope(s);
-    const Lins L = {make_lin(QKV_DIM, DIM), make_lin(DIM, DIM), make_lin(2 * FFN, DIM), make_lin(DIM, FFN),
-                    make_lin(VOCAB, DIM, CUDA_R_32F)};
+    const Lins L = {make_fwd(DIM, DIM),     make_fwd(2 * FFN, DIM), make_fwd(DIM, FFN),     make_fwd(VOCAB, DIM),
+                    make_dx(QKV_DIM, DIM), make_dx(DIM, DIM),       make_dx(2 * FFN, DIM), make_dx(VOCAB, DIM)};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;
