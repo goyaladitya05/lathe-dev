@@ -38,10 +38,10 @@ static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 ==
                   P_DOWN * 2 % 256 == 0 && P_LAYER * 2 % 256 == 0,
               "matrices must stay 256B-aligned for cuBLASLt");
 
-// Grads: matrices in bf16 (PyTorch also rounds dW to bf16 before its fp32 .grad), per layer [qkv | o | gu | down];
-// embedding and norm weights in fp32 (PyTorch sums those in fp32): [embedding][LAYERS x (ln1, ln2)][final norm].
+// Grads: matrix grads (bf16 like PyTorch's dW) and most embedding rows never leave the dW GEMMs, which apply AdamW
+// directly. Norm weight grads are fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
 constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
-constexpr size_t G_VEC = P_EMBED + LAYERS * 2 * DIM + DIM;
+constexpr size_t G_NORM = LAYERS * 2 * DIM + DIM;
 
 #include "kernels.cuh"
 
@@ -76,8 +76,8 @@ static LayerP<X> layer(X* p, int l) {
     return {q, q + P_QKV, q + P_QKV + P_O, q + P_QKV + P_O + P_GU, ln, ln + DIM};
 }
 
-// Per-step host data: tokens, targets, embedding segments [perm N][starts N+1][count], bitmask of batch tokens.
-constexpr int IO_SEG = 2 * N, IO_TOUCHED = 4 * N + 2, IO_INTS = IO_TOUCHED + VOCAB / 32;
+// Per-step host data: tokens, targets, embedding segments [perm N][starts N+1][count], token -> segment (or -1).
+constexpr int IO_SEG = 2 * N, IO_SEGMAP = 4 * N + 2, IO_INTS = IO_SEGMAP + VOCAB;
 
 // Per-layer activations kept for backward.
 struct Acts {
@@ -108,13 +108,15 @@ struct Bwd {
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
-    bf16* gmat;      // [P_MAT] one layer's matrix grads, written only when dumping (they never leave registers)
+    float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
+    bf16* gmat;      // [P_MAT] one layer's matrix grads, dumps only (nullptr otherwise)
 };
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
     bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
-    float* gvec;    // [G_VEC] embedding and norm grads
+    float* gnorm;   // [G_NORM] norm weight grads
+    float* gemb;    // [P_EMBED] full fp32 embedding grad, dumps only (nullptr otherwise)
     float *m, *v;   // [P_TOTAL] AdamW moments
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
@@ -136,11 +138,12 @@ struct Arena {
     }
 };
 
-static void carve(Arena& ar, State& s) {
+static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exist only when dumping
     const size_t ND = (size_t)N * DIM;
     s.master = ar.take<float>(P_TOTAL);
     s.params = ar.take<bf16>(P_TOTAL);
-    s.gvec = ar.take<float>(G_VEC);
+    s.gnorm = ar.take<float>(G_NORM);
+    s.gemb = dumping ? ar.take<float>(P_EMBED) : nullptr;
     s.m = ar.take<float>(P_TOTAL);
     s.v = ar.take<float>(P_TOTAL);
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
@@ -172,7 +175,8 @@ static void carve(Arena& ar, State& s) {
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
-    g.gmat = ar.take<bf16>(P_MAT);
+    g.gemb_rows = ar.take<float>(ND);
+    g.gmat = dumping ? ar.take<bf16>(P_MAT) : nullptr;
 }
 
 static cudaStream_t stream;
@@ -313,13 +317,13 @@ static void backward(State& s, const Lins& L, FILE* df) {
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
     {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
         constexpr auto k = dw_adamw<VOCAB, DIM>;
-        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, df ? g.gmat : nullptr, a.logits,
-                                                          a.lnf, s.step, s.gvec, (const uint32_t*)(a.io + IO_TOUCHED));
+        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, nullptr, a.logits, a.lnf, s.step,
+                                                          g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
     }
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
-    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.gvec + G_VEC - DIM, g.dw_part);
+    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.gnorm + G_NORM - DIM, g.dw_part);
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l);
@@ -331,9 +335,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
             const size_t o = P_EMBED + l * P_LAYER + off;
             kernel<<<dim3(in / 64, out / 64), 128, 0, stream>>>(s.master + o, s.params + o, s.m + o, s.v + o, gout, dy, x,
-                                                               s.step, nullptr, nullptr);
+                                                               s.step, nullptr, nullptr, nullptr);
         };
-        float* gln = s.gvec + P_EMBED + l * 2 * DIM;
+        float* gln = s.gnorm + l * 2 * DIM;
         float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
         bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
         bf16 *qkv = a.qkv + (size_t)l * N * QKV_DIM, *gu = a.gu + (size_t)l * N * 2 * FFN;
@@ -370,7 +374,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln, g.dw_part);
         put("dres_in", g.dres, 1, DIM);
     }
-    embed_bwd_adamw<<<N, DIM / 4, 0, stream>>>(s.master, s.params, s.m, s.v, s.gvec, g.dres, a.io, a.io + IO_SEG, s.step);
+    embed_bwd_adamw<<<N, DIM / 4, 0, stream>>>(s.master, s.params, s.m, s.v, g.gemb_rows, df ? s.gemb : nullptr, g.dres,
+                                               a.io, a.io + IO_SEG, s.step);
     CK(cudaGetLastError());
 }
 
@@ -379,9 +384,10 @@ static void train_step(State& s, const Lins& L, FILE* df) {
     next_step<<<1, 1, 0, stream>>>(s.step);
     forward(s, L, df);
     backward(s, L, df);
-    dump(df, "gvec", s.gvec, 1, 1, G_VEC);
-    static_assert(P_EMBED % 4 == 0 && G_VEC % 4 == 0, "adamw_norms works on float4");
-    adamw_norms<<<cdiv((G_VEC - P_EMBED) / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gvec, s.m, s.v, s.step);
+    dump(df, "gemb", s.gemb, 1, 1, P_EMBED);
+    dump(df, "gnorm", s.gnorm, 1, 1, G_NORM);
+    static_assert(G_NORM % 4 == 0, "adamw_norms works on float4");
+    adamw_norms<<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gnorm, s.m, s.v, s.step);
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
     dump(df, "params", s.params, 0, 1, P_TOTAL);
@@ -455,9 +461,9 @@ static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* so
     }
     starts[count] = N;
     starts[N + 1] = count;
-    uint32_t* touched = (uint32_t*)(io + IO_TOUCHED);
-    memset(touched, 0, VOCAB / 8);
-    for (int j = 0; j < count; j++) touched[sorted[starts[j]].first >> 5] |= 1u << (sorted[starts[j]].first & 31);
+    int* segmap = io + IO_SEGMAP;
+    memset(segmap, 0xff, VOCAB * sizeof(int));  // -1
+    for (int j = 0; j < count; j++) segmap[sorted[starts[j]].first] = j;
 }
 
 int main(int argc, char** argv) {
@@ -482,11 +488,11 @@ int main(int argc, char** argv) {
 
     State s;
     Arena ar{nullptr, 0};
-    carve(ar, s);
+    carve(ar, s, dump_path != nullptr);
     const size_t arena_bytes = ar.used;
     CK(cudaMalloc(&ar.base, arena_bytes));
     ar.used = 0;
-    carve(ar, s);
+    carve(ar, s, dump_path != nullptr);
     printf("B=%d T=%d params=%zu arena=%.1f MiB\n", B, T, P_TOTAL, arena_bytes / 1048576.0);
 
     load_weights(s, weights);

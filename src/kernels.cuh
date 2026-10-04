@@ -748,18 +748,18 @@ __device__ __forceinline__ void adamw_update(float& p, float& m, float& v, float
 
 __global__ void next_step(float* step) { *step += 1.f; }
 
-// Embedding rows of the batch's tokens: grad = (bf16-rounded head grad, already in gemb) + sum of dres rows for that
-// token, then AdamW on the row. seg = [perm N][starts N+1][count 1] from the host: positions sorted by token, one
+// Embedding rows of the batch's tokens: grad = (bf16-rounded head grad, in gemb_rows[segment]) + sum of dres rows for
+// that token, then AdamW on the row; gemb_full (dumps only) receives the final grad. seg = [perm N][starts N+1][count 1] from the host: positions sorted by token, one
 // block per distinct token, rows summed in a fixed order (no atomics).
-__global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, float* m, float* v, float* gemb,
-                                                           const float* dres, const int* tok, const int* seg,
-                                                           const float* step_count) {
+__global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, float* m, float* v, const float* gemb_rows,
+                                                           float* gemb_full, const float* dres, const int* tok,
+                                                           const int* seg, const float* step_count) {
     const int* perm = seg;
     const int* starts = seg + N;
     if ((int)blockIdx.x >= starts[N + 1]) return;
     const int s0 = starts[blockIdx.x], s1 = starts[blockIdx.x + 1];
     const size_t o = (size_t)tok[perm[s0]] * DIM + threadIdx.x * 4;
-    float4 G = *(float4*)(gemb + o);
+    float4 G = *(const float4*)(gemb_rows + (size_t)blockIdx.x * DIM + threadIdx.x * 4);
     for (int k = s0; k < s1; k++) {
         float4 d = *(const float4*)(dres + (size_t)perm[k] * DIM + threadIdx.x * 4);
         G.x += d.x;
@@ -767,7 +767,7 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, f
         G.z += d.z;
         G.w += d.w;
     }
-    *(float4*)(gemb + o) = G;
+    if (gemb_full) *(float4*)(gemb_full + o) = G;
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
     float4 P = *(float4*)(p + o), M = *(float4*)(m + o), V = *(float4*)(v + o);
     adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
@@ -780,15 +780,15 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, f
     *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
 }
 
-// AdamW for the norm weights (gvec past the embedding), 4 per thread; also refreshes the bf16 copy. Weight matrices
-// and the embedding are updated inside their dW GEMMs (dw_adamw) and embed_bwd_adamw.
-__global__ void adamw_norms(float* p, bf16* pb, const float* gvec, float* m, float* v, const float* step_count) {
-    const size_t j = P_EMBED + 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
-    if (j >= G_VEC) return;
-    const size_t o = j < G_VEC - DIM ? P_EMBED + (j - P_EMBED) / (2 * DIM) * P_LAYER + P_MAT + (j - P_EMBED) % (2 * DIM)
-                                     : P_TOTAL - DIM + (j - (G_VEC - DIM));  // parameter offset of gvec[j]
+// AdamW for the norm weights (gnorm = [LAYERS x (ln1, ln2)][final norm]), 4 per thread; also refreshes the bf16 copy.
+// Weight matrices and the embedding are updated inside their dW GEMMs (dw_adamw) and embed_bwd_adamw.
+__global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, float* v, const float* step_count) {
+    const size_t j = 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
+    if (j >= G_NORM) return;
+    const size_t o = j < G_NORM - DIM ? P_EMBED + j / (2 * DIM) * P_LAYER + P_MAT + j % (2 * DIM)
+                                      : P_TOTAL - DIM + (j - (G_NORM - DIM));  // parameter offset of gnorm[j]
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
-    float4 P = *(float4*)(p + o), G = *(const float4*)(gvec + j), M = *(float4*)(m + o), V = *(float4*)(v + o);
+    float4 P = *(float4*)(p + o), G = *(const float4*)(gnorm + j), M = *(float4*)(m + o), V = *(float4*)(v + o);
     adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
     adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
     adamw_update(P.z, M.z, V.z, G.z, bc1, bc2_sqrt);
@@ -803,14 +803,14 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gvec, float* m, flo
 // come through ldmatrix.trans. The AdamW update is fused into the epilogue: the grad, rounded to bf16 like PyTorch's
 // dW, updates master, moments and the bf16 copy of W in place while other blocks are still multiplying.
 // gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; DW_ST-stage cp.async.
-// Tied embedding (lm_head dW): rows whose token is in the batch (bit set in `touched`) also get the lookup grad
-// later, so their bf16-rounded head grad goes to gemb (fp32) and embed_bwd_adamw finishes them; gemb receives every
-// row's grad when gout is set (tests).
+// Tied embedding (lm_head dW): rows whose token is in the batch (segmap[row] = its segment, else -1) also get the
+// lookup grad later, so their bf16-rounded head grad goes to gemb_rows[segment] (fp32) and embed_bwd_adamw finishes
+// them. gemb_full (dumps only) receives every row's head grad.
 constexpr int DW_ST = 3;
 template <int OUT, int IN>
 __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
-                                                const bf16* X, const float* step_count, float* gemb = nullptr,
-                                                const uint32_t* touched = nullptr) {
+                                                const bf16* X, const float* step_count, float* gemb_rows = nullptr,
+                                                float* gemb_full = nullptr, const int* segmap = nullptr) {
     static_assert(OUT % 64 == 0 && IN % 64 == 0 && N % GBK == 0, "whole dW tiles");
     constexpr int KT = N / GBK;
     __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
@@ -858,9 +858,12 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
             const size_t o = (size_t)row * IN + bn + 8 * j + 2 * t;
             const bf162 gb = __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
             const float2 gf = __bfloat1622float2(gb);
-            if (gemb) {
-                if (gout || touched[row >> 5] >> (row & 31) & 1) *(float2*)(gemb + o) = gf;
-                if (touched[row >> 5] >> (row & 31) & 1) continue;
+            if (segmap) {
+                if (gemb_full) *(float2*)(gemb_full + o) = gf;
+                if (const int sg = segmap[row]; sg >= 0) {
+                    *(float2*)(gemb_rows + (size_t)sg * IN + bn + 8 * j + 2 * t) = gf;
+                    continue;
+                }
             } else if (gout) {
                 *(bf162*)(gout + o) = gb;
             }

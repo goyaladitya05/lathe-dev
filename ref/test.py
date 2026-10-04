@@ -59,12 +59,12 @@ def read_dump(path):
 
 
 def lathe_grads(d, cfg):
-    # gmat.<l> (bf16 matrix grads of layer l) + gvec (fp32 embedding and norm grads) -> flat fp32 in lathe order.
-    gvec, E, D = d["gvec"].view(-1), cfg.vocab * cfg.dim, cfg.dim
-    parts = [gvec[:E]]
+    # gemb (fp32), gmat.<l> (bf16 matrix grads of layer l), gnorm (fp32 norm grads) -> flat fp32 in lathe order.
+    gnorm, D = d["gnorm"].view(-1), cfg.dim
+    parts = [d["gemb"].view(-1)]
     for l in range(cfg.layers):
-        parts += [d[f"gmat.{l}"].view(-1).float(), gvec[E + 2 * D * l:E + 2 * D * (l + 1)]]
-    return torch.cat(parts + [gvec[-D:]])
+        parts += [d[f"gmat.{l}"].view(-1).float(), gnorm[2 * D * l:2 * D * (l + 1)]]
+    return torch.cat(parts + [gnorm[-D:]])
 
 
 def run_lathe(B, T, *args):
