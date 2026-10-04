@@ -237,8 +237,8 @@ __device__ __forceinline__ void c_to_a(uint32_t (&a)[4][4], const float (&c)[8][
 }
 
 // ---- Layer GEMMs with fused epilogues (cuBLASLt cannot fuse these). A block computes BM rows x 64 columns with
-// BM / WM warps of WM x 64, so each thread holds columns c and c + 32 of its 64 (fragments j and j + 4): a RoPE
-// pair, or a gate/up pair when the B tile holds 32 gate rows then the matching 32 up rows. BK = 32, cp.async ring.
+// BM / WM warps of WM x 64, so each thread holds columns c and c + 32 of its 64 (fragments j and j + 4), e.g. a
+// RoPE pair. BK = 32, cp.async ring. Used only where the fusion beats cuBLASLt plus a separate kernel.
 constexpr int GBK = 32;
 __device__ __forceinline__ int sw32(int r, int c) { return r * 32 + ((c ^ ((r >> 1) & 3)) << 3); }  // 64-byte rows
 
@@ -361,32 +361,6 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
                 }
                 *(bf162*)(y + 8 * j) = __floats2bfloat162_rn(a[0], a[1]);
                 *(bf162*)(y + 8 * j + 32) = __floats2bfloat162_rn(b[0], b[1]);
-            }
-        }
-}
-
-// gu = ln2 . Wgu^T and act = bf16(bf16(silu(gate)) * up). Block = GBM tokens x 32 gate columns + the matching up.
-__global__ void __launch_bounds__(GBM / GWM * 32) gu_swiglu(bf16* gu, bf16* act, const bf16* x, const bf16* w) {
-    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
-    const int bm = blockIdx.y * GBM, c0 = blockIdx.x * 32;
-    float acc[GWM / 16][8][4] = {};
-    gemm_tn_loop<GBM, GWM, DIM, GST>(acc, x, bm, w, [&](int r) { return r < 32 ? c0 + r : FFN + c0 + r - 32; }, sm);
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
-#pragma unroll
-    for (int i = 0; i < GWM / 16; i++)
-#pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const size_t n = bm + wm0 + 16 * i + g + 8 * r;
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int c = c0 + 8 * j + 2 * t;
-                const bf162 gg = __floats2bfloat162_rn(acc[i][j][2 * r], acc[i][j][2 * r + 1]);
-                const bf162 uu = __floats2bfloat162_rn(acc[i][j + 4][2 * r], acc[i][j + 4][2 * r + 1]);
-                *(bf162*)(gu + n * 2 * FFN + c) = gg;
-                *(bf162*)(gu + n * 2 * FFN + FFN + c) = uu;
-                const float2 gf = __bfloat1622float2(gg), uf = __bfloat1622float2(uu);
-                *(bf162*)(act + n * FFN + c) = __floats2bfloat162_rn(round_bf16(gf.x / (1.f + expf(-gf.x))) * uf.x,
-                                                                     round_bf16(gf.y / (1.f + expf(-gf.y))) * uf.y);
             }
         }
 }
