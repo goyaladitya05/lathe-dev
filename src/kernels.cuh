@@ -805,9 +805,9 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, fl
 // gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; DW_ST-stage cp.async.
 // Tied embedding (lm_head dW): rows whose token is in the batch (segmap[row] = its segment, else -1) also get the
 // lookup grad later, so their bf16-rounded head grad goes to gemb_rows[segment] (fp32) and embed_bwd_adamw finishes
-// them. gemb_full (dumps only) receives every row's head grad.
+// them. gemb_full (dumps only) receives every row's head grad. EMB is compile-time so layer dWs carry none of this.
 constexpr int DW_ST = 3;
-template <int OUT, int IN>
+template <int OUT, int IN, bool EMB = false>
 __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
                                                 const bf16* X, const float* step_count, float* gemb_rows = nullptr,
                                                 float* gemb_full = nullptr, const int* segmap = nullptr) {
@@ -858,7 +858,7 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
             const size_t o = (size_t)row * IN + bn + 8 * j + 2 * t;
             const bf162 gb = __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
             const float2 gf = __bfloat1622float2(gb);
-            if (segmap) {
+            if constexpr (EMB) {
                 if (gemb_full) *(float2*)(gemb_full + o) = gf;
                 if (const int sg = segmap[row]; sg >= 0) {
                     *(float2*)(gemb_rows + (size_t)sg * IN + bn + 8 * j + 2 * t) = gf;

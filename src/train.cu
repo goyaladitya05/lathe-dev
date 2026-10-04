@@ -316,7 +316,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     const size_t ND = (size_t)N * DIM;
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
     {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
-        constexpr auto k = dw_adamw<VOCAB, DIM>;
+        constexpr auto k = dw_adamw<VOCAB, DIM, true>;
         k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, nullptr, a.logits, a.lnf, s.step,
                                                           g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
     }
