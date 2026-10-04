@@ -1,7 +1,7 @@
 # Correctness of lathe against the reference.
 # Per-kernel: each lathe kernel output vs fp32 math on lathe's own dumped inputs (bf16-rounded weights).
 # End-to-end: lathe logits/loss vs the fp32 reference, measured against PyTorch bf16 autocast's own error.
-#   python ref/test.py
+#   python ref/test.py [B T]   (default 2 512)
 import re
 import struct
 import subprocess
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from model import DATA, ROOT, Config, Model, get_batch, init_weights, lathe_layout, load_lathe, rope, rope_table
 
-B, T = 2, 512
+B, T = (int(v) for v in sys.argv[1:3]) if len(sys.argv) == 3 else (2, 512)
 KERNEL_TOL = 2 ** -8  # rel L2 per kernel: one bf16 unit roundoff
 E2E_RATIO = 2.0       # lathe error vs fp32 may be at most this times torch-bf16 error vs fp32
 BIAS_BATCHES = 8
@@ -80,6 +80,7 @@ def kernel_checks(d, model, x, y):
         check("matmul qkv", rel(f("qkv_pre"), f("ln1") @ wqkv.T), KERNEL_TOL)
         qk = f("qkv_pre")[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2)
         check("rope", rel(f("qkv")[:, :rot], rope(qk, cos, sin).transpose(1, 2).reshape(B * T, rot)), KERNEL_TOL)
+        check("rope leaves v untouched", rel(f("qkv")[:, rot:], f("qkv_pre")[:, rot:]), 0)
         check("attention", rel(f("att"), attention(f("qkv"), cfg)), KERNEL_TOL)
         check("matmul o + residual", rel(f("res_mid"), f("res") + f("att") @ wo.T), KERNEL_TOL)
         check("rmsnorm 2", rel(f("ln2"), rmsnorm(f("res_mid"), ln2, cfg.rms_eps)), KERNEL_TOL)

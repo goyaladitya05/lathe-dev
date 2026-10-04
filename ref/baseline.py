@@ -89,11 +89,11 @@ def main():
 
     commit = subprocess.run(["git", "describe", "--always", "--dirty"], cwd=ROOT, capture_output=True,
                             text=True).stdout.strip()
-    peak = torch.cuda.max_memory_allocated() >> 20
+    peak, reserved = torch.cuda.max_memory_allocated() >> 20, torch.cuda.max_memory_reserved() >> 20
     retries = torch.cuda.memory_stats()["num_alloc_retries"]
     print(f"# warmup {warm:.1f}s, last loss {loss.item():.4f}, alloc retries {retries}, runs {[round(r) for r in rates]}")
     print(f"| {datetime.date.today()} | {commit} | torch {args.mode} | {args.B}x{args.T} | "
-          f"{statistics.median(rates):,.0f} | {min(rates):,.0f}-{max(rates):,.0f} | {peak:,} | {pmem:,} | {clocks} | "
+          f"{statistics.median(rates):,.0f} | {min(rates):,.0f}-{max(rates):,.0f} | {peak:,} | {reserved:,} | {pmem:,} | {clocks} | "
           f"torch {torch.__version__} |")
 
 
