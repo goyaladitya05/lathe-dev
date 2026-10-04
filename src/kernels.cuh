@@ -806,7 +806,7 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gvec, float* m, flo
 // Tied embedding (lm_head dW): rows whose token is in the batch (bit set in `touched`) also get the lookup grad
 // later, so their bf16-rounded head grad goes to gemb (fp32) and embed_bwd_adamw finishes them; gemb receives every
 // row's grad when gout is set (tests).
-constexpr int DW_ST = 4;
+constexpr int DW_ST = 3;
 template <int OUT, int IN>
 __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
                                                 const bf16* X, const float* step_count, float* gemb = nullptr,
