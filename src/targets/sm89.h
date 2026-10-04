@@ -5,4 +5,4 @@
 constexpr int ATT_TILE = 64;                    // query rows per block and key rows per smem tile
 constexpr int CE_THREADS = 512;                 // threads per cross-entropy row
 constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
-constexpr double SOL_BF16_TFLOPS = 23.81;       // measured: ref/baseline.py --mode sol (8192^3, fp32 accumulate)
+constexpr double SOL_BF16_TFLOPS = 25.41;       // best measured: ref/baseline.py --mode sol (16384^3, fp32 accumulate)
