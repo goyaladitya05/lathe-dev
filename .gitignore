@@ -4,6 +4,7 @@ __pycache__/
 data/*
 !data/prep.py
 BENCH.md
+README.md
 project.md
 *.nsys-rep
 *.sqlite
