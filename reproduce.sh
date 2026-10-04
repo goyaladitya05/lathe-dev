@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce lathe's results from a fresh clone: data, weights, correctness tests, then one same-session benchmark.
 # Needs: CUDA 12.8 at /usr/local/cuda, a python3 that can import torch with CUDA, internet for the data (~1.3 GB).
-#   ./reproduce.sh                      everything (the tinygrad BEAM search alone takes hours the first time)
+#   ./reproduce.sh                                  everything (tinygrad's first BEAM search takes about 20 minutes per shape)
 #   STACKS=eager,compile,lathe ./reproduce.sh       skip tinygrad
 set -euo pipefail
 cd "$(dirname "$0")"
