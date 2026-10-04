@@ -76,7 +76,8 @@ static LayerP<X> layer(X* p, int l) {
     return {q, q + P_QKV, q + P_QKV + P_O, q + P_QKV + P_O + P_GU, ln, ln + DIM};
 }
 
-constexpr int IO_INTS = 4 * N + 2;  // tokens, targets, then embed_bwd segments [perm N][starts N+1][count]
+// Per-step host data: tokens, targets, embedding segments [perm N][starts N+1][count], bitmask of batch tokens.
+constexpr int IO_SEG = 2 * N, IO_TOUCHED = 4 * N + 2, IO_INTS = IO_TOUCHED + VOCAB / 32;
 
 // Per-layer activations kept for backward.
 struct Acts {
@@ -310,7 +311,11 @@ static void backward(State& s, const Lins& L, FILE* df) {
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
-    gemm(s, L.head.dw, s.gvec, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
+    {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
+        constexpr auto k = dw_adamw<VOCAB, DIM>;
+        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, df ? s.gmat : nullptr, a.logits,
+                                                          a.lnf, s.step, s.gvec, (const uint32_t*)(a.io + IO_TOUCHED));
+    }
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
@@ -326,7 +331,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
             const size_t o = P_EMBED + l * P_LAYER + off;
             kernel<<<dim3(in / 64, out / 64), 128, 0, stream>>>(s.master + o, s.params + o, s.m + o, s.v + o, gout, dy, x,
-                                                               s.step);
+                                                               s.step, nullptr, nullptr);
         };
         float* gln = s.gvec + P_EMBED + l * 2 * DIM;
         float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
@@ -362,19 +367,19 @@ static void backward(State& s, const Lins& L, FILE* df) {
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln, g.dw_part);
         put("dres_in", g.dres, 1, DIM);
     }
-    embed_bwd<<<N, DIM / 4, 0, stream>>>(s.gvec, g.dres, a.io, a.io + 2 * N);
+    embed_bwd_adamw<<<N, DIM / 4, 0, stream>>>(s.master, s.params, s.m, s.v, s.gvec, g.dres, a.io, a.io + IO_SEG, s.step);
     CK(cudaGetLastError());
 }
 
-// Weight matrices are updated by AdamW inside backward (dw_adamw); embedding and norm weights after it.
+// AdamW runs inside backward for the weight matrices and the embedding (dw_adamw, embed_bwd_adamw); norms after it.
 static void train_step(State& s, const Lins& L, FILE* df) {
     next_step<<<1, 1, 0, stream>>>(s.step);
     forward(s, L, df);
     backward(s, L, df);
     dump(df, "gmat", s.gmat, 0, 1, LAYERS * P_MAT);
     dump(df, "gvec", s.gvec, 1, 1, G_VEC);
-    static_assert(G_VEC % 4 == 0, "adamw_vec works on float4");
-    adamw_vec<<<cdiv(G_VEC / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gvec, s.m, s.v, s.step);
+    static_assert(P_EMBED % 4 == 0 && G_VEC % 4 == 0, "adamw_norms works on float4");
+    adamw_norms<<<cdiv((G_VEC - P_EMBED) / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gvec, s.m, s.v, s.step);
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
     dump(df, "params", s.params, 0, 1, P_TOTAL);
@@ -434,7 +439,7 @@ static Tokens map_tokens(const char* path) {
 // Also builds embed_bwd segments: positions sorted by (token, position), one segment per distinct token.
 static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* sorted) {
     const size_t nb = (d.n - 1) / N, s = (i % nb) * N;
-    int *tok = io, *tgt = io + N, *perm = io + 2 * N, *starts = io + 3 * N;
+    int *tok = io, *tgt = io + N, *perm = io + IO_SEG, *starts = io + IO_SEG + N;
     for (int j = 0; j < N; j++) {
         tok[j] = d.data[s + j];
         tgt[j] = d.data[s + j + 1];
@@ -448,6 +453,9 @@ static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* so
     }
     starts[count] = N;
     starts[N + 1] = count;
+    uint32_t* touched = (uint32_t*)(io + IO_TOUCHED);
+    memset(touched, 0, VOCAB / 8);
+    for (int j = 0; j < count; j++) touched[sorted[starts[j]].first >> 5] |= 1u << (sorted[starts[j]].first & 31);
 }
 
 int main(int argc, char** argv) {

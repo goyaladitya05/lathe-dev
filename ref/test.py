@@ -20,7 +20,7 @@ KERNEL_TOL = 2 ** -8  # rel L2 for kernels with bf16 outputs: one bf16 unit roun
 F32_TOL = 1e-4        # rel L2 for kernels with fp32 outputs: summation-order noise (K*eps = 1.2e-4 at K = 2048)
 E2E_RATIO = 2.0
 MEDIAN_RATIO = 1.25
-BIAS_BATCHES = 8
+BIAS_BATCHES = 16
 CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
 
@@ -211,29 +211,36 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         check("rmsnorm 1 bwd dx + residual", rel(f("dres_in"), f("dres_mid") + dx), F32_TOL)
         check("rmsnorm 1 bwd dw", rel(G("input_layernorm.weight"), dw), F32_TOL)
     print(" backward embedding")
-    gemb = dlogits.T @ lnf
+    gemb = bf(dlogits.T @ lnf)  # PyTorch: bf16 lm_head dW, plus the fp32 lookup grad
     gemb.index_add_(0, x.view(-1).cuda(), d["L0.dres_in"].cuda())
-    check("embedding grad (lm_head dW + lookup)", rel(grads["embed_tokens.weight"].cuda(), gemb), F32_TOL)
+    check("embedding grad (bf16 lm_head dW + lookup)", rel(grads["embed_tokens.weight"].cuda(), gemb), KERNEL_TOL)
 
 
 def e2e_checks(d, lathe_losses, model, tokens, B, T):
-    # Accuracy on batch 0 (dumped logits); bias on mean loss over BIAS_BATCHES batches, tol = 3 standard errors.
+    # Accuracy on batch 0 (dumped logits); bias on mean loss over BIAS_BATCHES batches.
     x, y = (t.cuda() for t in get_batch(tokens, 0, B, T))
     ce = lambda lg: F.cross_entropy(lg.float().view(-1, lg.size(-1)), y.view(-1), reduction="none").double()
     with torch.no_grad():
         lg32 = model(x)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             lg16 = model(x)
-        ref = [model(*(t.cuda() for t in get_batch(tokens, i, B, T)))[1].item() for i in range(BIAS_BATCHES)]
+        batches = [[t.cuda() for t in get_batch(tokens, i, B, T)] for i in range(BIAS_BATCHES)]
+        ref = [model(*xy)[1].item() for xy in batches]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            ref16 = [model(*xy)[1].item() for xy in batches]
     lg = d["logits"].cuda().view_as(lg32)
     dl, dl16 = ce(lg) - ce(lg32), ce(lg16) - ce(lg32)
     print(f" end to end   batch 0 loss: fp32 {ce(lg32).mean():.6f}  torch-bf16 {ce(lg16).mean():.6f}  "
           f"lathe {ce(lg).mean():.6f}")
-    print(f"   mean loss over {BIAS_BATCHES} batches: fp32 {np.mean(ref):.6f}  lathe {np.mean(lathe_losses):.6f}")
+    print(f"   mean loss over {BIAS_BATCHES} batches: fp32 {np.mean(ref):.6f}  torch-bf16 {np.mean(ref16):.6f}  "
+          f"lathe {np.mean(lathe_losses):.6f}")
     check("logits rel err vs fp32", rel(lg, lg32), E2E_RATIO * rel(lg16, lg32))
     rms = lambda t: t.pow(2).mean().sqrt().item()
     check("per-token loss rms vs fp32", rms(dl), E2E_RATIO * rms(dl16))
-    check("mean loss bias", abs(np.mean(lathe_losses) - np.mean(ref)), 3 * dl.std().item() / (BIAS_BATCHES * B * T) ** 0.5)
+    # bf16 itself shifts the mean loss slightly (flash attention's bf16 P), so lathe may be off fp32 by torch-bf16's
+    # shift plus 3 standard errors.
+    check("mean loss bias", abs(np.mean(lathe_losses) - np.mean(ref)),
+          abs(np.mean(ref16) - np.mean(ref)) + 3 * dl.std().item() / (BIAS_BATCHES * B * T) ** 0.5)
 
 
 def ref_grads(model, x, y, bf16):

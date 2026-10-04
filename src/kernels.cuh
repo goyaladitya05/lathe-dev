@@ -738,26 +738,6 @@ __global__ void __launch_bounds__(1024) mean_loss(float* loss, const float* loss
     if (threadIdx.x == 0) *loss = part[0] / N;
 }
 
-// gemb[tok] += sum of dres rows for that token. seg = [perm N][starts N+1][count 1] built on the host:
-// positions sorted by token, so each block sums one token's rows in a fixed order (no atomics).
-__global__ void __launch_bounds__(DIM / 4) embed_bwd(float* gemb, const float* dres, const int* tok, const int* seg) {
-    const int* perm = seg;
-    const int* starts = seg + N;
-    if ((int)blockIdx.x >= starts[N + 1]) return;
-    const int s0 = starts[blockIdx.x], s1 = starts[blockIdx.x + 1], c = threadIdx.x * 4;
-    float4 acc = {0.f, 0.f, 0.f, 0.f};
-    for (int k = s0; k < s1; k++) {
-        float4 d = *(const float4*)(dres + (size_t)perm[k] * DIM + c);
-        acc.x += d.x;
-        acc.y += d.y;
-        acc.z += d.z;
-        acc.w += d.w;
-    }
-    float4* g = (float4*)(gemb + (size_t)tok[perm[s0]] * DIM + c);
-    float4 cur = *g;
-    *g = {cur.x + acc.x, cur.y + acc.y, cur.z + acc.z, cur.w + acc.w};
-}
-
 // AdamW, same math as PyTorch's fused kernel (fp32). bc1 = 1 - beta1^step, bc2_sqrt = sqrt(1 - beta2^step).
 __device__ __forceinline__ void adamw_update(float& p, float& m, float& v, float g, float bc1, float bc2_sqrt) {
     p -= LR * WEIGHT_DECAY * p;
@@ -768,15 +748,45 @@ __device__ __forceinline__ void adamw_update(float& p, float& m, float& v, float
 
 __global__ void next_step(float* step) { *step += 1.f; }
 
-// AdamW for the fp32-grad parameters (embedding, norm weights; gvec layout), 4 per thread. The weight matrices are
-// updated inside their dW GEMMs (dw_adamw). Also refreshes the bf16 working copy.
-__global__ void adamw_vec(float* p, bf16* pb, const float* gvec, float* m, float* v, const float* step_count) {
-    const size_t j = 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
+// Embedding rows of the batch's tokens: grad = (bf16-rounded head grad, already in gemb) + sum of dres rows for that
+// token, then AdamW on the row. seg = [perm N][starts N+1][count 1] from the host: positions sorted by token, one
+// block per distinct token, rows summed in a fixed order (no atomics).
+__global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, float* m, float* v, float* gemb,
+                                                           const float* dres, const int* tok, const int* seg,
+                                                           const float* step_count) {
+    const int* perm = seg;
+    const int* starts = seg + N;
+    if ((int)blockIdx.x >= starts[N + 1]) return;
+    const int s0 = starts[blockIdx.x], s1 = starts[blockIdx.x + 1];
+    const size_t o = (size_t)tok[perm[s0]] * DIM + threadIdx.x * 4;
+    float4 G = *(float4*)(gemb + o);
+    for (int k = s0; k < s1; k++) {
+        float4 d = *(const float4*)(dres + (size_t)perm[k] * DIM + threadIdx.x * 4);
+        G.x += d.x;
+        G.y += d.y;
+        G.z += d.z;
+        G.w += d.w;
+    }
+    *(float4*)(gemb + o) = G;
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    float4 P = *(float4*)(p + o), M = *(float4*)(m + o), V = *(float4*)(v + o);
+    adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
+    adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+    adamw_update(P.z, M.z, V.z, G.z, bc1, bc2_sqrt);
+    adamw_update(P.w, M.w, V.w, G.w, bc1, bc2_sqrt);
+    *(float4*)(p + o) = P;
+    *(float4*)(m + o) = M;
+    *(float4*)(v + o) = V;
+    *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
+}
+
+// AdamW for the norm weights (gvec past the embedding), 4 per thread; also refreshes the bf16 copy. Weight matrices
+// and the embedding are updated inside their dW GEMMs (dw_adamw) and embed_bwd_adamw.
+__global__ void adamw_norms(float* p, bf16* pb, const float* gvec, float* m, float* v, const float* step_count) {
+    const size_t j = P_EMBED + 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
     if (j >= G_VEC) return;
-    size_t o;  // parameter offset of gvec[j]
-    if (j < P_EMBED) o = j;
-    else if (j < G_VEC - DIM) o = P_EMBED + (j - P_EMBED) / (2 * DIM) * P_LAYER + P_MAT + (j - P_EMBED) % (2 * DIM);
-    else o = P_TOTAL - DIM + (j - (G_VEC - DIM));
+    const size_t o = j < G_VEC - DIM ? P_EMBED + (j - P_EMBED) / (2 * DIM) * P_LAYER + P_MAT + (j - P_EMBED) % (2 * DIM)
+                                     : P_TOTAL - DIM + (j - (G_VEC - DIM));  // parameter offset of gvec[j]
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
     float4 P = *(float4*)(p + o), G = *(const float4*)(gvec + j), M = *(float4*)(m + o), V = *(float4*)(v + o);
     adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
@@ -793,10 +803,14 @@ __global__ void adamw_vec(float* p, bf16* pb, const float* gvec, float* m, float
 // come through ldmatrix.trans. The AdamW update is fused into the epilogue: the grad, rounded to bf16 like PyTorch's
 // dW, updates master, moments and the bf16 copy of W in place while other blocks are still multiplying.
 // gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; 4-stage cp.async.
+// Tied embedding (lm_head dW): rows whose token is in the batch (bit set in `touched`) also get the lookup grad
+// later, so their bf16-rounded head grad goes to gemb (fp32) and embed_bwd_adamw finishes them; gemb receives every
+// row's grad when gout is set (tests).
 constexpr int DW_ST = 4;
 template <int OUT, int IN>
 __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
-                                                const bf16* X, const float* step_count) {
+                                                const bf16* X, const float* step_count, float* gemb = nullptr,
+                                                const uint32_t* touched = nullptr) {
     static_assert(OUT % 64 == 0 && IN % 64 == 0 && N % GBK == 0, "whole dW tiles");
     constexpr int KT = N / GBK;
     __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
@@ -840,10 +854,16 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
     for (int r = 0; r < 2; r++)
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            const size_t o = (size_t)(bm + wm0 + g + 8 * r) * IN + bn + 8 * j + 2 * t;
+            const int row = bm + wm0 + g + 8 * r;
+            const size_t o = (size_t)row * IN + bn + 8 * j + 2 * t;
             const bf162 gb = __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
-            if (gout) *(bf162*)(gout + o) = gb;
             const float2 gf = __bfloat1622float2(gb);
+            if (gemb) {
+                if (gout || touched[row >> 5] >> (row & 31) & 1) *(float2*)(gemb + o) = gf;
+                if (touched[row >> 5] >> (row & 31) & 1) continue;
+            } else if (gout) {
+                *(bf162*)(gout + o) = gb;
+            }
             float2 P = *(float2*)(p + o), M = *(float2*)(m + o), V = *(float2*)(v + o);
             adamw_update(P.x, M.x, V.x, gf.x, bc1, bc2_sqrt);
             adamw_update(P.y, M.y, V.y, gf.y, bc1, bc2_sqrt);
