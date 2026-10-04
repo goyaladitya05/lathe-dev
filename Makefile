@@ -4,13 +4,16 @@ BATCH ?= 1
 SEQ ?= 2048
 CUDA ?= /usr/local/cuda
 NVCC ?= $(CUDA)/bin/nvcc
-OUT := build/train_$(MODEL)_b$(BATCH)_t$(SEQ)
+STEP_TIMES ?=
+CHISEL_DOWN ?=
+CHISEL_DKV ?=
+OUT := build/train_$(MODEL)_b$(BATCH)_t$(SEQ)$(if $(CHISEL_DOWN),_cdown)$(if $(CHISEL_DKV),_cdkv)$(if $(STEP_TIMES),_timed)
 NVFLAGS := -O3 -std=c++17 -arch=sm_89 -lineinfo -Xcompiler -Wall,-Wextra -Xptxas -warn-spills
 LDFLAGS := -lcublasLt -Xlinker -rpath,$(CUDA)/lib64
 
-$(OUT): src/train.cu src/kernels.cuh src/models/$(MODEL).h src/targets/sm89.h
+$(OUT): src/train.cu src/kernels.cuh src/models/$(MODEL).h src/targets/sm89.h $(if $(CHISEL_DOWN),src/chisel_gemm.h) $(if $(CHISEL_DKV),src/chisel_att.h)
 	@mkdir -p build
-	$(NVCC) $(NVFLAGS) -DMODEL='"$(MODEL)"' -DMODEL_H='"models/$(MODEL).h"' -DBATCH=$(BATCH) -DSEQ=$(SEQ) -Isrc $< -o $@ $(LDFLAGS)
+	$(NVCC) $(NVFLAGS) $(if $(STEP_TIMES),-DSTEP_TIMES) $(if $(CHISEL_DOWN),-DCHISEL_DOWN) $(if $(CHISEL_DKV),-DCHISEL_DKV) -DMODEL='"$(MODEL)"' -DMODEL_H='"models/$(MODEL).h"' -DBATCH=$(BATCH) -DSEQ=$(SEQ) -Isrc $< -o $@ $(LDFLAGS) $(if $(CHISEL_DOWN)$(CHISEL_DKV),-lcuda)
 
 clean:
 	rm -rf build
