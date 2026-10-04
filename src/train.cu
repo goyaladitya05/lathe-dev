@@ -107,6 +107,7 @@ struct Bwd {
     bf16* dgu;       // [N][2*FFN]
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
+    float* dq_acc;   // [N][HEADS][HEAD_DIM] fp32 dq, accumulated atomically by attention_bwd_dkv
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     bf16* gmat;      // [P_MAT] one layer's matrix grads, written only when dumping (they never leave registers)
 };
@@ -171,6 +172,7 @@ static void carve(Arena& ar, State& s) {
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
+    g.dq_acc = ar.take<float>((size_t)N * HEADS * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
     g.gmat = ar.take<bf16>(P_MAT);
 }
@@ -354,10 +356,11 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
         dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
         put("datt", g.datt, 0, DIM);
-        attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
-        attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.part, qkv, g.datt, lse, g.dsum);
+        attention_dsum<<<cdiv(N * HEADS * 8, 256), 256, 0, stream>>>(g.dsum, att, g.datt);
+        CK(cudaMemsetAsync(g.dq_acc, 0, (size_t)N * HEADS * HEAD_DIM * sizeof(float), stream));
+        attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, ATT_BWD_SMEM, stream>>>(g.part, g.dq_acc, qkv, g.datt, lse, g.dsum);
         attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
-                                                                                                       s.rope);
+                                                                                                       g.dq_acc, s.rope);
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
         dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
@@ -479,6 +482,7 @@ int main(int argc, char** argv) {
     CK(cudaSetDevice(0));
     CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     CKB(cublasLtCreate(&lt));
+    CK(cudaFuncSetAttribute(attention_bwd_dkv, cudaFuncAttributeMaxDynamicSharedMemorySize, ATT_BWD_SMEM));
 
     State s;
     Arena ar{nullptr, 0};

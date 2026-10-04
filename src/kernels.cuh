@@ -481,98 +481,39 @@ __global__ void __launch_bounds__(128) attention_fwd(bf16* out, float* lse, cons
     }
 }
 
-// dq (before RoPE backward) for 64 query rows of one head, written into dqkv's q columns, and
-// Dsum = rowsum(dO * O), which attention_bwd_dkv reads.
-__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, float* Dsum, const bf16* qkv, const bf16* out,
-                                                        const bf16* dout, const float* lse) {
-    const int qt = NT - 1 - blockIdx.x, h = blockIdx.y, b = blockIdx.z;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
-    const bf16* vg = kg + KV_HEADS * HEAD_DIM;
-    const size_t row0 = (size_t)b * T + qt * 64, lrow = ((size_t)b * HEADS + h) * T + qt * 64;
-    __shared__ __align__(128) bf16 ks[2][TILE], vs[2][TILE];
-    __shared__ float dsm[64];
-
-    load_tile(ks[1], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);  // Q and dO staged in buffer 1
-    load_tile(vs[1], dout + row0 * DIM + h * HEAD_DIM, DIM);
-    load_tile(ks[0], kg, QKV_DIM);
-    load_tile(vs[0], vg, QKV_DIM);
-    cp_commit();
-    {  // D, two threads per row
-        const int r = threadIdx.x >> 1, c0 = (threadIdx.x & 1) * 32;
-        const bf16 *dp = dout + (row0 + r) * DIM + h * HEAD_DIM + c0, *op = out + (row0 + r) * DIM + h * HEAD_DIM + c0;
-        float acc = 0.f;
+// Dsum = rowsum(dO * O) per (token, head), fp32, 8 threads per row.
+__global__ void attention_dsum(float* Dsum, const bf16* out, const bf16* dout) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = i / 8, c = i % 8 * 8;  // 8 threads per (token, head)
+    if (r >= N * HEADS) return;
+    const int n = r / HEADS, h = r % HEADS;
+    float a8[8], b8[8], acc = 0.f;
+    load8(a8, dout + (size_t)n * DIM + h * HEAD_DIM + c);
+    load8(b8, out + (size_t)n * DIM + h * HEAD_DIM + c);
 #pragma unroll
-        for (int c = 0; c < 32; c += 8) {
-            float a8[8], b8[8];
-            load8(a8, dp + c);
-            load8(b8, op + c);
+    for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
 #pragma unroll
-            for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
-        }
-        acc += __shfl_xor_sync(0xffffffff, acc, 1);
-        if (!(threadIdx.x & 1)) {
-            dsm[r] = acc;
-            Dsum[lrow + r] = acc;
-        }
-    }
-    cp_wait<0>();
-    __syncthreads();
-    uint32_t qf[4][4], df[4][4];
-    frag_a(qf, ks[1], warp * 16);
-    frag_a(df, vs[1], warp * 16);
-    const int r0 = warp * 16 + g, q0 = qt * 64 + r0;
-    const float dd[2] = {dsm[r0], dsm[r0 + 8]}, l2[2] = {lse[lrow + r0], lse[lrow + r0 + 8]};
-    __syncthreads();
-
-    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
-    float dq[8][4] = {};
-    for (int kt = 0; kt <= qt; kt++) {
-        if (kt < qt) {
-            load_tile(ks[(kt + 1) & 1], kg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
-            load_tile(vs[(kt + 1) & 1], vg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
-        }
-        cp_commit();
-        cp_wait<1>();
-        __syncthreads();
-        float s[8][4] = {}, dp[8][4] = {};
-        mma_abt(s, qf, ks[kt & 1]);
-        mma_abt(dp, df, vs[kt & 1]);
-#pragma unroll
-        for (int j = 0; j < 8; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int r = e >> 1;
-                const bool masked = kt == qt && kt * 64 + 8 * j + 2 * t + (e & 1) > q0 + 8 * r;
-                const float p = masked ? 0.f : exp2f(s[j][e] * scale - l2[r]);
-                s[j][e] = p * (dp[j][e] - dd[r]);
-            }
-        uint32_t sf[4][4];
-        c_to_a(sf, s);
-        mma_ab(dq, sf, ks[kt & 1]);
-        __syncthreads();
-    }
-    const float k = scale / LOG2E;  // dS is w.r.t. scores scaled by 1/sqrt(HEAD_DIM)
-#pragma unroll
-    for (int r = 0; r < 2; r++) {
-        bf16* row = dqkv + (row0 + r0 + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
-#pragma unroll
-        for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
-    }
+    for (int o = 4; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+    if (c == 0) Dsum[((size_t)(n / T) * HEADS + h) * T + n % T] = acc;
 }
 
-// dk, dv contributions of one query head for 64 key rows (4 warps x 16 keys), over all query tiles that see
-// them. fp32 partials [N][HEADS][dk 64 | dv 64]; attention_bwd_finish sums the heads of each kv group.
-__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16* qkv, const bf16* dout,
+// Single-pass attention backward (FlashAttention-2 with atomic dq; nondeterministic in dq's last bits).
+// One query head, 64 key rows (4 warps x 16 keys), all query tiles that see them: dk, dv as fp32 partials
+// [N][HEADS][dk 64 | dv 64] (attention_bwd_finish sums the kv group), and dq += dS K added atomically into
+// dq_acc [N][HEADS][64] fp32 through a dS tile in shared memory.
+constexpr int ATT_BWD_SMEM = 6 * TILE * 2 + 4 * 64 * 4;
+__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, float* dq_acc, const bf16* qkv, const bf16* dout,
                                                          const float* lse, const float* Dsum) {
     const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;  // kt = 0 has the most work
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
     const size_t lrow = ((size_t)b * HEADS + h) * T;
-    __shared__ __align__(128) bf16 qs[2][TILE], dos[2][TILE];
-    __shared__ __align__(16) float ls[2][64], dds[2][64];
+    extern __shared__ __align__(128) bf16 smem[];
+    bf16(*qs)[TILE] = (bf16(*)[TILE])smem;
+    bf16(*dos)[TILE] = (bf16(*)[TILE])(smem + 2 * TILE);
+    bf16 *ks = smem + 4 * TILE, *dst = smem + 5 * TILE;  // K tile (kept), dS^T tile [keys][queries]
+    float(*ls)[64] = (float(*)[64])(smem + 6 * TILE);
+    float(*dds)[64] = ls + 2;
 
     auto load_q = [&](int qt, int buf) {  // Q, dO, lse and D of query tile qt
         load_tile(qs[buf], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);
@@ -580,14 +521,14 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16
         if (threadIdx.x < 16) cp16(&ls[buf][threadIdx.x * 4], lse + lrow + qt * 64 + threadIdx.x * 4);
         else if (threadIdx.x < 32) cp16(&dds[buf][(threadIdx.x - 16) * 4], Dsum + lrow + qt * 64 + (threadIdx.x - 16) * 4);
     };
-    load_tile(qs[1], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);  // K and V staged in buffer 1
+    load_tile(ks, kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);  // K stays; V staged in buffer 1
     load_tile(dos[1], kg + KV_HEADS * HEAD_DIM + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
     load_q(kt, 0);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
     uint32_t kf[4][4], vf[4][4];
-    frag_a(kf, qs[1], warp * 16);
+    frag_a(kf, ks, warp * 16);
     frag_a(vf, dos[1], warp * 16);
     __syncthreads();
 
@@ -618,6 +559,35 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16
         c_to_a(sf, dpt);
         mma_ab(dv, pf, dos[buf]);  // dV += P^T dO
         mma_ab(dk, sf, qs[buf]);   // dK += dS^T Q
+#pragma unroll
+        for (int j = 0; j < 8; j++)  // dS^T (bf16) to shared memory for dQ = dS K
+#pragma unroll
+            for (int r = 0; r < 2; r++)
+                *(bf162*)(dst + swz(warp * 16 + g + 8 * r, j) + 2 * t) = __floats2bfloat162_rn(dpt[j][2 * r], dpt[j][2 * r + 1]);
+        __syncthreads();
+        float dq[8][4] = {};  // 16 queries (rows warp*16..) x 64 dims, over the block's 64 keys
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            uint32_t a[4];
+            ldsm4t(a, dst + swz(16 * kk + (lane & 7) + ((lane >> 4) << 3), warp * 2 + ((lane >> 3) & 1)));
+#pragma unroll
+            for (int np = 0; np < 4; np++) {
+                uint32_t r[4];
+                ldsm4t(r, ks + swz(16 * kk + (lane & 15), 2 * np + (lane >> 4)));
+                mma(dq[2 * np], a, r[0], r[1]);
+                mma(dq[2 * np + 1], a, r[2], r[3]);
+            }
+        }
+        const float kq = scale / LOG2E;
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            float* row = dq_acc + (((size_t)b * T + qt * 64 + warp * 16 + g + 8 * r) * HEADS + h) * HEAD_DIM + 2 * t;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                atomicAdd(row + 8 * j, dq[j][2 * r] * kq);
+                atomicAdd(row + 8 * j + 1, dq[j][2 * r + 1] * kq);
+            }
+        }
         __syncthreads();
     }
     const float k = scale / LOG2E;
@@ -632,8 +602,8 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16
     }
 }
 
-// dqkv <- [RoPE^-1(dq) | RoPE^-1(sum over the group's heads of dk) | sum of dv], dq read in place from dqkv.
-__global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2* cs) {
+// dqkv <- [RoPE^-1(dq) | RoPE^-1(sum over the group's heads of dk) | sum of dv], dq from dq_acc (fp32).
+__global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float* dq_acc, const float2* cs) {
     constexpr int HALF = HEAD_DIM / 2, U = HEADS + 2 * KV_HEADS, G = HEADS / KV_HEADS;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N * U * HALF) return;
@@ -641,8 +611,9 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
     bf16* y = dqkv + (size_t)n * QKV_DIM + u * HEAD_DIM;
     float x1 = 0.f, x2 = 0.f;
     if (u < HEADS) {
-        x1 = __bfloat162float(y[d]);
-        x2 = __bfloat162float(y[d + HALF]);
+        const float* q = dq_acc + ((size_t)n * HEADS + u) * HEAD_DIM;
+        x1 = q[d];
+        x2 = q[d + HALF];
     } else {
         const int kv = (u - HEADS) % KV_HEADS, off = u < HEADS + KV_HEADS ? 0 : HEAD_DIM;
         for (int hh = kv * G; hh < (kv + 1) * G; hh++) {

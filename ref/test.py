@@ -316,7 +316,8 @@ def unit(B, T):
 
     common = ["--weights", DATA / "smol135_init.bin", "--data", val, "--steps", 6, "--group", 6]
     graph, eager = (losses_from(run_lathe(B, T, *common, *extra), "step") for extra in [[], ["--eager", 1]])
-    check("CUDA graph replay == eager, 6 steps", float(graph != eager), 0)
+    # atomic dq accumulation is nondeterministic in the last bits, so graph and eager runs agree only closely
+    check("CUDA graph replay ~ eager, 6 steps", max(abs(a - b) / b for a, b in zip(graph, eager)), 1e-3)
 
     tokens = np.memmap(val, dtype=np.uint16, mode="r")
     x, y = get_batch(tokens, 0, B, T)
