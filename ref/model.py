@@ -217,6 +217,14 @@ def unsplit(model, flat):
         sd["norm.weight"].copy_(next(it))
 
 
+# Training hyperparameters shared by baseline, tests, and lathe (src/train.cu must match).
+LR, BETAS, EPS, WD = 3e-4, (0.9, 0.95), 1e-8, 0.1
+
+
+def make_optimizer(model):
+    return torch.optim.AdamW(model.parameters(), lr=LR, betas=BETAS, eps=EPS, weight_decay=WD, fused=True)
+
+
 def get_batch(tokens, i, B, T):
     # Batch i = contiguous span of B*T+1 tokens, wrapping over whole batches. lathe uses the same order.
     nb = (len(tokens) - 1) // (B * T)
