@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -117,12 +118,13 @@ class Model(nn.Module):
         self.embed_tokens = nn.Embedding(cfg.vocab, cfg.dim)
         self.layers = nn.ModuleList(Block(cfg) for _ in range(cfg.layers))
         self.norm = RMSNorm(cfg.dim, cfg.rms_eps)
+        self.ckpt = False  # recompute each block in backward (fits fp32 runs in memory)
 
     def forward(self, idx, targets=None):
         cos, sin = rope_table(self.cfg, idx.shape[1], idx.device)
         x = self.embed_tokens(idx)
         for layer in self.layers:
-            x = layer(x, cos, sin)
+            x = checkpoint(layer, x, cos, sin, use_reentrant=False) if self.ckpt else layer(x, cos, sin)
         logits = F.linear(self.norm(x), self.embed_tokens.weight)  # tied
         if targets is None:
             return logits
@@ -183,38 +185,35 @@ def export(model, path):
             f.write(t.detach().float().cpu().contiguous().numpy().tobytes())
 
 
+def from_lathe(flat, cfg):
+    # Inverse of lathe_layout: flat fp32 tensor in lathe order -> HF-named views.
+    hd, out, off = cfg.head_dim, {}, 0
+
+    def take(*shape):
+        nonlocal off
+        n = int(np.prod(shape))
+        off += n
+        return flat[off - n:off].view(shape)
+
+    out["embed_tokens.weight"] = take(cfg.vocab, cfg.dim)
+    for i in range(cfg.layers):
+        p = f"layers.{i}."
+        q, k, v = take((cfg.heads + 2 * cfg.kv_heads) * hd, cfg.dim).split([cfg.heads * hd, cfg.kv_heads * hd,
+                                                                            cfg.kv_heads * hd])
+        out[p + "self_attn.q_proj.weight"], out[p + "self_attn.k_proj.weight"] = q, k
+        out[p + "self_attn.v_proj.weight"] = v
+        out[p + "self_attn.o_proj.weight"] = take(cfg.dim, cfg.heads * hd)
+        out[p + "mlp.gate_proj.weight"], out[p + "mlp.up_proj.weight"] = take(2 * cfg.ffn, cfg.dim).split(cfg.ffn)
+        out[p + "mlp.down_proj.weight"] = take(cfg.dim, cfg.ffn)
+        out[p + "input_layernorm.weight"] = take(cfg.dim)
+        out[p + "post_attention_layernorm.weight"] = take(cfg.dim)
+    out["norm.weight"] = take(cfg.dim)
+    assert off == flat.numel()
+    return out
+
+
 def load_lathe(model, path):
-    params = np.fromfile(path, dtype=np.float32, offset=256)
-    sd, off = model.state_dict(), 0
-    flat = []
-    for t in lathe_layout(sd, model.cfg):
-        flat.append(torch.from_numpy(params[off:off + t.numel()].copy()).view(t.shape))
-        off += t.numel()
-    assert off == params.size
-    unsplit(model, flat)
-
-
-def unsplit(model, flat):
-    # Inverse of lathe_layout: list of lathe-order tensors -> HF state dict tensors (in place).
-    c, hd = model.cfg, model.cfg.head_dim
-    sd = model.state_dict()
-    it = iter(flat)
-    with torch.no_grad():
-        sd["embed_tokens.weight"].copy_(next(it))
-        for i in range(c.layers):
-            p = f"layers.{i}."
-            q, k, v = next(it).split([c.heads * hd, c.kv_heads * hd, c.kv_heads * hd])
-            sd[p + "self_attn.q_proj.weight"].copy_(q)
-            sd[p + "self_attn.k_proj.weight"].copy_(k)
-            sd[p + "self_attn.v_proj.weight"].copy_(v)
-            sd[p + "self_attn.o_proj.weight"].copy_(next(it))
-            g, u = next(it).split([c.ffn, c.ffn])
-            sd[p + "mlp.gate_proj.weight"].copy_(g)
-            sd[p + "mlp.up_proj.weight"].copy_(u)
-            sd[p + "mlp.down_proj.weight"].copy_(next(it))
-            sd[p + "input_layernorm.weight"].copy_(next(it))
-            sd[p + "post_attention_layernorm.weight"].copy_(next(it))
-        sd["norm.weight"].copy_(next(it))
+    model.load_state_dict(from_lathe(torch.from_numpy(np.fromfile(path, dtype=np.float32, offset=256)), model.cfg))
 
 
 # Training hyperparameters shared by baseline, tests, and lathe (src/train.cu must match).

@@ -1,7 +1,9 @@
 # Correctness of lathe against the reference.
-# Per-kernel: each lathe kernel output vs fp32 math on lathe's own dumped inputs (bf16-rounded weights).
-# End-to-end: lathe logits/loss vs the fp32 reference, measured against PyTorch bf16 autocast's own error.
-#   python ref/test.py [B T]   (default 2 512)
+#   python ref/test.py [B T]              kernels fwd/bwd, end to end, every parameter grad, AdamW (default 2 512)
+#   python ref/test.py curve [steps]      loss curve vs reference training at 1x2048 (default 1000 steps)
+# Per-kernel checks feed each lathe kernel's dumped inputs to fp32 math (bf16-rounded matmul weights).
+# End-to-end checks measure lathe against an fp32 reference, with PyTorch bf16 autocast's own error as the
+# yardstick: lathe may be at most E2E_RATIO times worse.
 import re
 import struct
 import subprocess
@@ -11,37 +13,57 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model import DATA, ROOT, Config, Model, get_batch, init_weights, lathe_layout, load_lathe, rope, rope_table
+from model import (DATA, ROOT, Config, Model, from_lathe, get_batch, init_weights, lathe_layout, load_lathe,
+                   make_optimizer, rope, rope_table)
 
-B, T = (int(v) for v in sys.argv[1:3]) if len(sys.argv) == 3 else (2, 512)
-KERNEL_TOL = 2 ** -8  # rel L2 per kernel: one bf16 unit roundoff
-E2E_RATIO = 2.0       # lathe error vs fp32 may be at most this times torch-bf16 error vs fp32
+KERNEL_TOL = 2 ** -8  # rel L2 for kernels with bf16 outputs: one bf16 unit roundoff
+F32_TOL = 1e-5        # rel L2 for kernels with fp32 outputs
+E2E_RATIO = 2.0
+MEDIAN_RATIO = 1.25
 BIAS_BATCHES = 8
-DT = {0: torch.bfloat16, 1: torch.float32, 2: torch.int32}
 failures = []
 
 
 def rel(a, b):
-    a, b = a.double(), b.double()
-    return ((a - b).norm() / b.norm()).item()
+    # ||a - b|| / ||b|| in fp64, chunked so 100M-element tensors fit in memory.
+    num = den = 0.0
+    for x, y in zip(a.reshape(-1).split(1 << 24), b.reshape(-1).split(1 << 24)):
+        x, y = x.double(), y.double()
+        num += (x - y).pow(2).sum().item()
+        den += y.pow(2).sum().item()
+    return (num / den) ** 0.5
 
 
 def check(name, err, tol):
     ok = err <= tol
-    print(f"  {'ok  ' if ok else 'FAIL'} {name:<28} {err:.2e}  (tol {tol:.2e})")
+    print(f"  {'ok  ' if ok else 'FAIL'} {name:<34} {err:.2e}  (tol {tol:.2e})")
     if not ok:
         failures.append(name)
 
 
 def read_dump(path):
-    raw, out, off = path.read_bytes(), {}, 0
+    raw = np.memmap(path, dtype=np.uint8, mode="c")
+    out, off = {}, 0
     while off < len(raw):
-        name = raw[off:off + 48].split(b"\0")[0].decode()
-        dt, _, rows, cols = struct.unpack("<iiqq", raw[off + 48:off + 72])
-        n = rows * cols * DT[dt].itemsize
-        out[name] = torch.frombuffer(bytearray(raw[off + 72:off + 72 + n]), dtype=DT[dt]).view(rows, cols)
+        name = bytes(raw[off:off + 48]).split(b"\0")[0].decode()
+        dt, _, rows, cols = struct.unpack("<iiqq", bytes(raw[off + 48:off + 72]))
+        npdt = {0: np.int16, 1: np.float32, 2: np.int32}[dt]
+        n = rows * cols * np.dtype(npdt).itemsize
+        t = torch.from_numpy(raw[off + 72:off + 72 + n].view(npdt).reshape(rows, cols))
+        out[name] = t.view(torch.bfloat16) if dt == 0 else t
         off += 72 + n
     return out
+
+
+def run_lathe(B, T, *args):
+    out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
+    if out.returncode:
+        sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
+    return out.stdout
+
+
+def losses_from(stdout, kind):
+    return [float(v) for v in re.findall(rf"{kind} \d+ loss ([\d.]+)", stdout)]
 
 
 def check_header(cfg):
@@ -51,53 +73,144 @@ def check_header(cfg):
             "FFN": cfg.ffn, "ROPE_THETA": cfg.rope_theta, "RMS_EPS": cfg.rms_eps}
     bad = {k: (h.get(k), v) for k, v in want.items() if h.get(k) != v}
     check("smol135.h == config.json", len(bad), 0)
-    if bad:
-        print("   ", bad)
 
 
 def rmsnorm(x, w, eps):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 
-def attention(qkv, cfg):
-    hd = cfg.head_dim
-    q, k, v = qkv.view(B, T, -1, hd).transpose(1, 2).split([cfg.heads, cfg.kv_heads, cfg.kv_heads], 1)
+def rmsnorm_grads(x, w, dy, eps):
+    # fp32 autograd of the reference RMSNorm: (dx, dw).
+    x, w = x.clone().requires_grad_(), w.clone().requires_grad_()
+    rmsnorm(x, w, eps).backward(dy)
+    return x.grad, w.grad
+
+
+def attention(qkv, cfg, B, T):
+    q, k, v = qkv.view(B, T, -1, cfg.head_dim).transpose(1, 2).split([cfg.heads, cfg.kv_heads, cfg.kv_heads], 1)
     return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True).transpose(1, 2).reshape(B * T, -1)
 
 
-def kernel_checks(d, model, x, y):
-    cfg = model.cfg
-    W = [t.to(torch.bfloat16).float().cuda() for t in lathe_layout(model.state_dict(), cfg)]  # lathe's bf16 weights
+def attention_bwd(qkv, o, do, cfg, B, T):
+    # fp32 attention backward from the kernel's inputs; D = rowsum(dO * O) uses the stored O, as flash kernels do.
+    hd, G = cfg.head_dim, cfg.heads // cfg.kv_heads
+    q, k, v = qkv.view(B, T, -1, hd).transpose(1, 2).split([cfg.heads, cfg.kv_heads, cfg.kv_heads], 1)
+    k, v = k.repeat_interleave(G, 1), v.repeat_interleave(G, 1)
+    o, do = (t.view(B, T, cfg.heads, hd).transpose(1, 2) for t in (o, do))
+    mask = torch.ones(T, T, dtype=torch.bool, device=qkv.device).triu(1)
+    p = (q @ k.transpose(-1, -2) / hd ** 0.5).masked_fill(mask, float("-inf")).softmax(-1)
+    ds = p * (do @ v.transpose(-1, -2) - (do * o).sum(-1, keepdim=True))
+    fold = lambda t: t.view(B, cfg.kv_heads, G, T, hd).sum(2)  # sum over the query heads sharing a kv head
+    flat = lambda t: t.transpose(1, 2).reshape(B * T, -1)
+    return flat(ds @ k / hd ** 0.5), flat(fold(ds.transpose(-1, -2) @ q / hd ** 0.5)), flat(fold(p.transpose(-1, -2) @ do))
+
+
+def bf(t):
+    return t.to(torch.bfloat16).float()
+
+
+class Weights:
+    # Lathe-order parameters: fp32 (norms, embedding lookup) and bf16-rounded (matmul inputs), per layer.
+    def __init__(self, model):
+        self.f = [t.float().cuda() for t in lathe_layout(model.state_dict(), model.cfg)]
+        self.b = [bf(t) for t in self.f]
+
+    def layer(self, l, kind):  # kind "f" or "b": [qkv, o, gu, down, ln1, ln2]
+        return getattr(self, kind)[1 + 6 * l:7 + 6 * l]
+
+
+def forward_kernel_checks(d, W, x, y, cfg, B, T):
     cos, sin = rope_table(cfg, T, "cuda")
     rot = (cfg.heads + cfg.kv_heads) * cfg.head_dim
     for l in [0, cfg.layers - 1]:
         f = lambda name: d[f"L{l}.{name}"].float().cuda()
-        wqkv, wo, wgu, wdown, ln1, ln2 = W[1 + 6 * l:7 + 6 * l]
-        print(f" layer {l}")
+        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "b")
+        *_, ln1, ln2 = W.layer(l, "f")
+        print(f" forward layer {l}")
         if l == 0:
-            check("embed", rel(f("res"), W[0][x.view(-1).cuda()]), 0)
+            check("embed", rel(f("res"), W.f[0][x.view(-1).cuda()]), 0)
         check("rmsnorm 1", rel(f("ln1"), rmsnorm(f("res"), ln1, cfg.rms_eps)), KERNEL_TOL)
         check("matmul qkv", rel(f("qkv_pre"), f("ln1") @ wqkv.T), KERNEL_TOL)
         qk = f("qkv_pre")[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2)
         check("rope", rel(f("qkv")[:, :rot], rope(qk, cos, sin).transpose(1, 2).reshape(B * T, rot)), KERNEL_TOL)
         check("rope leaves v untouched", rel(f("qkv")[:, rot:], f("qkv_pre")[:, rot:]), 0)
-        check("attention", rel(f("att"), attention(f("qkv"), cfg)), KERNEL_TOL)
-        check("matmul o + residual", rel(f("res_mid"), f("res") + f("att") @ wo.T), KERNEL_TOL)
+        check("attention", rel(f("att"), attention(f("qkv"), cfg, B, T)), KERNEL_TOL)
+        check("matmul o", rel(f("ao"), f("att") @ wo.T), KERNEL_TOL)
+        check("residual add 1 (fp32)", rel(f("res_mid"), f("res") + f("ao")), 0)
         check("rmsnorm 2", rel(f("ln2"), rmsnorm(f("res_mid"), ln2, cfg.rms_eps)), KERNEL_TOL)
         check("matmul gate|up", rel(f("gu"), f("ln2") @ wgu.T), KERNEL_TOL)
-        g, u = f("gu").chunk(2, -1)
-        check("swiglu", rel(f("act"), F.silu(g) * u), KERNEL_TOL)
-        check("matmul down + residual", rel(f("res_out"), f("res_mid") + f("act") @ wdown.T), KERNEL_TOL)
-    print(" output")
+        g, u = d[f"L{l}.gu"].cuda().chunk(2, -1)
+        check("swiglu (vs torch bf16 ops)", rel(f("act"), (F.silu(g) * u).float()), KERNEL_TOL)
+        check("matmul down", rel(f("mo"), f("act") @ wdown.T), KERNEL_TOL)
+        check("residual add 2 (fp32)", rel(f("res_out"), f("res_mid") + f("mo")), 0)
+    print(" forward output")
     lnf = d["lnf"].float().cuda()
-    check("rmsnorm final", rel(lnf, rmsnorm(d[f"L{cfg.layers - 1}.res_out"].float().cuda(), W[-1], cfg.rms_eps)),
-          KERNEL_TOL)
-    check("matmul lm_head", rel(d["logits"].float().cuda(), lnf @ W[0].T), KERNEL_TOL)
+    res_l = d[f"L{cfg.layers - 1}.res_out"].float().cuda()
+    check("rmsnorm final", rel(lnf, rmsnorm(res_l, W.f[-1], cfg.rms_eps)), KERNEL_TOL)
+    check("matmul lm_head", rel(d["logits"].float().cuda(), lnf @ W.b[0].T), KERNEL_TOL)
     ce = F.cross_entropy(d["logits"].float().cuda(), y.view(-1).cuda(), reduction="none")
-    check("cross entropy", rel(d["losses"].view(-1).cuda(), ce), 1e-6)
+    check("cross entropy", rel(d["losses"].view(-1).cuda(), ce), F32_TOL)
 
 
-def e2e_checks(d, lathe_losses, model, tokens):
+def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
+    cos, sin = rope_table(cfg, T, "cuda")
+    rot = (cfg.heads + cfg.kv_heads) * cfg.head_dim
+    eps = cfg.rms_eps
+    logits, lnf = d["logits"].float().cuda(), d["lnf"].float().cuda()
+    dlogits = d["dlogits"].float().cuda()
+    onehot = F.one_hot(y.view(-1).cuda(), cfg.vocab).float()
+    print(" backward output")
+    check("cross entropy bwd", rel(dlogits, (logits.softmax(-1) - onehot) / (B * T)), KERNEL_TOL)
+    check("matmul lm_head dX", rel(d["dlnf"].float().cuda(), dlogits @ W.b[0]), KERNEL_TOL)
+    L = cfg.layers - 1
+    dx, dw = rmsnorm_grads(d[f"L{L}.res_out"].float().cuda(), W.f[-1], d["dlnf"].float().cuda(), eps)
+    check("rmsnorm final bwd dx", rel(d[f"L{L}.dres_out"].cuda(), dx), F32_TOL)
+    check("rmsnorm final bwd dw", rel(grads["norm.weight"].cuda(), dw), F32_TOL)
+    for l in [L, 0]:
+        f = lambda name: d[f"L{l}.{name}"].float().cuda()
+        p = f"layers.{l}."
+        G = lambda name: grads[p + name].cuda()
+        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "b")
+        *_, ln1, ln2 = W.layer(l, "f")
+        print(f" backward layer {l}")
+        dmo = bf(f("dres_out"))
+        check("matmul down dX", rel(f("dact"), dmo @ wdown), KERNEL_TOL)
+        check("matmul down dW (fp32)", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), F32_TOL)
+        g, u = (t.clone().requires_grad_() for t in d[f"L{l}.gu"].cuda().chunk(2, -1))
+        (F.silu(g) * u).backward(d[f"L{l}.dact"].cuda())
+        check("swiglu bwd (vs torch bf16 ops)", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
+        check("matmul gate|up dX", rel(f("dln2"), f("dgu") @ wgu), KERNEL_TOL)
+        gate, up = (f("dgu").T @ f("ln2")).chunk(2)
+        check("matmul gate|up dW (fp32)", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),
+                                               torch.cat([gate, up])), F32_TOL)
+        dx, dw = rmsnorm_grads(f("res_mid"), ln2, f("dln2"), eps)
+        check("rmsnorm 2 bwd dx + residual", rel(f("dres_mid"), f("dres_out") + dx), F32_TOL)
+        check("rmsnorm 2 bwd dw", rel(G("post_attention_layernorm.weight"), dw), F32_TOL)
+        dao = bf(f("dres_mid"))
+        check("matmul o dX", rel(f("datt"), dao @ wo), KERNEL_TOL)
+        check("matmul o dW (fp32)", rel(G("self_attn.o_proj.weight"), dao.T @ f("att")), F32_TOL)
+        hq, hk = cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
+        want = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
+        for name, got, w in zip(["dq", "dk", "dv"], f("dqkv").split([hq, hk, hk], -1), want):
+            check(f"attention bwd {name}", rel(got, w), KERNEL_TOL)
+        dqk = f("dqkv")[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2)
+        check("rope bwd", rel(f("dqkv_pre")[:, :rot], rope(dqk, cos, -sin).transpose(1, 2).reshape(B * T, rot)),
+              KERNEL_TOL)
+        check("rope bwd leaves dv untouched", rel(f("dqkv_pre")[:, rot:], f("dqkv")[:, rot:]), 0)
+        check("matmul qkv dX", rel(f("dln1"), f("dqkv_pre") @ wqkv), KERNEL_TOL)
+        q, k, v = (f("dqkv_pre").T @ f("ln1")).split([hq, hk, hk])
+        check("matmul qkv dW (fp32)", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),
+                                                     G("self_attn.v_proj.weight")]), torch.cat([q, k, v])), F32_TOL)
+        dx, dw = rmsnorm_grads(f("res"), ln1, f("dln1"), eps)
+        check("rmsnorm 1 bwd dx + residual", rel(f("dres_in"), f("dres_mid") + dx), F32_TOL)
+        check("rmsnorm 1 bwd dw", rel(G("input_layernorm.weight"), dw), F32_TOL)
+    print(" backward embedding")
+    gemb = dlogits.T @ lnf
+    gemb.index_add_(0, x.view(-1).cuda(), d["L0.dres_in"].cuda())
+    check("embedding grad (lm_head dW + lookup)", rel(grads["embed_tokens.weight"].cuda(), gemb), F32_TOL)
+
+
+def e2e_checks(d, lathe_losses, model, tokens, B, T):
     # Accuracy on batch 0 (dumped logits); bias on mean loss over BIAS_BATCHES batches, tol = 3 standard errors.
     x, y = (t.cuda() for t in get_batch(tokens, 0, B, T))
     ce = lambda lg: F.cross_entropy(lg.float().view(-1, lg.size(-1)), y.view(-1), reduction="none").double()
@@ -117,7 +230,57 @@ def e2e_checks(d, lathe_losses, model, tokens):
     check("mean loss bias", abs(np.mean(lathe_losses) - np.mean(ref)), 3 * dl.std().item() / (BIAS_BATCHES * B * T) ** 0.5)
 
 
-def main():
+def ref_grads(model, x, y, bf16):
+    model.zero_grad(set_to_none=True)
+    model.ckpt = not bf16
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+        _, loss = model(x, y)
+    loss.backward()
+    model.ckpt = False
+    return {k: p.grad.cpu() for k, p in model.named_parameters()}
+
+
+def grad_checks(grads, model, x, y, per_tensor):
+    # Every parameter: lathe vs fp32 reference, measured against torch-bf16's error vs fp32.
+    # per_tensor: each tensor within E2E_RATIO (random init: errors are stable, ratios ~1).
+    # Otherwise the per-kind median over layers within MEDIAN_RATIO: with pretrained weights, single tensors
+    # near massive activations swing several x between equally valid bf16 implementations (rounding luck after
+    # catastrophic cancellation), while the median over layers is stable.
+    x, y = x.cuda(), y.cuda()
+    g32, g16 = ref_grads(model, x, y, False), ref_grads(model, x, y, True)
+    model.zero_grad(set_to_none=True)
+    groups = {}
+    for k in g32:
+        kind = re.sub(r"layers\.\d+\.", "", k).removesuffix(".weight")
+        groups.setdefault(kind, []).append((rel(grads[k], g32[k]), rel(g16[k], g32[k]), k))
+    print(f" every parameter grad ({len(g32)} tensors) vs fp32: lathe / torch-bf16 error ratio by kind")
+    for kind, rows in groups.items():
+        ratios = [e_l / e_t for e_l, e_t, _ in rows]
+        if per_tensor:
+            e_l, e_t, k = rows[int(np.argmax(ratios))]
+            check(f"{kind} ({len(rows)}) worst", e_l, E2E_RATIO * e_t)
+        else:
+            check(f"{kind} ({len(rows)}) median ratio", float(np.median(ratios)), MEDIAN_RATIO)
+        print(f"         ratio median {np.median(ratios):.2f}  max {max(ratios):.2f}")
+
+
+def adamw_check(d, grads, wpath, cfg):
+    # One step of PyTorch fused AdamW on lathe's grads must reproduce lathe's updated weights.
+    model = Model(cfg)
+    load_lathe(model, wpath)
+    model.cuda()
+    opt = make_optimizer(model)
+    for k, p in model.named_parameters():
+        p.grad = grads[k].cuda()
+    opt.step()
+    want = torch.cat([t.reshape(-1).cpu() for t in lathe_layout(model.state_dict(), cfg)])
+    master = d["master"].view(-1)
+    print(" optimizer")
+    check("AdamW step vs torch fused AdamW", rel(master, want), 1e-6)
+    check("bf16 copy == bf16(master)", float((d["params"].view(-1) != master.to(torch.bfloat16)).sum()), 0)
+
+
+def unit(B, T):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     cfg = Config.load()
@@ -133,16 +296,13 @@ def main():
     subprocess.run(["make", "-s", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
 
     # Run lathe before this process touches the GPU, so its arena never competes with torch for memory.
-    lathe_losses = {}
+    val, evals = DATA / "val.bin", {}
     for name in ["init", "pretrained"]:
-        out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", "--weights", DATA / f"smol135_{name}.bin", "--data",
-                              DATA / "val.bin", "--dump", ROOT / f"build/dump_{name}.bin", "--batches",
-                              str(BIAS_BATCHES)], capture_output=True, text=True)
-        if out.returncode:
-            sys.exit(f"lathe failed on {name} weights:\n{out.stderr}")
-        lathe_losses[name] = [float(v) for v in re.findall(r"batch \d+ loss ([\d.]+)", out.stdout)]
+        w = DATA / f"smol135_{name}.bin"
+        run_lathe(B, T, "--weights", w, "--data", val, "--steps", 1, "--dump", ROOT / f"build/dump_{name}.bin")
+        evals[name] = losses_from(run_lathe(B, T, "--weights", w, "--data", val, "--eval", BIAS_BATCHES), "batch")
 
-    tokens = np.memmap(DATA / "val.bin", dtype=np.uint16, mode="r")
+    tokens = np.memmap(val, dtype=np.uint16, mode="r")
     x, y = get_batch(tokens, 0, B, T)
     for name in ["init", "pretrained"]:
         print(f"\n{name} weights")
@@ -152,8 +312,14 @@ def main():
         model = Model(cfg)
         load_lathe(model, wpath)
         model.cuda()
-        kernel_checks(d, model, x, y)
-        e2e_checks(d, lathe_losses[name], model, tokens)
+        W = Weights(model)
+        grads = from_lathe(d["grads"].view(-1), cfg)
+        forward_kernel_checks(d, W, x, y, cfg, B, T)
+        e2e_checks(d, evals[name], model, tokens, B, T)
+        backward_kernel_checks(d, grads, W, x, y, cfg, B, T)
+        grad_checks(grads, model, x, y, per_tensor=name == "init")
+        del W
+        adamw_check(d, grads, wpath, cfg)
 
     print("\nreference sanity: pretrained SmolLM2-135M val loss over 8 batches")
     model.eval()
@@ -161,6 +327,12 @@ def main():
         loss = np.mean([model(*(t.cuda() for t in get_batch(tokens, i, B, T)))[1].item() for i in range(8)])
     check("pretrained val loss", loss, 3.5)
 
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "curve":
+        curve(int(sys.argv[2]) if len(sys.argv) > 2 else 1000)
+    else:
+        unit(*((int(v) for v in sys.argv[1:3]) if len(sys.argv) == 3 else (2, 512)))
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
     sys.exit(1 if failures else 0)
 

@@ -1,11 +1,16 @@
-// lathe: SmolLM2-135M training engine. M1: forward pass + loss.
-//   make BATCH=1 SEQ=2048 && build/train_b1_t2048 --weights data/smol135_init.bin --data data/val.bin
-//   --dump PATH writes layer 0 / last layer / output tensors of batch 0 for ref/test.py.
+// lathe: SmolLM2-135M training engine. M2: forward, backward, fused AdamW.
+//   make BATCH=1 SEQ=2048
+//   build/train_b1_t2048 --steps 1000 --data data/train.bin   train from --weights (default seed-0 init)
+//   build/train_b1_t2048 --eval 8 --data data/val.bin         forward-only loss on 8 batches
+//   --dump PATH writes step 0 tensors (layer 0, last layer, grads, updated weights) for ref/test.py.
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include <cublasLt.h>
@@ -20,6 +25,8 @@
 #include "targets/sm89.h"
 
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
+// AdamW, same as ref/model.py make_optimizer.
+constexpr float LR = 3e-4f, BETA1 = 0.9f, BETA2 = 0.95f, ADAM_EPS = 1e-8f, WEIGHT_DECAY = 0.1f;
 #include "kernels.cuh"
 
 #define CK(x) ck_cuda((x), #x, __LINE__)
@@ -50,38 +57,61 @@ constexpr size_t P_LAYER = P_QKV + P_O + P_GU + P_DOWN + 2 * DIM;
 constexpr size_t P_TOTAL = P_EMBED + LAYERS * P_LAYER + DIM;
 static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 == 0 && P_GU * 2 % 256 == 0 &&
                   P_DOWN * 2 % 256 == 0 && P_LAYER * 2 % 256 == 0,
-              "bf16 matrices must stay 256B-aligned for cuBLASLt");
+              "matrices must stay 256B-aligned for cuBLASLt");
 
-struct LayerW {
-    bf16 *qkv, *o, *gu, *down, *ln1, *ln2;
+template <class X>
+struct LayerP {
+    X *qkv, *o, *gu, *down, *ln1, *ln2;
 };
-static LayerW layer_w(bf16* p, int l) {
-    bf16* q = p + P_EMBED + l * P_LAYER;
-    bf16* ln = q + P_QKV + P_O + P_GU + P_DOWN;
+template <class X>
+static LayerP<X> layer(X* p, int l) {
+    X* q = p + P_EMBED + l * P_LAYER;
+    X* ln = q + P_QKV + P_O + P_GU + P_DOWN;
     return {q, q + P_QKV, q + P_QKV + P_O, q + P_QKV + P_O + P_GU, ln, ln + DIM};
 }
 
-// Per-layer activations are all kept; backward (M2) reads them.
+constexpr int IO_INTS = 4 * N + 2;  // tokens, targets, then embed_bwd segments [perm N][starts N+1][count]
+
+// Per-layer activations kept for backward.
 struct Acts {
-    bf16* res;      // [LAYERS+1][N][DIM] residual stream into each layer, res[LAYERS] feeds the final norm
-    bf16* res_mid;  // [LAYERS][N][DIM] after the attention residual add
+    float* res;       // [LAYERS+1][N][DIM] residual stream into each layer, res[LAYERS] feeds the final norm
+    float* res_mid;   // [LAYERS][N][DIM] after the attention residual add
     bf16 *ln1, *ln2;  // [LAYERS][N][DIM]
-    bf16* qkv;      // [LAYERS][N][QKV_DIM] post-RoPE
-    bf16* att;      // [LAYERS][N][DIM]
-    bf16* gu;       // [LAYERS][N][2*FFN]
-    bf16* act;      // [LAYERS][N][FFN]
-    bf16* lnf;      // [N][DIM]
-    bf16* logits;   // [N][VOCAB]
-    float* losses;  // [N]
-    int* tokens;    // [2][N] inputs then targets
+    bf16* qkv;        // [LAYERS][N][QKV_DIM] post-RoPE
+    bf16* att;        // [LAYERS][N][DIM]
+    float* lse;       // [LAYERS][B][HEADS][T]
+    bf16* gu;         // [LAYERS][N][2*FFN]
+    bf16* act;        // [LAYERS][N][FFN]
+    bf16* lnf;        // [N][DIM]
+    bf16* branch;     // [N][DIM] o_proj / down_proj output before the residual add (scratch)
+    bf16* logits;     // [N][VOCAB], overwritten with dlogits by cross_entropy
+    float* losses;    // [N]
+    float* loss;      // [1] mean
+    int* io;          // [IO_INTS]
+};
+
+// Backward scratch, reused by every layer.
+struct Bwd {
+    float* dres;     // [N][DIM] grad of the residual stream
+    bf16* dres_bf;   // [N][DIM] bf16 copy: grad into the branch outputs
+    bf16* dln;       // [N][DIM] grad of a norm output
+    bf16* datt;      // [N][DIM]
+    bf16* dqkv;      // [N][QKV_DIM]
+    bf16* dgu;       // [N][2*FFN]
+    bf16* dact;      // [N][FFN]
+    float* dsum;     // [B][HEADS][T] rowsum(dO * O)
+    float* dw_rows;  // [N][DIM] per-row norm weight grads
 };
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
-    bf16* params;   // [P_TOTAL] bf16 working weights
+    bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
+    float* grads;   // [P_TOTAL] fp32
+    float *m, *v;   // [P_TOTAL] AdamW moments
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     void* workspace;
     Acts a;
+    Bwd g;
 };
 
 // One cudaMalloc. carve() runs twice: once on a null base to size the arena, once to assign pointers.
@@ -101,63 +131,90 @@ static void carve(Arena& ar, State& s) {
     const size_t ND = (size_t)N * DIM;
     s.master = ar.take<float>(P_TOTAL);
     s.params = ar.take<bf16>(P_TOTAL);
+    s.grads = ar.take<float>(P_TOTAL);
+    s.m = ar.take<float>(P_TOTAL);
+    s.v = ar.take<float>(P_TOTAL);
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
     s.workspace = ar.take<char>(CUBLAS_WORKSPACE);
     Acts& a = s.a;
-    a.res = ar.take<bf16>((LAYERS + 1) * ND);
-    a.res_mid = ar.take<bf16>(LAYERS * ND);
+    a.res = ar.take<float>((LAYERS + 1) * ND);
+    a.res_mid = ar.take<float>(LAYERS * ND);
     a.ln1 = ar.take<bf16>(LAYERS * ND);
     a.ln2 = ar.take<bf16>(LAYERS * ND);
     a.qkv = ar.take<bf16>((size_t)LAYERS * N * QKV_DIM);
     a.att = ar.take<bf16>(LAYERS * ND);
+    a.lse = ar.take<float>((size_t)LAYERS * N * HEADS);
     a.gu = ar.take<bf16>((size_t)LAYERS * N * 2 * FFN);
     a.act = ar.take<bf16>((size_t)LAYERS * N * FFN);
     a.lnf = ar.take<bf16>(ND);
+    a.branch = ar.take<bf16>(ND);
     a.logits = ar.take<bf16>((size_t)N * VOCAB);
     a.losses = ar.take<float>(N);
-    a.tokens = ar.take<int>(2 * N);
+    a.loss = ar.take<float>(1);
+    a.io = ar.take<int>(IO_INTS);
+    Bwd& g = s.g;
+    g.dres = ar.take<float>(ND);
+    g.dres_bf = ar.take<bf16>(ND);
+    g.dln = ar.take<bf16>(ND);
+    g.datt = ar.take<bf16>(ND);
+    g.dqkv = ar.take<bf16>((size_t)N * QKV_DIM);
+    g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
+    g.dact = ar.take<bf16>((size_t)N * FFN);
+    g.dsum = ar.take<float>((size_t)N * HEADS);
+    g.dw_rows = ar.take<float>(ND);
 }
 
 static cudaStream_t stream;
 static cublasLtHandle_t lt;
 
-// y[n][m] = x[n][k] . w[m][k]^T (+ res[n][m]); row-major bf16, fp32 accumulate. Built once per shape.
+// Column-major D[m x n] = op(A)[m x k] op(B)[k x n], bf16 inputs, fp32 accumulate. Built once per shape.
 struct Gemm {
     cublasLtMatmulDesc_t desc;
-    cublasLtMatrixLayout_t w, x, y;
+    cublasLtMatrixLayout_t a, b, d;
     cublasLtMatmulAlgo_t algo;
 };
 
-static Gemm make_gemm(int m, int n, int k) {
+static Gemm make_gemm(bool ta, bool tb, int m, int n, int k, cudaDataType_t dtype) {
     Gemm g;
     CKB(cublasLtMatmulDescCreate(&g.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    cublasOperation_t tr = CUBLAS_OP_T;
-    CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSA, &tr, sizeof(tr)));
-    // Column-major views of the row-major tensors.
-    CKB(cublasLtMatrixLayoutCreate(&g.w, CUDA_R_16BF, k, m, k));
-    CKB(cublasLtMatrixLayoutCreate(&g.x, CUDA_R_16BF, k, n, k));
-    CKB(cublasLtMatrixLayoutCreate(&g.y, CUDA_R_16BF, m, n, m));
+    cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N, opb = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opa, sizeof(opa)));
+    CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opb, sizeof(opb)));
+    CKB(cublasLtMatrixLayoutCreate(&g.a, CUDA_R_16BF, ta ? k : m, ta ? m : k, ta ? k : m));
+    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, tb ? n : k, tb ? k : n, tb ? n : k));
+    CKB(cublasLtMatrixLayoutCreate(&g.d, dtype, m, n, m));
     cublasLtMatmulPreference_t pref;
     CKB(cublasLtMatmulPreferenceCreate(&pref));
     size_t ws = CUBLAS_WORKSPACE;
     CKB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+    uint32_t red = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;  // split-K partials summed in fp32, never in bf16
+    CKB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red)));
     cublasLtMatmulHeuristicResult_t h;
     int found = 0;
-    CKB(cublasLtMatmulAlgoGetHeuristic(lt, g.desc, g.w, g.x, g.y, g.y, pref, 1, &h, &found));
+    CKB(cublasLtMatmulAlgoGetHeuristic(lt, g.desc, g.a, g.b, g.d, g.d, pref, 1, &h, &found));
     if (!found) die("no cuBLASLt algo");
     CKB(cublasLtMatmulPreferenceDestroy(pref));
     g.algo = h.algo;
     return g;
 }
 
-static void gemm(const State& s, const Gemm& g, bf16* y, const bf16* x, const bf16* w, const bf16* res = nullptr) {
+static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf16* b) {
     const float one = 1.f, zero = 0.f;
-    CKB(cublasLtMatmul(lt, g.desc, &one, w, g.w, x, g.x, res ? &one : &zero, res ? res : y, g.y, y, g.y, &g.algo,
-                       s.workspace, CUBLAS_WORKSPACE, stream));
+    CKB(cublasLtMatmul(lt, g.desc, &one, a, g.a, b, g.b, &zero, d, g.d, d, g.d, &g.algo, s.workspace,
+                       CUBLAS_WORKSPACE, stream));
 }
 
-struct Gemms {
-    Gemm qkv, o, gu, down, head;
+// Linear y = x W^T, W [out][in] row-major, x/y [N][features] row-major.
+struct Lin {
+    Gemm fwd, dx, dw;
+};
+static Lin make_lin(int out, int in) {
+    return {make_gemm(true, false, out, N, in, CUDA_R_16BF),   // y[N][out] = x W^T      (A = W, B = x)
+            make_gemm(false, false, in, N, out, CUDA_R_16BF),  // dx[N][in] = dy W       (A = W, B = dy)
+            make_gemm(false, true, in, out, N, CUDA_R_32F)};   // dW[out][in] = dy^T x   (A = x, B = dy), fp32
+}
+struct Lins {
+    Lin qkv, o, gu, down, head;
 };
 
 // Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
@@ -176,50 +233,124 @@ static void dump(FILE* f, const char* name, const void* p, int dtype, size_t row
     fwrite(h.data(), 1, bytes, f);
 }
 
-static void forward(State& s, const Gemms& g, FILE* df) {
+// Dumps tensors of layers 0 and LAYERS-1 only, named "L<l>.<name>".
+struct LayerDump {
+    FILE* f;
+    int l;
+    void operator()(const char* name, const void* p, int dtype, size_t cols) const {
+        if (!f || (l != 0 && l != LAYERS - 1)) return;
+        char nm[48];
+        snprintf(nm, sizeof(nm), "L%d.%s", l, name);
+        dump(f, nm, p, dtype, N, cols);
+    }
+};
+
+static void forward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     const size_t ND = (size_t)N * DIM;
-    embed<<<cdiv(N * DIM / 8, 256), 256, 0, stream>>>(a.res, a.tokens, s.params);
+    const int* tokens = a.io;
+    embed<<<cdiv(N * DIM / 4, 256), 256, 0, stream>>>(a.res, tokens, s.master);
+    rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(a.ln1, nullptr, a.res, nullptr, layer(s.master, 0).ln1);
     for (int l = 0; l < LAYERS; l++) {
-        const LayerW w = layer_w(s.params, l);
-        bf16 *res = a.res + l * ND, *res_mid = a.res_mid + l * ND, *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND;
-        bf16 *qkv = a.qkv + (size_t)l * N * QKV_DIM, *att = a.att + l * ND;
-        bf16 *gu = a.gu + (size_t)l * N * 2 * FFN, *act = a.act + (size_t)l * N * FFN;
-        FILE* d = l == 0 || l == LAYERS - 1 ? df : nullptr;
-        char nm[48];
-        auto put = [&](const char* name, const bf16* p, size_t cols) {
-            snprintf(nm, sizeof(nm), "L%d.%s", l, name);
-            dump(d, nm, p, 0, N, cols);
-        };
+        const LayerP<bf16> w = layer(s.params, l);
+        const LayerP<float> wf = layer(s.master, l);
+        float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
+        bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
+        bf16 *qkv = a.qkv + (size_t)l * N * QKV_DIM, *gu = a.gu + (size_t)l * N * 2 * FFN;
+        bf16* act = a.act + (size_t)l * N * FFN;
+        float* lse = a.lse + (size_t)l * N * HEADS;
+        const bool last = l == LAYERS - 1;
+        const LayerDump put{df, l};
 
-        put("res", res, DIM);
-        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln1, res, w.ln1);
-        put("ln1", ln1, DIM);
-        gemm(s, g.qkv, qkv, ln1, w.qkv);
-        put("qkv_pre", qkv, QKV_DIM);
-        rope<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
-        put("qkv", qkv, QKV_DIM);
-        attention_fwd<<<dim3(T / ATT_TILE, HEADS, B), ATT_TILE, 0, stream>>>(att, qkv);
-        put("att", att, DIM);
-        gemm(s, g.o, res_mid, att, w.o, res);
-        put("res_mid", res_mid, DIM);
-        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, w.ln2);
-        put("ln2", ln2, DIM);
-        gemm(s, g.gu, gu, ln2, w.gu);
-        put("gu", gu, 2 * FFN);
+        put("res", res, 1, DIM);
+        put("ln1", ln1, 0, DIM);
+        gemm(s, L.qkv.fwd, qkv, w.qkv, ln1);
+        put("qkv_pre", qkv, 0, QKV_DIM);
+        rope<false><<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
+        put("qkv", qkv, 0, QKV_DIM);
+        attention_fwd<<<dim3(T / ATT_TILE, HEADS, B), ATT_TILE, 0, stream>>>(att, lse, qkv);
+        put("att", att, 0, DIM);
+        gemm(s, L.o.fwd, a.branch, w.o, att);
+        put("ao", a.branch, 0, DIM);
+        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2);
+        put("res_mid", res_mid, 1, DIM);
+        put("ln2", ln2, 0, DIM);
+        gemm(s, L.gu.fwd, gu, w.gu, ln2);
+        put("gu", gu, 0, 2 * FFN);
         swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu);
-        put("act", act, FFN);
-        gemm(s, g.down, res + ND, act, w.down, res_mid);
-        put("res_out", res + ND, DIM);
+        put("act", act, 0, FFN);
+        gemm(s, L.down.fwd, a.branch, w.down, act);
+        put("mo", a.branch, 0, DIM);
+        // Next layer's input norm, or the final norm.
+        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(last ? a.lnf : a.ln1 + (l + 1) * ND, res + ND, res_mid, a.branch,
+                                                last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1);
+        put("res_out", res + ND, 1, DIM);
     }
-    rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(a.lnf, a.res + LAYERS * ND, s.params + P_TOTAL - DIM);
-    gemm(s, g.head, a.logits, a.lnf, s.params);  // tied embedding
-    cross_entropy_fwd<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, a.tokens + N);
-    CK(cudaGetLastError());
+    gemm(s, L.head.fwd, a.logits, s.params, a.lnf);  // tied embedding
+    dump(df, "res_all", a.res, 1, (LAYERS + 1) * N, DIM);
+    dump(df, "res_mid_all", a.res_mid, 1, LAYERS * N, DIM);
     dump(df, "lnf", a.lnf, 0, N, DIM);
     dump(df, "logits", a.logits, 0, N, VOCAB);
+    cross_entropy<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, tokens + N);
+    mean_loss<<<1, 1024, 0, stream>>>(a.loss, a.losses);
+    CK(cudaGetLastError());
+    dump(df, "dlogits", a.logits, 0, N, VOCAB);
     dump(df, "losses", a.losses, 1, N, 1);
-    dump(df, "tokens", a.tokens, 2, 2, N);
+    dump(df, "tokens", a.io, 2, 2, N);
+}
+
+static void backward(State& s, const Lins& L, FILE* df) {
+    Acts& a = s.a;
+    Bwd& g = s.g;
+    const size_t ND = (size_t)N * DIM;
+    gemm(s, L.head.dx, g.dln, s.params, a.logits);
+    gemm(s, L.head.dw, s.grads, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
+    dump(df, "dlnf", g.dln, 0, N, DIM);
+    rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_rows, nullptr, g.dln, a.res + LAYERS * ND,
+                                                s.master + P_TOTAL - DIM);
+    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.grads + P_TOTAL - DIM, g.dw_rows);
+    for (int l = LAYERS - 1; l >= 0; l--) {
+        const LayerP<bf16> w = layer(s.params, l);
+        const LayerP<float> wf = layer(s.master, l), gr = layer(s.grads, l);
+        float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
+        bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
+        bf16 *qkv = a.qkv + (size_t)l * N * QKV_DIM, *gu = a.gu + (size_t)l * N * 2 * FFN;
+        bf16* act = a.act + (size_t)l * N * FFN;
+        float* lse = a.lse + (size_t)l * N * HEADS;
+        const LayerDump put{df, l};
+
+        put("dres_out", g.dres, 1, DIM);
+        gemm(s, L.down.dx, g.dact, w.down, g.dres_bf);
+        gemm(s, L.down.dw, gr.down, act, g.dres_bf);
+        put("dact", g.dact, 0, FFN);
+        swiglu_bwd<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(g.dgu, g.dact, gu);
+        put("dgu", g.dgu, 0, 2 * FFN);
+        gemm(s, L.gu.dx, g.dln, w.gu, g.dgu);
+        gemm(s, L.gu.dw, gr.gu, ln2, g.dgu);
+        put("dln2", g.dln, 0, DIM);
+        rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_rows, g.dres, g.dln, res_mid, wf.ln2);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln2, g.dw_rows);
+        put("dres_mid", g.dres, 1, DIM);
+        gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
+        gemm(s, L.o.dw, gr.o, att, g.dres_bf);
+        put("datt", g.datt, 0, DIM);
+        attention_bwd_dq<<<dim3(T / ATT_TILE, HEADS, B), 2 * ATT_TILE, 0, stream>>>(g.dqkv, g.dsum, qkv, att,
+                                                                                     g.datt, lse);
+        attention_bwd_dkv<<<dim3(T / ATT_TILE, KV_HEADS, B), 2 * ATT_TILE, 0, stream>>>(g.dqkv, qkv, g.datt, lse,
+                                                                                        g.dsum);
+        put("dqkv", g.dqkv, 0, QKV_DIM);
+        rope<true><<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, s.rope);
+        put("dqkv_pre", g.dqkv, 0, QKV_DIM);
+        gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
+        gemm(s, L.qkv.dw, gr.qkv, ln1, g.dqkv);
+        put("dln1", g.dln, 0, DIM);
+        rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_rows, g.dres, g.dln, res,
+                                                    wf.ln1);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln1, g.dw_rows);
+        put("dres_in", g.dres, 1, DIM);
+    }
+    embed_bwd<<<N, DIM / 4, 0, stream>>>(s.grads, g.dres, a.io, a.io + 2 * N);
+    CK(cudaGetLastError());
 }
 
 static void load_weights(State& s, const char* path) {
@@ -239,6 +370,8 @@ static void load_weights(State& s, const char* path) {
     fclose(f);
     CK(cudaMemcpy(s.master, w.data(), P_TOTAL * 4, cudaMemcpyHostToDevice));
     f32_to_bf16<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, P_TOTAL);
+    CK(cudaMemsetAsync(s.m, 0, P_TOTAL * 4, stream));
+    CK(cudaMemsetAsync(s.v, 0, P_TOTAL * 4, stream));
 }
 
 static void init_rope(State& s) {
@@ -270,24 +403,39 @@ static Tokens map_tokens(const char* path) {
 }
 
 // Batch i = contiguous span of N+1 tokens, wrapping over whole batches (same as ref/model.py get_batch).
-static void load_batch(const Tokens& d, long i, int* h) {
-    size_t nb = (d.n - 1) / N, s = (i % nb) * N;
+// Also builds embed_bwd segments: positions sorted by (token, position), one segment per distinct token.
+static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* sorted) {
+    const size_t nb = (d.n - 1) / N, s = (i % nb) * N;
+    int *tok = io, *tgt = io + N, *perm = io + 2 * N, *starts = io + 3 * N;
     for (int j = 0; j < N; j++) {
-        h[j] = d.data[s + j];
-        h[N + j] = d.data[s + j + 1];
+        tok[j] = d.data[s + j];
+        tgt[j] = d.data[s + j + 1];
+        sorted[j] = {tok[j], j};
     }
+    std::sort(sorted, sorted + N);
+    int count = 0;
+    for (int j = 0; j < N; j++) {
+        perm[j] = sorted[j].second;
+        if (j == 0 || sorted[j].first != sorted[j - 1].first) starts[count++] = j;
+    }
+    starts[count] = N;
+    starts[N + 1] = count;
 }
 
 int main(int argc, char** argv) {
-    const char *weights = "data/smol135_init.bin", *data = "data/val.bin", *dump_path = nullptr;
-    int batches = 1;
-    for (int i = 1; i + 1 < argc; i += 2) {
-        if (!strcmp(argv[i], "--weights")) weights = argv[i + 1];
-        else if (!strcmp(argv[i], "--data")) data = argv[i + 1];
-        else if (!strcmp(argv[i], "--dump")) dump_path = argv[i + 1];
-        else if (!strcmp(argv[i], "--batches")) batches = atoi(argv[i + 1]);
-        else die("usage: train [--weights f] [--data f] [--batches n] [--dump f]");
+    const char *weights = "data/smol135_init.bin", *data = "data/train.bin", *dump_path = nullptr;
+    int steps = 0, evals = 0, group = 20;
+    for (int i = 1; i < argc; i++) {
+        if (i + 1 == argc) die("missing value");
+        if (!strcmp(argv[i], "--weights")) weights = argv[++i];
+        else if (!strcmp(argv[i], "--data")) data = argv[++i];
+        else if (!strcmp(argv[i], "--dump")) dump_path = argv[++i];
+        else if (!strcmp(argv[i], "--steps")) steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--eval")) evals = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--group")) group = atoi(argv[++i]);
+        else die("usage: train [--weights f] [--data f] [--steps n | --eval n] [--group n] [--dump f]");
     }
+    if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
     CK(cudaSetDevice(0));
     CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -304,31 +452,48 @@ int main(int argc, char** argv) {
 
     load_weights(s, weights);
     init_rope(s);
-    const Gemms g = {make_gemm(QKV_DIM, N, DIM), make_gemm(DIM, N, DIM), make_gemm(2 * FFN, N, DIM),
-                     make_gemm(DIM, N, FFN), make_gemm(VOCAB, N, DIM)};
+    const Lins L = {make_lin(QKV_DIM, DIM), make_lin(DIM, DIM), make_lin(2 * FFN, DIM), make_lin(DIM, FFN),
+                    make_lin(VOCAB, DIM)};
     const Tokens d = map_tokens(data);
-    int* h_tok;
-    CK(cudaMallocHost(&h_tok, 2 * N * sizeof(int)));
-    std::vector<float> losses(N);
-    cudaEvent_t e0, e1;
-    CK(cudaEventCreate(&e0));
-    CK(cudaEventCreate(&e1));
+    int* h_io;
+    float* h_loss;
+    CK(cudaMallocHost(&h_io, IO_INTS * sizeof(int)));
+    CK(cudaMallocHost(&h_loss, group * sizeof(float)));
+    std::vector<std::pair<int, int>> sorted(N);
+    cudaEvent_t copied;
+    CK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
+    CK(cudaStreamSynchronize(stream));
 
-    for (int i = 0; i < batches; i++) {
-        load_batch(d, i, h_tok);
-        CK(cudaMemcpyAsync(s.a.tokens, h_tok, 2 * N * sizeof(int), cudaMemcpyHostToDevice, stream));
+    const bool train = steps > 0;
+    const int total = train ? steps : evals;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0, first = 0; i < total; i++) {
+        CK(cudaEventSynchronize(copied));  // the previous upload has left the pinned buffer
+        load_batch(d, i, h_io, sorted.data());
+        CK(cudaMemcpyAsync(s.a.io, h_io, IO_INTS * sizeof(int), cudaMemcpyHostToDevice, stream));
+        CK(cudaEventRecord(copied, stream));
         FILE* df = i == 0 && dump_path ? fopen(dump_path, "wb") : nullptr;
-        CK(cudaEventRecord(e0, stream));
-        forward(s, g, df);
-        CK(cudaEventRecord(e1, stream));
-        CK(cudaMemcpyAsync(losses.data(), s.a.losses, N * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CK(cudaStreamSynchronize(stream));
+        forward(s, L, df);
+        if (train) {
+            backward(s, L, df);
+            dump(df, "grads", s.grads, 1, 1, P_TOTAL);
+            adamw<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.master, s.params, s.grads, s.m, s.v, P_TOTAL,
+                                                          (float)(i + 1));
+            dump(df, "master", s.master, 1, 1, P_TOTAL);
+            dump(df, "params", s.params, 0, 1, P_TOTAL);
+        }
+        CK(cudaMemcpyAsync(h_loss + i % group, s.a.loss, sizeof(float), cudaMemcpyDeviceToHost, stream));
         if (df) fclose(df);
-        double sum = 0;
-        for (float x : losses) sum += x;
-        float ms;
-        CK(cudaEventElapsedTime(&ms, e0, e1));
-        printf("batch %d loss %.6f fwd %.2f ms\n", i, sum / N, ms);
+        if ((i + 1) % group == 0 || i + 1 == total) {
+            CK(cudaStreamSynchronize(stream));
+            auto now = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(now - t0).count();
+            for (int k = first; k <= i; k++) printf("%s %d loss %.6f\n", train ? "step" : "batch", k, h_loss[k % group]);
+            printf("group %d steps %d-%d ms %.1f tok/s %.0f\n", i / group, first, i, ms, (i + 1 - first) * N / ms * 1e3);
+            fflush(stdout);
+            first = i + 1;
+            t0 = now;
+        }
     }
     return 0;
 }
