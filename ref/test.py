@@ -191,13 +191,10 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         check("matmul o dX", rel(f("datt"), dao @ wo), KERNEL_TOL)
         check("matmul o dW (fp32)", rel(G("self_attn.o_proj.weight"), dao.T @ f("att")), F32_TOL)
         hq, hk = cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
-        want = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
-        for name, got, w in zip(["dq", "dk", "dv"], f("dqkv").split([hq, hk, hk], -1), want):
-            check(f"attention bwd {name}", rel(got, w), KERNEL_TOL)
-        dqk = f("dqkv")[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2)
-        check("rope bwd", rel(f("dqkv_pre")[:, :rot], rope(dqk, cos, -sin).transpose(1, 2).reshape(B * T, rot)),
-              KERNEL_TOL)
-        check("rope bwd leaves dv untouched", rel(f("dqkv_pre")[:, rot:], f("dqkv")[:, rot:]), 0)
+        dq, dk, dv = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
+        unrope = lambda t: rope(t.view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, -sin).transpose(1, 2).reshape(B * T, -1)
+        for name, got, w in zip(["dq", "dk", "dv"], f("dqkv_pre").split([hq, hk, hk], -1), [unrope(dq), unrope(dk), dv]):
+            check(f"attention + rope bwd {name}", rel(got, w), KERNEL_TOL)
         check("matmul qkv dX", rel(f("dln1"), f("dqkv_pre") @ wqkv), KERNEL_TOL)
         q, k, v = (f("dqkv_pre").T @ f("ln1")).split([hq, hk, hk])
         check("matmul qkv dW (fp32)", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),

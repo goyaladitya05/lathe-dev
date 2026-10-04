@@ -100,6 +100,7 @@ struct Bwd {
     bf16* dgu;       // [N][2*FFN]
     bf16* dact;      // [N][FFN]
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
+    float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_rows;  // [N][DIM] per-row norm weight grads
 };
 
@@ -161,6 +162,7 @@ static void carve(Arena& ar, State& s) {
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
     g.dact = ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
+    g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_rows = ar.take<float>(ND);
 }
 
@@ -266,9 +268,9 @@ static void forward(State& s, const Lins& L, FILE* df) {
         put("ln1", ln1, 0, DIM);
         gemm(s, L.qkv.fwd, qkv, w.qkv, ln1);
         put("qkv_pre", qkv, 0, QKV_DIM);
-        rope<false><<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
+        rope<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
         put("qkv", qkv, 0, QKV_DIM);
-        attention_fwd<<<dim3(T / ATT_TILE, HEADS, B), ATT_TILE, 0, stream>>>(att, lse, qkv);
+        attention_fwd<<<dim3(NT, HEADS, B), 128, 0, stream>>>(att, lse, qkv);
         put("att", att, 0, DIM);
         gemm(s, L.o.fwd, a.branch, w.o, att);
         put("ao", a.branch, 0, DIM);
@@ -332,12 +334,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
         gemm(s, L.o.dw, gr.o, att, g.dres_bf);
         put("datt", g.datt, 0, DIM);
-        attention_bwd_dq<<<dim3(T / ATT_TILE, HEADS, B), 2 * ATT_TILE, 0, stream>>>(g.dqkv, g.dsum, qkv, att,
-                                                                                     g.datt, lse);
-        attention_bwd_dkv<<<dim3(T / ATT_TILE, KV_HEADS, B), 2 * ATT_TILE, 0, stream>>>(g.dqkv, qkv, g.datt, lse,
-                                                                                        g.dsum);
-        put("dqkv", g.dqkv, 0, QKV_DIM);
-        rope<true><<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, s.rope);
+        attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
+        attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.part, qkv, g.datt, lse, g.dsum);
+        attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
+                                                                                                       s.rope);
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
         gemm(s, L.qkv.dw, gr.qkv, ln1, g.dqkv);

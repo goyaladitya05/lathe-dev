@@ -128,8 +128,7 @@ __global__ void colsum(float* out, const float* rows) {
 }
 
 // In place on the q and k heads of qkv [N][QKV_DIM]. Non-interleaved: rotates pairs (d, d + HEAD_DIM/2).
-// cs = [T][HEAD_DIM/2] of (cos, sin). BWD applies the inverse rotation to gradients.
-template <bool BWD>
+// cs = [T][HEAD_DIM/2] of (cos, sin).
 __global__ void rope(bf16* qkv, const float2* cs) {
     constexpr int HALF = HEAD_DIM / 2, ROT = HEADS + KV_HEADS;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -137,240 +136,365 @@ __global__ void rope(bf16* qkv, const float2* cs) {
     int d = i % HALF, n = i / (ROT * HALF);
     bf16* x = qkv + (size_t)n * QKV_DIM + i / HALF % ROT * HEAD_DIM;
     float2 c = cs[n % T * HALF + d];
-    float s = BWD ? -c.y : c.y;
     float x1 = __bfloat162float(x[d]), x2 = __bfloat162float(x[d + HALF]);
-    x[d] = __float2bfloat16(x1 * c.x - x2 * s);
-    x[d + HALF] = __float2bfloat16(x2 * c.x + x1 * s);
+    x[d] = __float2bfloat16(x1 * c.x - x2 * c.y);
+    x[d + HALF] = __float2bfloat16(x2 * c.x + x1 * c.y);
 }
 
-// Causal GQA attention, online softmax in fp32, one thread per query row.
-// Block = (query tile, head, batch); each K/V tile is staged in shared memory and read by broadcast.
-// qkv [N][QKV_DIM] post-RoPE, out [N][DIM], lse [B][HEADS][T] in log2 units of the scaled scores.
-__global__ void __launch_bounds__(ATT_TILE) attention_fwd(bf16* out, float* lse, const bf16* qkv) {
-    constexpr int D = HEAD_DIM, CH = 16;  // CH keys per softmax rescale
-    static_assert(ATT_TILE % CH == 0, "chunking");
-    const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
-    const int kvh = h / (HEADS / KV_HEADS);
-    const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    __shared__ __align__(16) bf16 ks[ATT_TILE][D], vs[ATT_TILE][D];
+// ---- Tensor cores: mma.sync m16n8k16, bf16 inputs, fp32 accumulate ----
+// Fragments (PTX ISA), lane = 4g + t. A 16x16: {row g, col 2t..}, {g+8, 2t}, {g, 8+2t}, {g+8, 8+2t}.
+// B 16x8 (k x n): {k 2t.., n g}, {k 8+2t.., n g}. C 16x8: {row g, col 2t, 2t+1}, {row g+8, col 2t, 2t+1}.
+static_assert(HEAD_DIM == 64 && ATT_TILE == 64, "attention kernels are written for 64x64 tiles");
 
-    const float scale = LOG2E / sqrtf((float)D);  // softmax via exp2
-    float q[D], o[D];
-    const bf16* qrow = seq + (size_t)(qt * ATT_TILE + t) * QKV_DIM + h * D;
+__device__ __forceinline__ uint32_t smem_addr(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+
+__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const bf16* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
+}
+
+__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const bf16* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
+}
+
+__device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t pack2(float lo, float hi) {
+    bf162 h = __floats2bfloat162_rn(lo, hi);
+    return *(uint32_t*)&h;
+}
+
+__device__ __forceinline__ void cp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int K>
+__device__ __forceinline__ void cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(K));
+}
+
+// 64x64 bf16 tile in shared memory: row r, 16-byte chunk c lives at r*64 + 8*(c ^ (r & 7)), so the 8 rows
+// an ldmatrix reads hit distinct banks.
+constexpr int TILE = 64 * 64;
+__device__ __forceinline__ int swz(int r, int c) { return r * 64 + ((c ^ (r & 7)) << 3); }
+
+// Async copy of a 64x64 tile whose rows are `stride` elements apart (128 threads).
+__device__ __forceinline__ void load_tile(bf16* dst, const bf16* src, size_t stride) {
+    for (int i = threadIdx.x; i < 512; i += 128) cp16(dst + swz(i >> 3, i & 7), src + (i >> 3) * stride + (i & 7) * 8);
+}
+
+// A fragments for 16 tile rows from r0, all 64 columns (k = columns).
+__device__ __forceinline__ void frag_a(uint32_t (&a)[4][4], const bf16* tile, int r0) {
+    const int lane = threadIdx.x & 31;
 #pragma unroll
-    for (int c = 0; c < D; c += 8) load8(q + c, qrow + c);
+    for (int kk = 0; kk < 4; kk++) ldsm4(a[kk], tile + swz(r0 + (lane & 15), kk * 2 + (lane >> 4)));
+}
+
+// acc[16 x 64] += A[16 x 64] * tile^T: tile rows become output columns, k = tile columns.
+__device__ __forceinline__ void mma_abt(float (&acc)[8][4], const uint32_t (&a)[4][4], const bf16* tile) {
+    const int lane = threadIdx.x & 31;
 #pragma unroll
-    for (int d = 0; d < D; d++) {
-        q[d] *= scale;
-        o[d] = 0.f;
+    for (int kk = 0; kk < 4; kk++)
+#pragma unroll
+        for (int np = 0; np < 4; np++) {
+            uint32_t r[4];
+            ldsm4(r, tile + swz(np * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 2 + ((lane >> 3) & 1)));
+            mma(acc[2 * np], a[kk], r[0], r[1]);
+            mma(acc[2 * np + 1], a[kk], r[2], r[3]);
+        }
+}
+
+// acc[16 x 64] += A[16 x 64] * tile: k = tile rows, output columns = tile columns.
+__device__ __forceinline__ void mma_ab(float (&acc)[8][4], const uint32_t (&a)[4][4], const bf16* tile) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int kk = 0; kk < 4; kk++)
+#pragma unroll
+        for (int np = 0; np < 4; np++) {
+            uint32_t r[4];
+            ldsm4t(r, tile + swz(kk * 16 + (lane & 15), np * 2 + (lane >> 4)));
+            mma(acc[2 * np], a[kk], r[0], r[1]);
+            mma(acc[2 * np + 1], a[kk], r[2], r[3]);
+        }
+}
+
+// C block [16 x 64] fp32 -> bf16 A fragments with k = its 64 columns.
+__device__ __forceinline__ void c_to_a(uint32_t (&a)[4][4], const float (&c)[8][4]) {
+#pragma unroll
+    for (int kk = 0; kk < 4; kk++) {
+        a[kk][0] = pack2(c[2 * kk][0], c[2 * kk][1]);
+        a[kk][1] = pack2(c[2 * kk][2], c[2 * kk][3]);
+        a[kk][2] = pack2(c[2 * kk + 1][0], c[2 * kk + 1][1]);
+        a[kk][3] = pack2(c[2 * kk + 1][2], c[2 * kk + 1][3]);
     }
-    float m = -INFINITY, l = 0.f;
+}
 
+// ---- Attention (FlashAttention-2 style). Scores are scaled into log2 units so softmax uses exp2; lse is kept
+// in those units. P (and dS in backward) are rounded to bf16 for the tensor-core products, as flash attention does.
+// Each thread owns rows g and g+8 of its warp's 16 rows and columns 8j + 2t + {0,1} of the 64-column block.
+constexpr int NT = T / 64;
+
+// Causal GQA forward. Block = (64 query rows, head, batch), 4 warps x 16 rows; K/V tiles double-buffered.
+// qkv [N][QKV_DIM] post-RoPE, out [N][DIM], lse [B][HEADS][T].
+__global__ void __launch_bounds__(128) attention_fwd(bf16* out, float* lse, const bf16* qkv) {
+    const int qt = NT - 1 - blockIdx.x, h = blockIdx.y, b = blockIdx.z;  // longest blocks first
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
+    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    const bf16* vg = kg + KV_HEADS * HEAD_DIM;
+    __shared__ __align__(128) bf16 ks[2][TILE], vs[2][TILE];
+
+    load_tile(ks[1], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);  // Q, staged in buffer 1
+    load_tile(ks[0], kg, QKV_DIM);
+    load_tile(vs[0], vg, QKV_DIM);
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+    uint32_t qf[4][4];
+    frag_a(qf, ks[1], warp * 16);
+    __syncthreads();
+
+    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
+    const int q0 = qt * 64 + warp * 16 + g;
+    float o[8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
     for (int kt = 0; kt <= qt; kt++) {
-        __syncthreads();
-        const bf16* krow = seq + (size_t)(kt * ATT_TILE + t) * QKV_DIM + (HEADS + kvh) * D;
-        const bf16* vrow = krow + KV_HEADS * D;
-#pragma unroll
-        for (int c = 0; c < D; c += 8) {
-            *(uint4*)&ks[t][c] = *(const uint4*)(krow + c);
-            *(uint4*)&vs[t][c] = *(const uint4*)(vrow + c);
+        if (kt < qt) {
+            load_tile(ks[(kt + 1) & 1], kg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
+            load_tile(vs[(kt + 1) & 1], vg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
         }
+        cp_commit();
+        cp_wait<1>();
         __syncthreads();
-        const int nk = kt == qt ? t + 1 : ATT_TILE;  // causal: keys <= query
-        for (int j0 = 0; j0 < nk; j0 += CH) {
-            float s[CH], mc = m;
+        float s[8][4] = {};
+        mma_abt(s, qf, ks[kt & 1]);
+        float mx[2] = {m[0], m[1]};
 #pragma unroll
-            for (int j = 0; j < CH; j++) {
-                float a = 0.f;
+        for (int j = 0; j < 8; j++)
 #pragma unroll
-                for (int c = 0; c < D; c += 8) {
-                    float k8[8];
-                    load8(k8, &ks[j0 + j][c]);
-#pragma unroll
-                    for (int e = 0; e < 8; e++) a += q[c + e] * k8[e];
-                }
-                s[j] = j0 + j < nk ? a : -INFINITY;
-                mc = fmaxf(mc, s[j]);
+            for (int e = 0; e < 4; e++) {
+                float v = s[j][e] * scale;
+                if (kt == qt && kt * 64 + 8 * j + 2 * t + (e & 1) > q0 + 8 * (e >> 1)) v = -INFINITY;
+                s[j][e] = v;
+                mx[e >> 1] = fmaxf(mx[e >> 1], v);
             }
-            const float corr = exp2f(m - mc);
-            l *= corr;
+        float corr[2];
 #pragma unroll
-            for (int d = 0; d < D; d++) o[d] *= corr;
-#pragma unroll
-            for (int j = 0; j < CH; j++) {
-                const float p = exp2f(s[j] - mc);
-                l += p;
-#pragma unroll
-                for (int c = 0; c < D; c += 8) {
-                    float v8[8];
-                    load8(v8, &vs[j0 + j][c]);
-#pragma unroll
-                    for (int e = 0; e < 8; e++) o[c + e] += p * v8[e];
-                }
-            }
-            m = mc;
+        for (int r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            corr[r] = exp2f(m[r] - mx[r]);
+            m[r] = mx[r];
+            l[r] *= corr[r];
         }
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                o[j][e] *= corr[e >> 1];
+                s[j][e] = exp2f(s[j][e] - m[e >> 1]);
+                l[e >> 1] += s[j][e];
+            }
+        uint32_t pf[4][4];
+        c_to_a(pf, s);
+        mma_ab(o, pf, vs[kt & 1]);
+        __syncthreads();
     }
-    const float inv = 1.f / l;
-    const int i = qt * ATT_TILE + t;
-    lse[((size_t)b * HEADS + h) * T + i] = m + log2f(l);
-    bf16* orow = out + (size_t)(b * T + i) * DIM + h * D;
 #pragma unroll
-    for (int c = 0; c < D; c += 8) {
-        float r[8];
+    for (int r = 0; r < 2; r++) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+        const int q = q0 + 8 * r;
+        bf16* orow = out + ((size_t)b * T + q) * DIM + h * HEAD_DIM + 2 * t;
 #pragma unroll
-        for (int e = 0; e < 8; e++) r[e] = o[c + e] * inv;
-        store8(orow + c, r);
+        for (int j = 0; j < 8; j++)
+            *(bf162*)(orow + 8 * j) = __floats2bfloat162_rn(o[j][2 * r] / l[r], o[j][2 * r + 1] / l[r]);
+        if (t == 0) lse[((size_t)b * HEADS + h) * T + q] = m[r] + log2f(l[r]);
     }
 }
 
-// Attention backward, fp32 math. Two threads per row, each owning half of the head dims; partial dot
-// products are combined with one shuffle. P = exp2(s - lse) is recomputed from the forward lse.
-
-// dq for one query tile of one head. Also writes Dsum = rowsum(dO * O), which attention_bwd_dkv reads.
-__global__ void __launch_bounds__(2 * ATT_TILE) attention_bwd_dq(bf16* dqkv, float* Dsum, const bf16* qkv,
-                                                                 const bf16* out, const bf16* dout,
-                                                                 const float* lse) {
-    constexpr int D = HEAD_DIM, HD = D / 2;
-    const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
-    const int r = threadIdx.x / 2, off = threadIdx.x % 2 * HD, i = qt * ATT_TILE + r;
-    const int kvh = h / (HEADS / KV_HEADS);
+// dq (before RoPE backward) for 64 query rows of one head, written into dqkv's q columns, and
+// Dsum = rowsum(dO * O), which attention_bwd_dkv reads.
+__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, float* Dsum, const bf16* qkv, const bf16* out,
+                                                        const bf16* dout, const float* lse) {
+    const int qt = NT - 1 - blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    const size_t n = (size_t)b * T + i, row = ((size_t)b * HEADS + h) * T + i;
-    __shared__ __align__(16) bf16 ks[ATT_TILE][D], vs[ATT_TILE][D];
+    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    const bf16* vg = kg + KV_HEADS * HEAD_DIM;
+    const size_t row0 = (size_t)b * T + qt * 64, lrow = ((size_t)b * HEADS + h) * T + qt * 64;
+    __shared__ __align__(128) bf16 ks[2][TILE], vs[2][TILE];
+    __shared__ float dsm[64];
 
-    const float scale = LOG2E / sqrtf((float)D);
-    float q[HD], dO[HD], dq[HD], dd = 0.f;
+    load_tile(ks[1], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);  // Q and dO staged in buffer 1
+    load_tile(vs[1], dout + row0 * DIM + h * HEAD_DIM, DIM);
+    load_tile(ks[0], kg, QKV_DIM);
+    load_tile(vs[0], vg, QKV_DIM);
+    cp_commit();
+    {  // D, two threads per row
+        const int r = threadIdx.x >> 1, c0 = (threadIdx.x & 1) * 32;
+        const bf16 *dp = dout + (row0 + r) * DIM + h * HEAD_DIM + c0, *op = out + (row0 + r) * DIM + h * HEAD_DIM + c0;
+        float acc = 0.f;
 #pragma unroll
-    for (int c = 0; c < HD; c += 8) {
-        float o8[8];
-        load8(q + c, seq + (size_t)i * QKV_DIM + h * D + off + c);
-        load8(dO + c, dout + n * DIM + h * D + off + c);
-        load8(o8, out + n * DIM + h * D + off + c);
+        for (int c = 0; c < 32; c += 8) {
+            float a8[8], b8[8];
+            load8(a8, dp + c);
+            load8(b8, op + c);
 #pragma unroll
-        for (int e = 0; e < 8; e++) dd += dO[c + e] * o8[e];
+            for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
+        }
+        acc += __shfl_xor_sync(0xffffffff, acc, 1);
+        if (!(threadIdx.x & 1)) {
+            dsm[r] = acc;
+            Dsum[lrow + r] = acc;
+        }
     }
-    dd += __shfl_xor_sync(0xffffffff, dd, 1);
-    if (off == 0) Dsum[row] = dd;
-#pragma unroll
-    for (int d = 0; d < HD; d++) {
-        q[d] *= scale;
-        dq[d] = 0.f;
-    }
-    const float l2 = lse[row];
+    cp_wait<0>();
+    __syncthreads();
+    uint32_t qf[4][4], df[4][4];
+    frag_a(qf, ks[1], warp * 16);
+    frag_a(df, vs[1], warp * 16);
+    const int r0 = warp * 16 + g, q0 = qt * 64 + r0;
+    const float dd[2] = {dsm[r0], dsm[r0 + 8]}, l2[2] = {lse[lrow + r0], lse[lrow + r0 + 8]};
+    __syncthreads();
 
+    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
+    float dq[8][4] = {};
     for (int kt = 0; kt <= qt; kt++) {
-        __syncthreads();
-        const bf16* krow = seq + (size_t)(kt * ATT_TILE + r) * QKV_DIM + (HEADS + kvh) * D + off;
-#pragma unroll
-        for (int c = 0; c < HD; c += 8) {
-            *(uint4*)&ks[r][off + c] = *(const uint4*)(krow + c);
-            *(uint4*)&vs[r][off + c] = *(const uint4*)(krow + KV_HEADS * D + c);
+        if (kt < qt) {
+            load_tile(ks[(kt + 1) & 1], kg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
+            load_tile(vs[(kt + 1) & 1], vg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
         }
+        cp_commit();
+        cp_wait<1>();
         __syncthreads();
-        for (int j = 0; j < ATT_TILE; j++) {
-            float s = 0.f, dp = 0.f, k8[8], v8[8];
+        float s[8][4] = {}, dp[8][4] = {};
+        mma_abt(s, qf, ks[kt & 1]);
+        mma_abt(dp, df, vs[kt & 1]);
 #pragma unroll
-            for (int c = 0; c < HD; c += 8) {
-                load8(k8, &ks[j][off + c]);
-                load8(v8, &vs[j][off + c]);
+        for (int j = 0; j < 8; j++)
 #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    s += q[c + e] * k8[e];
-                    dp += dO[c + e] * v8[e];
-                }
+            for (int e = 0; e < 4; e++) {
+                const int r = e >> 1;
+                const bool masked = kt == qt && kt * 64 + 8 * j + 2 * t + (e & 1) > q0 + 8 * r;
+                const float p = masked ? 0.f : exp2f(s[j][e] * scale - l2[r]);
+                s[j][e] = p * (dp[j][e] - dd[r]);
             }
-            s += __shfl_xor_sync(0xffffffff, s, 1);
-            dp += __shfl_xor_sync(0xffffffff, dp, 1);
-            const float p = kt < qt || j <= r ? exp2f(s - l2) : 0.f, ds = p * (dp - dd);
-#pragma unroll
-            for (int c = 0; c < HD; c += 8) {
-                load8(k8, &ks[j][off + c]);
-#pragma unroll
-                for (int e = 0; e < 8; e++) dq[c + e] += ds * k8[e];
-            }
-        }
+        uint32_t sf[4][4];
+        c_to_a(sf, s);
+        mma_ab(dq, sf, ks[kt & 1]);
+        __syncthreads();
     }
-    float w[8];
+    const float k = scale / LOG2E;  // dS is w.r.t. scores scaled by 1/sqrt(HEAD_DIM)
 #pragma unroll
-    for (int c = 0; c < HD; c += 8) {
+    for (int r = 0; r < 2; r++) {
+        bf16* row = dqkv + (row0 + r0 + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
 #pragma unroll
-        for (int e = 0; e < 8; e++) w[e] = dq[c + e] * (scale / LOG2E);
-        store8(dqkv + n * QKV_DIM + h * D + off + c, w);
+        for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
     }
 }
 
-// dk, dv for one key tile of one kv head, summed over the query heads sharing it.
-__global__ void __launch_bounds__(2 * ATT_TILE) attention_bwd_dkv(bf16* dqkv, const bf16* qkv, const bf16* dout,
-                                                                  const float* lse, const float* Dsum) {
-    constexpr int D = HEAD_DIM, HD = D / 2, G = HEADS / KV_HEADS;
-    const int kt = blockIdx.x, g = blockIdx.y, b = blockIdx.z;
-    const int r = threadIdx.x / 2, off = threadIdx.x % 2 * HD, j = kt * ATT_TILE + r;
+// dk, dv contributions of one query head for 64 key rows (4 warps x 16 keys), over all query tiles that see
+// them. fp32 partials [N][HEADS][dk 64 | dv 64]; attention_bwd_finish sums the heads of each kv group.
+__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16* qkv, const bf16* dout,
+                                                         const float* lse, const float* Dsum) {
+    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;  // kt = 0 has the most work
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    __shared__ __align__(16) bf16 qs[ATT_TILE][D], dos[ATT_TILE][D];
-    __shared__ float ls[ATT_TILE], dds[ATT_TILE];
+    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    const size_t lrow = ((size_t)b * HEADS + h) * T;
+    __shared__ __align__(128) bf16 qs[2][TILE], dos[2][TILE];
+    __shared__ __align__(16) float ls[2][64], dds[2][64];
 
-    const float scale = LOG2E / sqrtf((float)D);
-    float k[HD], v[HD], dk[HD], dv[HD];
+    auto load_q = [&](int qt, int buf) {  // Q, dO, lse and D of query tile qt
+        load_tile(qs[buf], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);
+        load_tile(dos[buf], dout + ((size_t)b * T + qt * 64) * DIM + h * HEAD_DIM, DIM);
+        if (threadIdx.x < 16) cp16(&ls[buf][threadIdx.x * 4], lse + lrow + qt * 64 + threadIdx.x * 4);
+        else if (threadIdx.x < 32) cp16(&dds[buf][(threadIdx.x - 16) * 4], Dsum + lrow + qt * 64 + (threadIdx.x - 16) * 4);
+    };
+    load_tile(qs[1], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);  // K and V staged in buffer 1
+    load_tile(dos[1], kg + KV_HEADS * HEAD_DIM + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
+    load_q(kt, 0);
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+    uint32_t kf[4][4], vf[4][4];
+    frag_a(kf, qs[1], warp * 16);
+    frag_a(vf, dos[1], warp * 16);
+    __syncthreads();
+
+    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
+    const int k0 = kt * 64 + warp * 16 + g;
+    float dk[8][4] = {}, dv[8][4] = {};
+    for (int qt = kt; qt < NT; qt++) {
+        const int buf = (qt - kt) & 1;
+        if (qt + 1 < NT) load_q(qt + 1, buf ^ 1);
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        float st[8][4] = {}, dpt[8][4] = {};
+        mma_abt(st, kf, qs[buf]);   // S^T = K Q^T  [16 keys x 64 queries]
+        mma_abt(dpt, vf, dos[buf]);  // dP^T = V dO^T
 #pragma unroll
-    for (int c = 0; c < HD; c += 8) {
-        load8(k + c, seq + (size_t)j * QKV_DIM + (HEADS + g) * D + off + c);
-        load8(v + c, seq + (size_t)j * QKV_DIM + (HEADS + KV_HEADS + g) * D + off + c);
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int c = 8 * j + 2 * t + (e & 1);
+                const bool masked = qt == kt && qt * 64 + c < k0 + 8 * (e >> 1);
+                const float p = masked ? 0.f : exp2f(st[j][e] * scale - ls[buf][c]);
+                st[j][e] = p;
+                dpt[j][e] = p * (dpt[j][e] - dds[buf][c]);
+            }
+        uint32_t pf[4][4], sf[4][4];
+        c_to_a(pf, st);
+        c_to_a(sf, dpt);
+        mma_ab(dv, pf, dos[buf]);  // dV += P^T dO
+        mma_ab(dk, sf, qs[buf]);   // dK += dS^T Q
+        __syncthreads();
     }
+    const float k = scale / LOG2E;
 #pragma unroll
-    for (int d = 0; d < HD; d++) dk[d] = dv[d] = 0.f;
-
-    for (int h = g * G; h < (g + 1) * G; h++) {
-        for (int qt = kt; qt < T / ATT_TILE; qt++) {
-            __syncthreads();
-            const int i = qt * ATT_TILE + r;
-            const size_t n = (size_t)b * T + i;
+    for (int r = 0; r < 2; r++) {
+        float* row = part + (((size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
 #pragma unroll
-            for (int c = 0; c < HD; c += 8) {
-                *(uint4*)&qs[r][off + c] = *(const uint4*)(seq + (size_t)i * QKV_DIM + h * D + off + c);
-                *(uint4*)&dos[r][off + c] = *(const uint4*)(dout + n * DIM + h * D + off + c);
-            }
-            if (off == 0) {
-                ls[r] = lse[((size_t)b * HEADS + h) * T + i];
-                dds[r] = Dsum[((size_t)b * HEADS + h) * T + i];
-            }
-            __syncthreads();
-            for (int ii = 0; ii < ATT_TILE; ii++) {
-                float s = 0.f, dp = 0.f, q8[8], o8[8];
-#pragma unroll
-                for (int c = 0; c < HD; c += 8) {
-                    load8(q8, &qs[ii][off + c]);
-                    load8(o8, &dos[ii][off + c]);
-#pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        s += q8[e] * k[c + e];
-                        dp += o8[e] * v[c + e];
-                    }
-                }
-                s += __shfl_xor_sync(0xffffffff, s, 1);
-                dp += __shfl_xor_sync(0xffffffff, dp, 1);
-                const float p = qt > kt || ii >= r ? exp2f(s * scale - ls[ii]) : 0.f, ds = p * (dp - dds[ii]);
-#pragma unroll
-                for (int c = 0; c < HD; c += 8) {
-                    load8(q8, &qs[ii][off + c]);
-                    load8(o8, &dos[ii][off + c]);
-#pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        dv[c + e] += p * o8[e];
-                        dk[c + e] += ds * q8[e];
-                    }
-                }
-            }
+        for (int j = 0; j < 8; j++) {
+            *(float2*)(row + 8 * j) = {dk[j][2 * r] * k, dk[j][2 * r + 1] * k};
+            *(float2*)(row + HEAD_DIM + 8 * j) = {dv[j][2 * r], dv[j][2 * r + 1]};
         }
     }
-    const size_t n = (size_t)b * T + j;
-    float w[8];
-#pragma unroll
-    for (int c = 0; c < HD; c += 8) {
-#pragma unroll
-        for (int e = 0; e < 8; e++) w[e] = dk[c + e] * (scale / LOG2E);
-        store8(dqkv + n * QKV_DIM + (HEADS + g) * D + off + c, w);
-        store8(dqkv + n * QKV_DIM + (HEADS + KV_HEADS + g) * D + off + c, dv + c);
+}
+
+// dqkv <- [RoPE^-1(dq) | RoPE^-1(sum over the group's heads of dk) | sum of dv], dq read in place from dqkv.
+__global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2* cs) {
+    constexpr int HALF = HEAD_DIM / 2, U = HEADS + 2 * KV_HEADS, G = HEADS / KV_HEADS;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * U * HALF) return;
+    const int d = i % HALF, u = i / HALF % U, n = i / (HALF * U);
+    bf16* y = dqkv + (size_t)n * QKV_DIM + u * HEAD_DIM;
+    float x1 = 0.f, x2 = 0.f;
+    if (u < HEADS) {
+        x1 = __bfloat162float(y[d]);
+        x2 = __bfloat162float(y[d + HALF]);
+    } else {
+        const int kv = (u - HEADS) % KV_HEADS, off = u < HEADS + KV_HEADS ? 0 : HEAD_DIM;
+        for (int hh = kv * G; hh < (kv + 1) * G; hh++) {
+            const float* p = part + ((size_t)n * HEADS + hh) * 2 * HEAD_DIM + off;
+            x1 += p[d];
+            x2 += p[d + HALF];
+        }
+    }
+    if (u < HEADS + KV_HEADS) {  // inverse rotation
+        const float2 c = cs[n % T * HALF + d];
+        y[d] = __float2bfloat16(x1 * c.x + x2 * c.y);
+        y[d + HALF] = __float2bfloat16(x2 * c.x - x1 * c.y);
+    } else {
+        y[d] = __float2bfloat16(x1);
+        y[d + HALF] = __float2bfloat16(x2);
     }
 }
 
