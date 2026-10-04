@@ -347,7 +347,7 @@ def unit(B, T):
         del W
         adamw_check(d, grads, wpath, cfg)
 
-    print("\nreference sanity: pretrained SmolLM2-135M val loss over 8 batches")
+    print(f"\nreference sanity: pretrained {MODEL} val loss over 8 batches")
     model.eval()
     with torch.no_grad():
         loss = np.mean([model(*(t.cuda() for t in get_batch(tokens, i, B, T)))[1].item() for i in range(8)])
