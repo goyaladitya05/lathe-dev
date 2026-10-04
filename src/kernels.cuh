@@ -1,5 +1,5 @@
-// All lathe kernels. Shapes from the model header, tiles from the target header,
-// B/T/N and AdamW hyperparameters from train.cu. Precision follows PyTorch bf16 autocast op by op (BENCH.md).
+// All lathe kernels. Shapes from the model header, tiles from the target header; B/T/N, AdamW
+// hyperparameters and the parameter layout from train.cu. Precision follows PyTorch bf16 autocast (BENCH.md).
 #pragma once
 #include <cuda_bf16.h>
 
@@ -630,14 +630,32 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd(float* gemb, const float* d
 }
 
 // Fused AdamW, same math as PyTorch's fused kernel (fp32), then refreshes the bf16 working copy.
-// 4 parameters per thread through 16-byte accesses (memory-bound: 30 bytes per parameter).
-__global__ void adamw(float* p, bf16* pb, const float* g, float* m, float* v, size_t n4, float step) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= n4) return;
-    const float bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
-    float4 P = ((float4*)p)[i], G = ((const float4*)g)[i], M = ((float4*)m)[i], V = ((float4*)v)[i];
-    float* pp = &P.x;
-    float *gg = &G.x, *mm = &M.x, *vv = &V.x;
+// 4 parameters per thread (memory-bound). Grads come from gmat (bf16 matrices) or gvec (fp32 embedding, norms),
+// following the parameter layout in train.cu.
+__global__ void next_step(float* step) { *step += 1.f; }
+
+__global__ void adamw(float* p, bf16* pb, const bf16* gmat, const float* gvec, float* m, float* v,
+                      const float* step_count) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, j = 4 * i;
+    if (j >= P_TOTAL) return;
+    float4 G;
+    if (j < P_EMBED) {
+        G = *(const float4*)(gvec + j);
+    } else if (j >= P_EMBED + LAYERS * P_LAYER) {
+        G = *(const float4*)(gvec + G_VEC - DIM + (j - P_EMBED - LAYERS * P_LAYER));
+    } else {
+        const size_t l = (j - P_EMBED) / P_LAYER, o = (j - P_EMBED) % P_LAYER;
+        if (o < P_MAT) {
+            const uint2 u = *(const uint2*)(gmat + l * P_MAT + o);
+            const float2 a = __bfloat1622float2(*(const bf162*)&u.x), b = __bfloat1622float2(*(const bf162*)&u.y);
+            G = {a.x, a.y, b.x, b.y};
+        } else {
+            G = *(const float4*)(gvec + P_EMBED + l * 2 * DIM + (o - P_MAT));
+        }
+    }
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    float4 P = ((float4*)p)[i], M = ((float4*)m)[i], V = ((float4*)v)[i];
+    float *pp = &P.x, *gg = &G.x, *mm = &M.x, *vv = &V.x;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         float pi = pp[k], gi = gg[k];

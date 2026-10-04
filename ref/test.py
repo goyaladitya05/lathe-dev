@@ -56,6 +56,16 @@ def read_dump(path):
     return out
 
 
+def lathe_grads(d, cfg):
+    # gmat (bf16 matrix grads per layer) + gvec (fp32 embedding and norm grads) -> flat fp32 in lathe order.
+    gmat, gvec = d["gmat"].view(-1).float(), d["gvec"].view(-1)
+    E, D, pm = cfg.vocab * cfg.dim, cfg.dim, d["gmat"].numel() // cfg.layers
+    parts = [gvec[:E]]
+    for l in range(cfg.layers):
+        parts += [gmat[l * pm:(l + 1) * pm], gvec[E + 2 * D * l:E + 2 * D * (l + 1)]]
+    return torch.cat(parts + [gvec[-D:]])
+
+
 def run_lathe(B, T, *args):
     out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
     if out.returncode:
@@ -176,20 +186,20 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         print(f" backward layer {l}")
         dmo = bf(f("dres_out"))
         check("matmul down dX", rel(f("dact"), dmo @ wdown), KERNEL_TOL)
-        check("matmul down dW (fp32)", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), F32_TOL)
+        check("matmul down dW", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), KERNEL_TOL)
         g, u = (t.clone().requires_grad_() for t in d[f"L{l}.gu"].cuda().chunk(2, -1))
         (F.silu(g) * u).backward(d[f"L{l}.dact"].cuda())
         check("swiglu bwd (vs torch bf16 ops)", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
         check("matmul gate|up dX", rel(f("dln2"), f("dgu") @ wgu), KERNEL_TOL)
         gate, up = (f("dgu").T @ f("ln2")).chunk(2)
-        check("matmul gate|up dW (fp32)", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),
-                                               torch.cat([gate, up])), F32_TOL)
+        check("matmul gate|up dW", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),
+                                               torch.cat([gate, up])), KERNEL_TOL)
         dx, dw = rmsnorm_grads(f("res_mid"), ln2, f("dln2"), eps)
         check("rmsnorm 2 bwd dx + residual", rel(f("dres_mid"), f("dres_out") + dx), F32_TOL)
         check("rmsnorm 2 bwd dw", rel(G("post_attention_layernorm.weight"), dw), F32_TOL)
         dao = bf(f("dres_mid"))
         check("matmul o dX", rel(f("datt"), dao @ wo), KERNEL_TOL)
-        check("matmul o dW (fp32)", rel(G("self_attn.o_proj.weight"), dao.T @ f("att")), F32_TOL)
+        check("matmul o dW", rel(G("self_attn.o_proj.weight"), dao.T @ f("att")), KERNEL_TOL)
         hq, hk = cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
         dq, dk, dv = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
         unrope = lambda t: rope(t.view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, -sin).transpose(1, 2).reshape(B * T, -1)
@@ -197,8 +207,8 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
             check(f"attention + rope bwd {name}", rel(got, w), KERNEL_TOL)
         check("matmul qkv dX", rel(f("dln1"), f("dqkv_pre") @ wqkv), KERNEL_TOL)
         q, k, v = (f("dqkv_pre").T @ f("ln1")).split([hq, hk, hk])
-        check("matmul qkv dW (fp32)", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),
-                                                     G("self_attn.v_proj.weight")]), torch.cat([q, k, v])), F32_TOL)
+        check("matmul qkv dW", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),
+                                                     G("self_attn.v_proj.weight")]), torch.cat([q, k, v])), KERNEL_TOL)
         dx, dw = rmsnorm_grads(f("res"), ln1, f("dln1"), eps)
         check("rmsnorm 1 bwd dx + residual", rel(f("dres_in"), f("dres_mid") + dx), F32_TOL)
         check("rmsnorm 1 bwd dw", rel(G("input_layernorm.weight"), dw), F32_TOL)
@@ -300,6 +310,10 @@ def unit(B, T):
         run_lathe(B, T, "--weights", w, "--data", val, "--steps", 1, "--dump", ROOT / f"build/dump_{name}.bin")
         evals[name] = losses_from(run_lathe(B, T, "--weights", w, "--data", val, "--eval", BIAS_BATCHES), "batch")
 
+    common = ["--weights", DATA / "smol135_init.bin", "--data", val, "--steps", 6, "--group", 6]
+    graph, eager = (losses_from(run_lathe(B, T, *common, *extra), "step") for extra in [[], ["--eager", 1]])
+    check("CUDA graph replay == eager, 6 steps", float(graph != eager), 0)
+
     tokens = np.memmap(val, dtype=np.uint16, mode="r")
     x, y = get_batch(tokens, 0, B, T)
     for name in ["init", "pretrained"]:
@@ -311,7 +325,7 @@ def unit(B, T):
         load_lathe(model, wpath)
         model.cuda()
         W = Weights(model)
-        grads = from_lathe(d["grads"].view(-1), cfg)
+        grads = from_lathe(lathe_grads(d, cfg), cfg)
         forward_kernel_checks(d, W, x, y, cfg, B, T)
         e2e_checks(d, evals[name], model, tokens, B, T)
         backward_kernel_checks(d, grads, W, x, y, cfg, B, T)

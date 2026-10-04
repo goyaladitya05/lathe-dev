@@ -3,6 +3,7 @@
 //   build/train_b1_t2048 --steps 1000 --data data/train.bin   train from --weights (default seed-0 init)
 //   build/train_b1_t2048 --eval 8 --data data/val.bin         forward-only loss on 8 batches
 //   --dump PATH writes step 0 tensors (layer 0, last layer, grads, updated weights) for ref/test.py.
+//   Training steps replay one captured CUDA graph; --eager 1 launches kernels directly instead.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,6 +28,21 @@
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
 // AdamW, same as ref/model.py make_optimizer.
 constexpr float LR = 3e-4f, BETA1 = 0.9f, BETA2 = 0.95f, ADAM_EPS = 1e-8f, WEIGHT_DECAY = 0.1f;
+// Parameter layout, mirrored by ref/model.py lathe_layout. Matrices lead each layer so they stay 256B-aligned.
+constexpr size_t P_EMBED = (size_t)VOCAB * DIM;
+constexpr size_t P_QKV = (size_t)QKV_DIM * DIM, P_O = (size_t)DIM * DIM;
+constexpr size_t P_GU = 2ull * FFN * DIM, P_DOWN = (size_t)DIM * FFN;
+constexpr size_t P_LAYER = P_QKV + P_O + P_GU + P_DOWN + 2 * DIM;
+constexpr size_t P_TOTAL = P_EMBED + LAYERS * P_LAYER + DIM;
+static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 == 0 && P_GU * 2 % 256 == 0 &&
+                  P_DOWN * 2 % 256 == 0 && P_LAYER * 2 % 256 == 0,
+              "matrices must stay 256B-aligned for cuBLASLt");
+
+// Grads: matrices in bf16 (PyTorch also rounds dW to bf16 before its fp32 .grad), per layer [qkv | o | gu | down];
+// embedding and norm weights in fp32 (PyTorch sums those in fp32): [embedding][LAYERS x (ln1, ln2)][final norm].
+constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
+constexpr size_t G_VEC = P_EMBED + LAYERS * 2 * DIM + DIM;
+
 #include "kernels.cuh"
 
 #define CK(x) ck_cuda((x), #x, __LINE__)
@@ -48,16 +64,6 @@ static void die(const char* msg) {
     exit(1);
 }
 constexpr unsigned cdiv(size_t a, size_t b) { return (unsigned)((a + b - 1) / b); }
-
-// Parameter layout, mirrored by ref/model.py lathe_layout. Matrices lead each layer so they stay 256B-aligned.
-constexpr size_t P_EMBED = (size_t)VOCAB * DIM;
-constexpr size_t P_QKV = (size_t)QKV_DIM * DIM, P_O = (size_t)DIM * DIM;
-constexpr size_t P_GU = 2ull * FFN * DIM, P_DOWN = (size_t)DIM * FFN;
-constexpr size_t P_LAYER = P_QKV + P_O + P_GU + P_DOWN + 2 * DIM;
-constexpr size_t P_TOTAL = P_EMBED + LAYERS * P_LAYER + DIM;
-static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 == 0 && P_GU * 2 % 256 == 0 &&
-                  P_DOWN * 2 % 256 == 0 && P_LAYER * 2 % 256 == 0,
-              "matrices must stay 256B-aligned for cuBLASLt");
 
 template <class X>
 struct LayerP {
@@ -107,9 +113,11 @@ struct Bwd {
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
     bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
-    float* grads;   // [P_TOTAL] fp32
+    bf16* gmat;     // [LAYERS][P_MAT] matrix grads
+    float* gvec;    // [G_VEC] embedding and norm grads
     float *m, *v;   // [P_TOTAL] AdamW moments
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
+    float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
     void* workspace;
     Acts a;
     Bwd g;
@@ -132,10 +140,12 @@ static void carve(Arena& ar, State& s) {
     const size_t ND = (size_t)N * DIM;
     s.master = ar.take<float>(P_TOTAL);
     s.params = ar.take<bf16>(P_TOTAL);
-    s.grads = ar.take<float>(P_TOTAL);
+    s.gmat = ar.take<bf16>(LAYERS * P_MAT);
+    s.gvec = ar.take<float>(G_VEC);
     s.m = ar.take<float>(P_TOTAL);
     s.v = ar.take<float>(P_TOTAL);
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
+    s.step = ar.take<float>(1);
     s.workspace = ar.take<char>(CUBLAS_WORKSPACE);
     Acts& a = s.a;
     a.res = ar.take<float>((LAYERS + 1) * ND);
@@ -210,10 +220,10 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 struct Lin {
     Gemm fwd, dx, dw;
 };
-static Lin make_lin(int out, int in) {
+static Lin make_lin(int out, int in, cudaDataType_t dw_type = CUDA_R_16BF) {
     return {make_gemm(true, false, out, N, in, CUDA_R_16BF),   // y[N][out] = x W^T      (A = W, B = x)
             make_gemm(false, false, in, N, out, CUDA_R_16BF),  // dx[N][in] = dy W       (A = W, B = dy)
-            make_gemm(false, true, in, out, N, CUDA_R_32F)};   // dW[out][in] = dy^T x   (A = x, B = dy), fp32
+            make_gemm(false, true, in, out, N, dw_type)};      // dW[out][in] = dy^T x   (A = x, B = dy)
 }
 struct Lins {
     Lin qkv, o, gu, down, head;
@@ -304,14 +314,17 @@ static void backward(State& s, const Lins& L, FILE* df) {
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
-    gemm(s, L.head.dw, s.grads, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
+    gemm(s, L.head.dw, s.gvec, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
-    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.grads + P_TOTAL - DIM, g.dw_part);
+    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.gvec + G_VEC - DIM, g.dw_part);
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
-        const LayerP<float> wf = layer(s.master, l), gr = layer(s.grads, l);
+        const LayerP<float> wf = layer(s.master, l);
+        bf16* gm = s.gmat + l * P_MAT;
+        const LayerP<bf16> gr = {gm, gm + P_QKV, gm + P_QKV + P_O, gm + P_QKV + P_O + P_GU, nullptr, nullptr};
+        float* gln = s.gvec + P_EMBED + l * 2 * DIM;
         float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
         bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
         bf16 *qkv = a.qkv + (size_t)l * N * QKV_DIM, *gu = a.gu + (size_t)l * N * 2 * FFN;
@@ -329,7 +342,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.gu.dw, gr.gu, ln2, g.dgu);
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
-        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln2, g.dw_part);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         put("dres_mid", g.dres, 1, DIM);
         gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
         gemm(s, L.o.dw, gr.o, att, g.dres_bf);
@@ -344,11 +357,24 @@ static void backward(State& s, const Lins& L, FILE* df) {
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
-        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln1, g.dw_part);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln, g.dw_part);
         put("dres_in", g.dres, 1, DIM);
     }
-    embed_bwd<<<N, DIM / 4, 0, stream>>>(s.grads, g.dres, a.io, a.io + 2 * N);
+    embed_bwd<<<N, DIM / 4, 0, stream>>>(s.gvec, g.dres, a.io, a.io + 2 * N);
     CK(cudaGetLastError());
+}
+
+static void train_step(State& s, const Lins& L, FILE* df) {
+    forward(s, L, df);
+    backward(s, L, df);
+    dump(df, "gmat", s.gmat, 0, 1, LAYERS * P_MAT);
+    dump(df, "gvec", s.gvec, 1, 1, G_VEC);
+    static_assert(P_TOTAL % 4 == 0, "adamw works on float4");
+    next_step<<<1, 1, 0, stream>>>(s.step);
+    adamw<<<cdiv(P_TOTAL / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gmat, s.gvec, s.m, s.v, s.step);
+    CK(cudaGetLastError());
+    dump(df, "master", s.master, 1, 1, P_TOTAL);
+    dump(df, "params", s.params, 0, 1, P_TOTAL);
 }
 
 static void load_weights(State& s, const char* path) {
@@ -370,6 +396,7 @@ static void load_weights(State& s, const char* path) {
     f32_to_bf16<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, P_TOTAL);
     CK(cudaMemsetAsync(s.m, 0, P_TOTAL * 4, stream));
     CK(cudaMemsetAsync(s.v, 0, P_TOTAL * 4, stream));
+    CK(cudaMemsetAsync(s.step, 0, sizeof(float), stream));
 }
 
 static void init_rope(State& s) {
@@ -422,7 +449,7 @@ static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* so
 
 int main(int argc, char** argv) {
     const char *weights = "data/smol135_init.bin", *data = "data/train.bin", *dump_path = nullptr;
-    int steps = 0, evals = 0, group = 20;
+    int steps = 0, evals = 0, group = 20, eager = 0;
     for (int i = 1; i < argc; i++) {
         if (i + 1 == argc) die("missing value");
         if (!strcmp(argv[i], "--weights")) weights = argv[++i];
@@ -431,7 +458,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--steps")) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--eval")) evals = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--group")) group = atoi(argv[++i]);
-        else die("usage: train [--weights f] [--data f] [--steps n | --eval n] [--group n] [--dump f]");
+        else if (!strcmp(argv[i], "--eager")) eager = atoi(argv[++i]);
+        else die("usage: train [--weights f] [--data f] [--steps n | --eval n] [--group n] [--dump f] [--eager 1]");
     }
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
@@ -451,7 +479,7 @@ int main(int argc, char** argv) {
     load_weights(s, weights);
     init_rope(s);
     const Lins L = {make_lin(QKV_DIM, DIM), make_lin(DIM, DIM), make_lin(2 * FFN, DIM), make_lin(DIM, FFN),
-                    make_lin(VOCAB, DIM)};
+                    make_lin(VOCAB, DIM, CUDA_R_32F)};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;
@@ -463,6 +491,7 @@ int main(int argc, char** argv) {
     CK(cudaStreamSynchronize(stream));
 
     const bool train = steps > 0;
+    cudaGraphExec_t graph = nullptr;
     const int total = train ? steps : evals;
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0, first = 0; i < total; i++) {
@@ -471,15 +500,20 @@ int main(int argc, char** argv) {
         CK(cudaMemcpyAsync(s.a.io, h_io, IO_INTS * sizeof(int), cudaMemcpyHostToDevice, stream));
         CK(cudaEventRecord(copied, stream));
         FILE* df = i == 0 && dump_path ? fopen(dump_path, "wb") : nullptr;
-        forward(s, L, df);
-        if (train) {
-            backward(s, L, df);
-            dump(df, "grads", s.grads, 1, 1, P_TOTAL);
-            static_assert(P_TOTAL % 4 == 0, "adamw works on float4");
-            adamw<<<cdiv(P_TOTAL / 4, 256), 256, 0, stream>>>(s.master, s.params, s.grads, s.m, s.v, P_TOTAL / 4,
-                                                              (float)(i + 1));
-            dump(df, "master", s.master, 1, 1, P_TOTAL);
-            dump(df, "params", s.params, 0, 1, P_TOTAL);
+        if (!train) {
+            forward(s, L, df);
+        } else if (df || eager) {  // dumps synchronize, so this step runs eagerly
+            train_step(s, L, df);
+        } else {  // the whole step is one CUDA graph, captured on first use
+            if (!graph) {
+                cudaGraph_t g;
+                CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                train_step(s, L, nullptr);
+                CK(cudaStreamEndCapture(stream, &g));
+                CK(cudaGraphInstantiate(&graph, g, 0));
+                CK(cudaGraphDestroy(g));
+            }
+            CK(cudaGraphLaunch(graph, stream));
         }
         CK(cudaMemcpyAsync(h_loss + i % group, s.a.loss, sizeof(float), cudaMemcpyDeviceToHost, stream));
         if (df) fclose(df);
