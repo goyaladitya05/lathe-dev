@@ -142,20 +142,6 @@ __global__ void colsum(float* out, const float* rows) {
     }
 }
 
-// In place on the q and k heads of qkv [N][QKV_DIM]. Non-interleaved: rotates pairs (d, d + HEAD_DIM/2).
-// cs = [T][HEAD_DIM/2] of (cos, sin).
-__global__ void rope(bf16* qkv, const float2* cs) {
-    constexpr int HALF = HEAD_DIM / 2, ROT = HEADS + KV_HEADS;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N * ROT * HALF) return;
-    int d = i % HALF, n = i / (ROT * HALF);
-    bf16* x = qkv + (size_t)n * QKV_DIM + i / HALF % ROT * HEAD_DIM;
-    float2 c = cs[n % T * HALF + d];
-    float x1 = __bfloat162float(x[d]), x2 = __bfloat162float(x[d + HALF]);
-    x[d] = __float2bfloat16(x1 * c.x - x2 * c.y);
-    x[d + HALF] = __float2bfloat16(x2 * c.x + x1 * c.y);
-}
-
 // ---- Tensor cores: mma.sync m16n8k16, bf16 inputs, fp32 accumulate ----
 // Fragments (PTX ISA), lane = 4g + t. A 16x16: {row g, col 2t..}, {g+8, 2t}, {g, 8+2t}, {g+8, 8+2t}.
 // B 16x8 (k x n): {k 2t.., n g}, {k 8+2t.., n g}. C 16x8: {row g, col 2t, 2t+1}, {row g+8, col 2t, 2t+1}.
@@ -248,6 +234,194 @@ __device__ __forceinline__ void c_to_a(uint32_t (&a)[4][4], const float (&c)[8][
         a[kk][2] = pack2(c[2 * kk + 1][0], c[2 * kk + 1][1]);
         a[kk][3] = pack2(c[2 * kk + 1][2], c[2 * kk + 1][3]);
     }
+}
+
+// ---- Layer GEMMs with fused epilogues (cuBLASLt cannot fuse these). A block computes BM rows x 64 columns with
+// BM / WM warps of WM x 64, so each thread holds columns c and c + 32 of its 64 (fragments j and j + 4): a RoPE
+// pair, or a gate/up pair when the B tile holds 32 gate rows then the matching 32 up rows. BK = 32, cp.async ring.
+constexpr int GBK = 32;
+__device__ __forceinline__ int sw32(int r, int c) { return r * 32 + ((c ^ ((r >> 1) & 3)) << 3); }  // 64-byte rows
+
+// acc += A[bm.., :K] * B^T where B tile row r is row brow(r) of B [.][K] (TN, both row-major with K columns).
+template <int BM, int WM, int K, int STAGES, class BRow>
+__device__ __forceinline__ void gemm_tn_loop(float (&acc)[WM / 16][8][4], const bf16* A, int bm, const bf16* B, BRow brow,
+                                             bf16* sm) {
+    constexpr int TH = BM / WM * 32, KT = K / GBK;
+    static_assert(K % GBK == 0 && KT >= STAGES - 1, "pipeline depth");
+    bf16 *as = sm, *bs = sm + STAGES * BM * GBK;
+    const int lane = threadIdx.x & 31, wm0 = (threadIdx.x >> 5) * WM;
+    auto load = [&](int kt, int st) {
+        for (int i = threadIdx.x; i < BM * 4; i += TH)
+            cp16(as + st * BM * GBK + sw32(i >> 2, i & 3), A + (size_t)(bm + (i >> 2)) * K + kt * GBK + (i & 3) * 8);
+        for (int i = threadIdx.x; i < 64 * 4; i += TH)
+            cp16(bs + st * 64 * GBK + sw32(i >> 2, i & 3), B + (size_t)brow(i >> 2) * K + kt * GBK + (i & 3) * 8);
+    };
+#pragma unroll
+    for (int st = 0; st < STAGES - 1; st++) {
+        load(st, st);
+        cp_commit();
+    }
+    for (int kt = 0; kt < KT; kt++) {
+        cp_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
+        cp_commit();
+        const bf16 *a = as + (kt % STAGES) * BM * GBK, *b = bs + (kt % STAGES) * 64 * GBK;
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            uint32_t af[WM / 16][4], bfr[4][4];
+#pragma unroll
+            for (int i = 0; i < WM / 16; i++) ldsm4(af[i], a + sw32(wm0 + 16 * i + (lane & 15), 2 * kk + (lane >> 4)));
+#pragma unroll
+            for (int p = 0; p < 4; p++)
+                ldsm4(bfr[p], b + sw32(16 * p + (lane & 7) + ((lane >> 4) << 3), 2 * kk + ((lane >> 3) & 1)));
+#pragma unroll
+            for (int i = 0; i < WM / 16; i++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) mma(acc[i][j], af[i], bfr[j / 2][(j & 1) * 2], bfr[j / 2][(j & 1) * 2 + 1]);
+        }
+    }
+}
+
+// acc += A[bm.., :K] * B[:K, bn..bn+63], B row-major [K][LDB] (NN); B points at column bn of row 0.
+template <int BM, int WM, int K, int LDB, int STAGES>
+__device__ __forceinline__ void gemm_nn_loop(float (&acc)[WM / 16][8][4], const bf16* A, int bm, const bf16* B, bf16* sm) {
+    constexpr int TH = BM / WM * 32, KT = K / GBK;
+    static_assert(K % GBK == 0 && KT >= STAGES - 1, "pipeline depth");
+    bf16 *as = sm, *bs = sm + STAGES * BM * GBK;
+    const int lane = threadIdx.x & 31, wm0 = (threadIdx.x >> 5) * WM;
+    auto load = [&](int kt, int st) {
+        for (int i = threadIdx.x; i < BM * 4; i += TH)
+            cp16(as + st * BM * GBK + sw32(i >> 2, i & 3), A + (size_t)(bm + (i >> 2)) * K + kt * GBK + (i & 3) * 8);
+        for (int i = threadIdx.x; i < GBK * 8; i += TH)
+            cp16(bs + st * GBK * 64 + swz(i >> 3, i & 7), B + (size_t)(kt * GBK + (i >> 3)) * LDB + (i & 7) * 8);
+    };
+#pragma unroll
+    for (int st = 0; st < STAGES - 1; st++) {
+        load(st, st);
+        cp_commit();
+    }
+    for (int kt = 0; kt < KT; kt++) {
+        cp_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
+        cp_commit();
+        const bf16 *a = as + (kt % STAGES) * BM * GBK, *b = bs + (kt % STAGES) * GBK * 64;
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            uint32_t af[WM / 16][4];
+#pragma unroll
+            for (int i = 0; i < WM / 16; i++) ldsm4(af[i], a + sw32(wm0 + 16 * i + (lane & 15), 2 * kk + (lane >> 4)));
+#pragma unroll
+            for (int p = 0; p < 4; p++) {
+                uint32_t r[4];
+                ldsm4t(r, b + swz(16 * kk + (lane & 15), 2 * p + (lane >> 4)));
+#pragma unroll
+                for (int i = 0; i < WM / 16; i++) {
+                    mma(acc[i][2 * p], af[i], r[0], r[1]);
+                    mma(acc[i][2 * p + 1], af[i], r[2], r[3]);
+                }
+            }
+        }
+    }
+}
+
+constexpr int GBM = 64, GWM = 16, GST = 3;  // fused-GEMM tiles, swept on sm89 (BENCH.md profiles)
+static_assert(N % GBM == 0 && QKV_DIM % 64 == 0 && FFN % 64 == 0, "whole GEMM tiles");
+
+// qkv = ln1 . Wqkv^T, then RoPE on the q and k heads, rounding to bf16 before and after the rotation (PyTorch's
+// projection then rope). Block = GBM tokens x one 64-column head unit (QKV_DIM / 64 of them).
+__global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16* x, const bf16* w, const float2* cs) {
+    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
+    const int bm = blockIdx.y * GBM, u = blockIdx.x;
+    float acc[GWM / 16][8][4] = {};
+    gemm_tn_loop<GBM, GWM, DIM, GST>(acc, x, bm, w, [&](int r) { return u * 64 + r; }, sm);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
+    const bool rot = u < HEADS + KV_HEADS;
+#pragma unroll
+    for (int i = 0; i < GWM / 16; i++)
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int n = bm + wm0 + 16 * i + g + 8 * r;
+            bf16* y = qkv + (size_t)n * QKV_DIM + u * 64 + 2 * t;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float a[2], b[2];
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const float x1 = round_bf16(acc[i][j][2 * r + e]), x2 = round_bf16(acc[i][j + 4][2 * r + e]);
+                    if (rot) {
+                        const float2 c = cs[n % T * 32 + 8 * j + 2 * t + e];
+                        a[e] = x1 * c.x - x2 * c.y;
+                        b[e] = x2 * c.x + x1 * c.y;
+                    } else {
+                        a[e] = x1;
+                        b[e] = x2;
+                    }
+                }
+                *(bf162*)(y + 8 * j) = __floats2bfloat162_rn(a[0], a[1]);
+                *(bf162*)(y + 8 * j + 32) = __floats2bfloat162_rn(b[0], b[1]);
+            }
+        }
+}
+
+// gu = ln2 . Wgu^T and act = bf16(bf16(silu(gate)) * up). Block = GBM tokens x 32 gate columns + the matching up.
+__global__ void __launch_bounds__(GBM / GWM * 32) gu_swiglu(bf16* gu, bf16* act, const bf16* x, const bf16* w) {
+    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
+    const int bm = blockIdx.y * GBM, c0 = blockIdx.x * 32;
+    float acc[GWM / 16][8][4] = {};
+    gemm_tn_loop<GBM, GWM, DIM, GST>(acc, x, bm, w, [&](int r) { return r < 32 ? c0 + r : FFN + c0 + r - 32; }, sm);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
+#pragma unroll
+    for (int i = 0; i < GWM / 16; i++)
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const size_t n = bm + wm0 + 16 * i + g + 8 * r;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int c = c0 + 8 * j + 2 * t;
+                const bf162 gg = __floats2bfloat162_rn(acc[i][j][2 * r], acc[i][j][2 * r + 1]);
+                const bf162 uu = __floats2bfloat162_rn(acc[i][j + 4][2 * r], acc[i][j + 4][2 * r + 1]);
+                *(bf162*)(gu + n * 2 * FFN + c) = gg;
+                *(bf162*)(gu + n * 2 * FFN + FFN + c) = uu;
+                const float2 gf = __bfloat1622float2(gg), uf = __bfloat1622float2(uu);
+                *(bf162*)(act + n * FFN + c) = __floats2bfloat162_rn(round_bf16(gf.x / (1.f + expf(-gf.x))) * uf.x,
+                                                                     round_bf16(gf.y / (1.f + expf(-gf.y))) * uf.y);
+            }
+        }
+}
+
+// dact = bf16(dmo . Wd) (PyTorch's matmul output), then PyTorch's mul and silu backward:
+// ds = bf16(dact * u), du = bf16(dact * s), dg = bf16(ds * silu'(g)), s = bf16(silu(g)), into dgu.
+// Block = GBM tokens x 64 FFN columns.
+__global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
+    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
+    const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
+    float acc[GWM / 16][8][4] = {};
+    gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
+#pragma unroll
+    for (int i = 0; i < GWM / 16; i++)
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const size_t n = bm + wm0 + 16 * i + g + 8 * r;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int c = bn + 8 * j + 2 * t;
+                const float2 gf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + c));
+                const float2 uf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + FFN + c));
+                float dg[2], du[2];
+                const float gv[2] = {gf.x, gf.y}, uv[2] = {uf.x, uf.y};
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const float da = round_bf16(acc[i][j][2 * r + e]), sig = 1.f / (1.f + expf(-gv[e]));
+                    du[e] = da * round_bf16(gv[e] / (1.f + expf(-gv[e])));
+                    dg[e] = round_bf16(da * uv[e]) * sig * (1.f + gv[e] * (1.f - sig));
+                }
+                *(bf162*)(dgu + n * 2 * FFN + c) = __floats2bfloat162_rn(dg[0], dg[1]);
+                *(bf162*)(dgu + n * 2 * FFN + FFN + c) = __floats2bfloat162_rn(du[0], du[1]);
+            }
+        }
 }
 
 // ---- Attention (FlashAttention-2 style). Scores are scaled into log2 units so softmax uses exp2; lse is kept
@@ -524,25 +698,6 @@ __global__ void swiglu(bf16* act, const bf16* gu) {
 #pragma unroll
     for (int k = 0; k < 8; k++) g[k] = round_bf16(g[k] / (1.f + expf(-g[k]))) * u[k];
     store8(act + (size_t)n * FFN + c, g);
-}
-
-// PyTorch mul and silu backward: ds = bf16(dact * u), du = bf16(dact * s), dg = bf16(ds * silu'(g)).
-__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N * FFN / 8) return;
-    int n = i / (FFN / 8), c = i % (FFN / 8) * 8;
-    float g[8], u[8], da[8], dg[8], du[8];
-    load8(g, gu + (size_t)n * 2 * FFN + c);
-    load8(u, gu + (size_t)n * 2 * FFN + FFN + c);
-    load8(da, dact + (size_t)n * FFN + c);
-#pragma unroll
-    for (int k = 0; k < 8; k++) {
-        const float sig = 1.f / (1.f + expf(-g[k])), s = round_bf16(g[k] / (1.f + expf(-g[k])));
-        du[k] = da[k] * s;
-        dg[k] = round_bf16(da[k] * u[k]) * sig * (1.f + g[k] * (1.f - sig));
-    }
-    store8(dgu + (size_t)n * 2 * FFN + c, dg);
-    store8(dgu + (size_t)n * 2 * FFN + FFN + c, du);
 }
 
 // One block per row. losses[n] = logsumexp(x) - x[target] in fp32, then x is overwritten in place

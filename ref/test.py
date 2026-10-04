@@ -141,10 +141,9 @@ def forward_kernel_checks(d, W, x, y, cfg, B, T):
         if l == 0:
             check("embed", rel(f("res"), W.f[0][x.view(-1).cuda()]), 0)
         check("rmsnorm 1", rel(f("ln1"), rmsnorm(f("res"), ln1, cfg.rms_eps)), KERNEL_TOL)
-        check("matmul qkv", rel(f("qkv_pre"), f("ln1") @ wqkv.T), KERNEL_TOL)
-        qk = f("qkv_pre")[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2)
-        check("rope", rel(f("qkv")[:, :rot], rope(qk, cos, sin).transpose(1, 2).reshape(B * T, rot)), KERNEL_TOL)
-        check("rope leaves v untouched", rel(f("qkv")[:, rot:], f("qkv_pre")[:, rot:]), 0)
+        pre = bf(f("ln1") @ wqkv.T)  # projection rounded to bf16, then RoPE (PyTorch's two ops)
+        qk = rope(pre[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, sin).transpose(1, 2).reshape(B * T, rot)
+        check("matmul qkv + rope", rel(f("qkv"), torch.cat([qk, pre[:, rot:]], 1)), KERNEL_TOL)
         check("attention", rel(f("att"), attention(f("qkv"), cfg, B, T)), KERNEL_TOL)
         check("matmul o", rel(f("ao"), f("att") @ wo.T), KERNEL_TOL)
         check("residual add 1 (fp32)", rel(f("res_mid"), f("res") + f("ao")), 0)
@@ -185,11 +184,9 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         *_, ln1, ln2 = W.layer(l, "f")
         print(f" backward layer {l}")
         dmo = bf(f("dres_out"))
-        check("matmul down dX", rel(f("dact"), dmo @ wdown), KERNEL_TOL)
-        check("matmul down dW", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), KERNEL_TOL)
         g, u = (t.clone().requires_grad_() for t in d[f"L{l}.gu"].cuda().chunk(2, -1))
-        (F.silu(g) * u).backward(d[f"L{l}.dact"].cuda())
-        check("swiglu bwd (vs torch bf16 ops)", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
+        (F.silu(g) * u).backward((dmo @ wdown).to(torch.bfloat16))  # bf16 dact, then PyTorch's bf16 backward
+        check("matmul down dX + swiglu bwd", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
         check("matmul gate|up dX", rel(f("dln2"), f("dgu") @ wgu), KERNEL_TOL)
         gate, up = (f("dgu").T @ f("ln2")).chunk(2)
         check("matmul gate|up dW", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),

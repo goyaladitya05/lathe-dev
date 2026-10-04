@@ -104,7 +104,6 @@ struct Bwd {
     bf16* datt;      // [N][DIM]
     bf16* dqkv;      // [N][QKV_DIM]
     bf16* dgu;       // [N][2*FFN]
-    bf16* dact;      // [N][FFN]
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
@@ -170,7 +169,6 @@ static void carve(Arena& ar, State& s) {
     g.datt = ar.take<bf16>(ND);
     g.dqkv = ar.take<bf16>((size_t)N * QKV_DIM);
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
-    g.dact = ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
@@ -276,9 +274,7 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
-        gemm(s, L.qkv.fwd, qkv, w.qkv, ln1);
-        put("qkv_pre", qkv, 0, QKV_DIM);
-        rope<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
+        qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<dim3(NT, HEADS, B), 128, 0, stream>>>(att, lse, qkv);
         put("att", att, 0, DIM);
@@ -333,10 +329,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         const LayerDump put{df, l};
 
         put("dres_out", g.dres, 1, DIM);
-        gemm(s, L.down.dx, g.dact, w.down, g.dres_bf);
+        down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
         gemm(s, L.down.dw, gr.down, act, g.dres_bf);
-        put("dact", g.dact, 0, FFN);
-        swiglu_bwd<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(g.dgu, g.dact, gu);
         put("dgu", g.dgu, 0, 2 * FFN);
         gemm(s, L.gu.dx, g.dln, w.gu, g.dgu);
         gemm(s, L.gu.dw, gr.gu, ln2, g.dgu);
