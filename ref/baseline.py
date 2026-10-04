@@ -1,6 +1,7 @@
 # Benchmarks with shared timing and clock logging. Prints BENCH.md rows.
-#   python ref/baseline.py --mode eager|compile --B 1 --T 2048   training step: bf16 autocast, fp32 master, fused AdamW
-#   python ref/baseline.py --mode sol                            bf16 cuBLASLt GEMM speed of light
+#   python ref/baseline.py --mode eager|compile|lathe --B 1 --T 2048   training step, bf16 mixed precision
+#   python ref/baseline.py --mode sol                                  bf16 cuBLASLt GEMM speed of light
+#   python ref/baseline.py --mode session --shapes 1x2048,4x512        sol, then eager, compile, lathe per shape
 import argparse
 import datetime
 import math
@@ -8,6 +9,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -139,16 +141,54 @@ def sol(args):
         del a, b, c
 
 
+def lathe_train(args):
+    # Same warmup / runs / steps as torch; lathe times each group of --steps steps itself (one sync per group).
+    assert args.warmup % args.steps == 0
+    subprocess.run(["make", "-s", f"BATCH={args.B}", f"SEQ={args.T}"], cwd=ROOT, check=True)
+    total = args.warmup + args.runs * args.steps
+    p = subprocess.Popen([ROOT / f"build/train_b{args.B}_t{args.T}", "--data", DATA / "train.bin", "--steps",
+                          str(total), "--group", str(args.steps)], stdout=subprocess.PIPE, text=True, cwd=ROOT)
+    rates, smi, pmem, arena, loss = [], Smi(), -1, "?", "?"
+    for line in p.stdout:
+        if line.startswith("B="):
+            arena = f"{float(re.search(r'arena=([\d.]+)', line).group(1)):,.0f}"
+        elif line.startswith("step "):
+            loss = line.split()[-1]
+        elif m := re.match(r"group \d+ steps (\d+)-\d+ ms [\d.]+ tok/s (\d+)", line):
+            if int(m.group(1)) >= args.warmup:
+                rates.append(float(m.group(2)))
+            elif int(m.group(1)) + args.steps == args.warmup:  # warmup done: start sampling
+                smi.__enter__()
+                pmem = proc_mem_mib(p.pid)
+    smi.__exit__()
+    if p.wait():
+        sys.exit("lathe failed")
+    print(f"# last loss {loss}, runs {[round(r) for r in rates]}")
+    train_row("lathe", args.B, args.T, rates, f"{arena} | - | {pmem:,}", smi.stats, "CUDA 12.8")
+
+
+def session(args):
+    # One sitting, so lathe is always compared against baselines measured under the same clocks and thermals.
+    run = lambda mode, *extra: subprocess.run([sys.executable, __file__, "--mode", mode, *extra])
+    run("sol")
+    for shape in args.shapes.split(","):
+        B, T = shape.split("x")
+        for mode in ["eager", "compile", "lathe"]:
+            if run(mode, "--B", B, "--T", T).returncode and mode == "compile":
+                run(mode, "--B", B, "--T", T)  # first compile of a shape can die in CUDA graph capture (BENCH.md)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["eager", "compile", "sol"], default="eager")
+    ap.add_argument("--mode", choices=["eager", "compile", "lathe", "sol", "session"], default="eager")
     ap.add_argument("--B", type=int, default=1)
     ap.add_argument("--T", type=int, default=2048)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--steps", type=int, default=20, help="steps per timed run")
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--shapes", default="1x2048", help="session mode: comma-separated BxT")
     args = ap.parse_args()
-    sol(args) if args.mode == "sol" else torch_train(args)
+    {"sol": sol, "lathe": lathe_train, "session": session}.get(args.mode, torch_train)(args)
 
 
 if __name__ == "__main__":

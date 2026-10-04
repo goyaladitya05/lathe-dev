@@ -17,10 +17,11 @@ from model import (DATA, ROOT, Config, Model, from_lathe, get_batch, init_weight
                    make_optimizer, rope, rope_table)
 
 KERNEL_TOL = 2 ** -8  # rel L2 for kernels with bf16 outputs: one bf16 unit roundoff
-F32_TOL = 1e-5        # rel L2 for kernels with fp32 outputs
+F32_TOL = 1e-4        # rel L2 for kernels with fp32 outputs: summation-order noise (K*eps = 1.2e-4 at K = 2048)
 E2E_RATIO = 2.0
 MEDIAN_RATIO = 1.25
 BIAS_BATCHES = 8
+CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
 
 
@@ -326,6 +327,53 @@ def unit(B, T):
     with torch.no_grad():
         loss = np.mean([model(*(t.cuda() for t in get_batch(tokens, i, B, T)))[1].item() for i in range(8)])
     check("pretrained val loss", loss, 3.5)
+
+
+def curve(steps, B=1, T=2048, window=100):
+    # lathe, torch-bf16 and fp32 (checkpointed) train from the same init on the same batches.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    cfg = Config.load()
+    subprocess.run(["make", "-s", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
+    train = DATA / "train.bin"
+    out = run_lathe(B, T, "--weights", DATA / "smol135_init.bin", "--data", train, "--steps", steps)
+    curves = {"lathe": np.array(losses_from(out, "step"))}
+    tokens = np.memmap(train, dtype=np.uint16, mode="r")
+    for name, bf16 in [("torch-bf16", True), ("fp32", False)]:
+        model = Model(cfg)
+        init_weights(model)
+        model.cuda()
+        model.ckpt = not bf16
+        opt = make_optimizer(model)
+        losses = []
+        for i in range(steps):
+            x, y = (t.cuda() for t in get_batch(tokens, i, B, T))
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+                _, loss = model(x, y)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            losses.append(loss.detach())
+        curves[name] = torch.stack(losses).cpu().numpy()
+        del model, opt
+        torch.cuda.empty_cache()
+    f32, t16, la = curves["fp32"], curves["torch-bf16"], curves["lathe"]
+    np.savetxt(ROOT / f"build/curve_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
+               header="step,fp32,torch_bf16,lathe", fmt="%.6f")
+    print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'lathe':>8} | mean |torch-fp32| |lathe-fp32| |lathe-torch|")
+    for s0 in range(0, steps, window):
+        w = slice(s0, s0 + window)
+        print(f"{s0:4d}-{min(s0 + window, steps) - 1:<5d} {f32[w].mean():8.4f} {t16[w].mean():10.4f} {la[w].mean():8.4f} | "
+              f"{np.abs(t16[w] - f32[w]).mean():17.4f} {np.abs(la[w] - f32[w]).mean():12.4f} {np.abs(la[w] - t16[w]).mean():12.4f}")
+    # bf16 runs track fp32 closely until the loss transition (steps ~50-100). After it, equally valid bf16
+    # implementations follow nearby trajectories that slowly reconverge: torch-bf16 with flash, cuDNN or
+    # mem-efficient attention, over init seeds 0 and 1, reached window offsets of 0.036 and late offsets of
+    # 0.018, with the sign set by the seed. So: a sharp check before the transition, coarse ones (1.7x) after.
+    early = slice(0, CURVE_EARLY)
+    check(f"steps 0-{CURVE_EARLY - 1} mean |loss - fp32|", np.abs(la[early] - f32[early]).mean(),
+          E2E_RATIO * np.abs(t16[early] - f32[early]).mean())
+    offsets = [abs(la[a:a + window].mean() - f32[a:a + window].mean()) for a in range(0, steps, window)]
+    check(f"worst {window}-step window |mean - fp32|", max(offsets), CURVE_WINDOW_TOL)
+    check("last 200 steps |mean - fp32|", abs(la[-200:].mean() - f32[-200:].mean()), CURVE_FINAL_TOL)
 
 
 def main():

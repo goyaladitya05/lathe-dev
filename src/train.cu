@@ -287,8 +287,6 @@ static void forward(State& s, const Lins& L, FILE* df) {
         put("res_out", res + ND, 1, DIM);
     }
     gemm(s, L.head.fwd, a.logits, s.params, a.lnf);  // tied embedding
-    dump(df, "res_all", a.res, 1, (LAYERS + 1) * N, DIM);
-    dump(df, "res_mid_all", a.res_mid, 1, LAYERS * N, DIM);
     dump(df, "lnf", a.lnf, 0, N, DIM);
     dump(df, "logits", a.logits, 0, N, VOCAB);
     cross_entropy<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, tokens + N);
