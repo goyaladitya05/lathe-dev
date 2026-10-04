@@ -802,7 +802,7 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gvec, float* m, flo
 // dW = dY^T X for one weight matrix W [OUT][IN]: reduction over the N tokens with both operands token-major, so both
 // come through ldmatrix.trans. The AdamW update is fused into the epilogue: the grad, rounded to bf16 like PyTorch's
 // dW, updates master, moments and the bf16 copy of W in place while other blocks are still multiplying.
-// gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; 4-stage cp.async.
+// gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; DW_ST-stage cp.async.
 // Tied embedding (lm_head dW): rows whose token is in the batch (bit set in `touched`) also get the lookup grad
 // later, so their bf16-rounded head grad goes to gemb (fp32) and embed_bwd_adamw finishes them; gemb receives every
 // row's grad when gout is set (tests).
