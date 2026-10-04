@@ -108,12 +108,12 @@ struct Bwd {
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
+    bf16* gmat;      // [P_MAT] one layer's matrix grads, written only when dumping (they never leave registers)
 };
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
     bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
-    bf16* gmat;     // [LAYERS][P_MAT] matrix grads
     float* gvec;    // [G_VEC] embedding and norm grads
     float *m, *v;   // [P_TOTAL] AdamW moments
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
@@ -140,7 +140,6 @@ static void carve(Arena& ar, State& s) {
     const size_t ND = (size_t)N * DIM;
     s.master = ar.take<float>(P_TOTAL);
     s.params = ar.take<bf16>(P_TOTAL);
-    s.gmat = ar.take<bf16>(LAYERS * P_MAT);
     s.gvec = ar.take<float>(G_VEC);
     s.m = ar.take<float>(P_TOTAL);
     s.v = ar.take<float>(P_TOTAL);
@@ -173,6 +172,7 @@ static void carve(Arena& ar, State& s) {
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
+    g.gmat = ar.take<bf16>(P_MAT);
 }
 
 static cudaStream_t stream;
@@ -313,7 +313,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
     {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
         constexpr auto k = dw_adamw<VOCAB, DIM>;
-        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, df ? s.gmat : nullptr, a.logits,
+        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, df ? g.gmat : nullptr, a.logits,
                                                           a.lnf, s.step, s.gvec, (const uint32_t*)(a.io + IO_TOUCHED));
     }
     dump(df, "dlnf", g.dln, 0, N, DIM);
@@ -323,7 +323,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l);
-        bf16* gm = s.gmat + l * P_MAT;  // matrix grads are only stored when dumping (tests)
+        bf16* gm = g.gmat;  // matrix grads are only stored when dumping (tests)
         const LayerP<bf16> gr = df ? LayerP<bf16>{gm, gm + P_QKV, gm + P_QKV + P_O, gm + P_QKV + P_O + P_GU, nullptr, nullptr}
                                    : LayerP<bf16>{};
         // dW of one weight matrix of this layer (at layer offset off) with its AdamW update fused in. Each runs
@@ -361,6 +361,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
         dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
+        char nm[48];
+        snprintf(nm, sizeof(nm), "gmat.%d", l);
+        dump(df, nm, g.gmat, 0, 1, P_MAT);
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
@@ -376,7 +379,6 @@ static void train_step(State& s, const Lins& L, FILE* df) {
     next_step<<<1, 1, 0, stream>>>(s.step);
     forward(s, L, df);
     backward(s, L, df);
-    dump(df, "gmat", s.gmat, 0, 1, LAYERS * P_MAT);
     dump(df, "gvec", s.gvec, 1, 1, G_VEC);
     static_assert(P_EMBED % 4 == 0 && G_VEC % 4 == 0, "adamw_norms works on float4");
     adamw_norms<<<cdiv((G_VEC - P_EMBED) / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gvec, s.m, s.v, s.step);
