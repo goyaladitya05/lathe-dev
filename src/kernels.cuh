@@ -749,8 +749,9 @@ __device__ __forceinline__ void adamw_update(float& p, float& m, float& v, float
 __global__ void next_step(float* step) { *step += 1.f; }
 
 // Embedding rows of the batch's tokens: grad = (bf16-rounded head grad, in gemb_rows[segment]) + sum of dres rows for
-// that token, then AdamW on the row; gemb_full (dumps only) receives the final grad. seg = [perm N][starts N+1][count 1] from the host: positions sorted by token, one
-// block per distinct token, rows summed in a fixed order (no atomics).
+// that token, then AdamW on the row; gemb_full (dumps only) receives the final grad. seg = [perm N][starts N+1]
+// [count 1] from the host: positions sorted by token, one block per distinct token, rows summed in a fixed order
+// (no atomics).
 __global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, float* m, float* v, const float* gemb_rows,
                                                            float* gemb_full, const float* dres, const int* tok,
                                                            const int* seg, const float* step_count) {
@@ -809,8 +810,8 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, fl
 constexpr int DW_ST = 3;
 template <int OUT, int IN, bool EMB = false>
 __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
-                                                const bf16* X, const float* step_count, float* gemb_rows = nullptr,
-                                                float* gemb_full = nullptr, const int* segmap = nullptr) {
+                                                const bf16* X, const float* step_count, float* gemb_rows,
+                                                float* gemb_full, const int* segmap) {
     static_assert(OUT % 64 == 0 && IN % 64 == 0 && N % GBK == 0, "whole dW tiles");
     constexpr int KT = N / GBK;
     __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];

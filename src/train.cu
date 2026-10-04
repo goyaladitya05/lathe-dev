@@ -400,7 +400,7 @@ static void load_weights(State& s, const char* path) {
     if (h[0] != 0x4854414C || h[1] != 1) die("bad weights magic/version");
     if (h[2] != VOCAB || h[3] != DIM || h[4] != LAYERS || h[5] != HEADS || h[6] != KV_HEADS || h[7] != FFN ||
         theta != ROPE_THETA || eps != RMS_EPS)
-        die("weights config does not match models/smol135.h");
+        die("weights config does not match models/" MODEL ".h");
     std::vector<float> w(P_TOTAL);
     if (fread(w.data(), 4, P_TOTAL, f) != P_TOTAL || fgetc(f) != EOF) die("weights size mismatch");
     fclose(f);
