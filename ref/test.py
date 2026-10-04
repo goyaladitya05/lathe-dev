@@ -364,7 +364,8 @@ def curve(steps, B=1, T=2048, dev="cuda", window=100):
     out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps)
     curves = {"lathe": np.array(losses_from(out, "step"))}
     tokens = np.memmap(train, dtype=np.uint16, mode="r")
-    for name, bf16 in [("torch-bf16", True), ("fp32", False)]:
+    refs = [("torch-bf16", True), ("fp32", False)] if dev == "cuda" else [("fp32", False)]  # CPU bf16 is ~10x slower
+    for name, bf16 in refs:
         model = Model(cfg)
         init_weights(model)
         model.to(dev)
@@ -382,6 +383,19 @@ def curve(steps, B=1, T=2048, dev="cuda", window=100):
         curves[name] = torch.stack(losses).cpu().numpy()
         del model, opt
         torch.cuda.empty_cache()
+    if dev != "cuda":
+        f32, la = curves["fp32"], curves["lathe"]
+        np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, la], 1), delimiter=",",
+                   header="step,fp32,lathe", fmt="%.6f")
+        for s0 in range(0, steps, 25):
+            w = slice(s0, s0 + 25)
+            print(f"steps {s0:4d}-{min(s0 + 25, steps) - 1:<4d} fp32 {f32[w].mean():.4f}  lathe {la[w].mean():.4f}  "
+                  f"mean |lathe-fp32| {np.abs(la[w] - f32[w]).mean():.4f}")
+        # No torch-bf16 yardstick on CPU: bound from the 135M runs, where bf16 runs sat 0.0007-0.001 off fp32
+        # over the first 50 steps (2x tolerance there ~0.002).
+        check(f"steps 0-{CURVE_EARLY - 1} mean |loss - fp32|", np.abs(la[:CURVE_EARLY] - f32[:CURVE_EARLY]).mean(), 0.004)
+        check("worst step |loss - fp32|", np.abs(la - f32).max(), CURVE_WINDOW_TOL)
+        return
     f32, t16, la = curves["fp32"], curves["torch-bf16"], curves["lathe"]
     np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
                header="step,fp32,torch_bf16,lathe", fmt="%.6f")
