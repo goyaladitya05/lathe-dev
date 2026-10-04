@@ -101,7 +101,7 @@ struct Bwd {
     bf16* dact;      // [N][FFN]
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
-    float* dw_rows;  // [N][DIM] per-row norm weight grads
+    float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
 };
 
 struct State {
@@ -163,7 +163,7 @@ static void carve(Arena& ar, State& s) {
     g.dact = ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
-    g.dw_rows = ar.take<float>(ND);
+    g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
 }
 
 static cudaStream_t stream;
@@ -306,9 +306,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
     gemm(s, L.head.dx, g.dln, s.params, a.logits);
     gemm(s, L.head.dw, s.grads, a.lnf, a.logits);  // embedding grad, embed_bwd adds the lookup part
     dump(df, "dlnf", g.dln, 0, N, DIM);
-    rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_rows, nullptr, g.dln, a.res + LAYERS * ND,
+    rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
-    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.grads + P_TOTAL - DIM, g.dw_rows);
+    colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.grads + P_TOTAL - DIM, g.dw_part);
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l), gr = layer(s.grads, l);
@@ -328,8 +328,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.gu.dx, g.dln, w.gu, g.dgu);
         gemm(s, L.gu.dw, gr.gu, ln2, g.dgu);
         put("dln2", g.dln, 0, DIM);
-        rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_rows, g.dres, g.dln, res_mid, wf.ln2);
-        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln2, g.dw_rows);
+        rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln2, g.dw_part);
         put("dres_mid", g.dres, 1, DIM);
         gemm(s, L.o.dx, g.datt, w.o, g.dres_bf);
         gemm(s, L.o.dw, gr.o, att, g.dres_bf);
@@ -342,9 +342,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.qkv.dx, g.dln, w.qkv, g.dqkv);
         gemm(s, L.qkv.dw, gr.qkv, ln1, g.dqkv);
         put("dln1", g.dln, 0, DIM);
-        rmsnorm_bwd<<<cdiv(N, 8), 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_rows, g.dres, g.dln, res,
+        rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
-        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln1, g.dw_rows);
+        colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gr.ln1, g.dw_part);
         put("dres_in", g.dres, 1, DIM);
     }
     embed_bwd<<<N, DIM / 4, 0, stream>>>(s.grads, g.dres, a.io, a.io + 2 * N);
@@ -475,8 +475,9 @@ int main(int argc, char** argv) {
         if (train) {
             backward(s, L, df);
             dump(df, "grads", s.grads, 1, 1, P_TOTAL);
-            adamw<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.master, s.params, s.grads, s.m, s.v, P_TOTAL,
-                                                          (float)(i + 1));
+            static_assert(P_TOTAL % 4 == 0, "adamw works on float4");
+            adamw<<<cdiv(P_TOTAL / 4, 256), 256, 0, stream>>>(s.master, s.params, s.grads, s.m, s.v, P_TOTAL / 4,
+                                                              (float)(i + 1));
             dump(df, "master", s.master, 1, 1, P_TOTAL);
             dump(df, "params", s.params, 0, 1, P_TOTAL);
         }

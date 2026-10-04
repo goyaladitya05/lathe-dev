@@ -85,39 +85,54 @@ __global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16*
     }
 }
 
-// One warp per row. dx of out = x * r * w given dy; dres = dres_in + dx (fp32, in place allowed),
-// dres_bf = bf16(dres) for the branch matmul, dw_rows[row] = dy * (x * r) for the weight grad.
-__global__ void rmsnorm_bwd(float* dres, bf16* dres_bf, float* dw_rows, const float* dres_in, const bf16* dy,
-                            const float* x, const float* w) {
-    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (row >= N) return;
-    const size_t o = (size_t)row * DIM;
-    float2 v[DIM / 64], d[DIM / 64], g[DIM / 64];
-    float dot = 0.f;
+// dx of out = x * r * w given dy; dres = dres_in + dx (fp32, in place allowed), dres_bf = bf16(dres) for the
+// branch matmul. One warp per row, NORM_ROWS rows per block; the block's weight-grad sum of dy * (x * r) goes
+// to dw_part[block], reduced by colsum. Fixed order everywhere.
+constexpr int NORM_ROWS = 16;
+static_assert(N % NORM_ROWS == 0, "whole norm blocks");
+__global__ void __launch_bounds__(256) rmsnorm_bwd(float* dres, bf16* dres_bf, float* dw_part, const float* dres_in,
+                                                   const bf16* dy, const float* x, const float* w) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    float2 acc[DIM / 64] = {};
+    for (int k = 0; k < NORM_ROWS / 8; k++) {
+        const size_t o = (size_t)(blockIdx.x * NORM_ROWS + warp * (NORM_ROWS / 8) + k) * DIM;
+        float2 v[DIM / 64], d[DIM / 64], g[DIM / 64];
+        float dot = 0.f;
 #pragma unroll
-    for (int i = 0; i < DIM / 64; i++) {
-        v[i] = ((const float2*)(x + o))[lane + 32 * i];
-        d[i] = __bfloat1622float2(((const bf162*)(dy + o))[lane + 32 * i]);
-        float2 ww = ((const float2*)w)[lane + 32 * i];
-        g[i] = {d[i].x * ww.x, d[i].y * ww.y};
-        dot += g[i].x * v[i].x + g[i].y * v[i].y;
+        for (int i = 0; i < DIM / 64; i++) {
+            v[i] = ((const float2*)(x + o))[lane + 32 * i];
+            d[i] = __bfloat1622float2(((const bf162*)(dy + o))[lane + 32 * i]);
+            float2 ww = ((const float2*)w)[lane + 32 * i];
+            g[i] = {d[i].x * ww.x, d[i].y * ww.y};
+            dot += g[i].x * v[i].x + g[i].y * v[i].y;
+        }
+        const float r = row_rstd(v), c = r * r * warp_sum(dot) / DIM;
+#pragma unroll
+        for (int i = 0; i < DIM / 64; i++) {
+            float2 a = dres_in ? ((const float2*)(dres_in + o))[lane + 32 * i] : float2{0.f, 0.f};
+            a = {a.x + r * (g[i].x - v[i].x * c), a.y + r * (g[i].y - v[i].y * c)};
+            ((float2*)(dres + o))[lane + 32 * i] = a;
+            if (dres_bf) ((bf162*)(dres_bf + o))[lane + 32 * i] = __floats2bfloat162_rn(a.x, a.y);
+            acc[i].x += d[i].x * (v[i].x * r);
+            acc[i].y += d[i].y * (v[i].y * r);
+        }
     }
-    const float r = row_rstd(v), c = r * r * warp_sum(dot) / DIM;
+    __shared__ float2 part[8][DIM / 2];
 #pragma unroll
-    for (int i = 0; i < DIM / 64; i++) {
-        float2 acc = dres_in ? ((const float2*)(dres_in + o))[lane + 32 * i] : float2{0.f, 0.f};
-        acc = {acc.x + r * (g[i].x - v[i].x * c), acc.y + r * (g[i].y - v[i].y * c)};
-        ((float2*)(dres + o))[lane + 32 * i] = acc;
-        if (dres_bf) ((bf162*)(dres_bf + o))[lane + 32 * i] = __floats2bfloat162_rn(acc.x, acc.y);
-        ((float2*)(dw_rows + o))[lane + 32 * i] = {d[i].x * (v[i].x * r), d[i].y * (v[i].y * r)};
+    for (int i = 0; i < DIM / 64; i++) part[warp][lane + 32 * i] = acc[i];
+    __syncthreads();
+    for (int c = threadIdx.x; c < DIM / 2; c += 256) {
+        float2 sum = part[0][c];
+        for (int k = 1; k < 8; k++) sum = {sum.x + part[k][c].x, sum.y + part[k][c].y};
+        ((float2*)(dw_part + (size_t)blockIdx.x * DIM))[c] = sum;
     }
 }
 
-// out[c] = sum over rows of rows[n][c]. Grid DIM/32, block (32, 8); fixed order, no atomics.
+// out[c] = sum over the N / NORM_ROWS partial rows of rows[n][c]. Grid DIM/32, block (32, 8); fixed order.
 __global__ void colsum(float* out, const float* rows) {
     const int c = blockIdx.x * 32 + threadIdx.x, y = threadIdx.y;
     float acc = 0.f;
-    for (int n = y; n < N; n += 8) acc += rows[(size_t)n * DIM + c];
+    for (int n = y; n < N / NORM_ROWS; n += 8) acc += rows[(size_t)n * DIM + c];
     __shared__ float part[8][32];
     part[y][threadIdx.x] = acc;
     __syncthreads();
@@ -615,17 +630,24 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd(float* gemb, const float* d
 }
 
 // Fused AdamW, same math as PyTorch's fused kernel (fp32), then refreshes the bf16 working copy.
-__global__ void adamw(float* p, bf16* pb, const float* g, float* m, float* v, size_t n, float step) {
+// 4 parameters per thread through 16-byte accesses (memory-bound: 30 bytes per parameter).
+__global__ void adamw(float* p, bf16* pb, const float* g, float* m, float* v, size_t n4, float step) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n4) return;
     const float bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
-    float pi = p[i], gi = g[i], mi = m[i], vi = v[i];
-    pi -= LR * WEIGHT_DECAY * pi;
-    mi = fmaf(BETA1, mi, fmaf(-BETA1, gi, gi));
-    vi = fmaf(BETA2, vi, fmaf(-BETA2, gi * gi, gi * gi));
-    pi -= (LR / bc1) * mi / (sqrtf(vi) / bc2_sqrt + ADAM_EPS);
-    p[i] = pi;
-    m[i] = mi;
-    v[i] = vi;
-    pb[i] = __float2bfloat16(pi);
+    float4 P = ((float4*)p)[i], G = ((const float4*)g)[i], M = ((float4*)m)[i], V = ((float4*)v)[i];
+    float* pp = &P.x;
+    float *gg = &G.x, *mm = &M.x, *vv = &V.x;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        float pi = pp[k], gi = gg[k];
+        pi -= LR * WEIGHT_DECAY * pi;
+        mm[k] = fmaf(BETA1, mm[k], fmaf(-BETA1, gi, gi));
+        vv[k] = fmaf(BETA2, vv[k], fmaf(-BETA2, gi * gi, gi * gi));
+        pp[k] = pi - (LR / bc1) * mm[k] / (sqrtf(vv[k]) / bc2_sqrt + ADAM_EPS);
+    }
+    ((float4*)p)[i] = P;
+    ((float4*)m)[i] = M;
+    ((float4*)v)[i] = V;
+    ((uint2*)pb)[i] = {pack2(P.x, P.y), pack2(P.z, P.w)};
 }
