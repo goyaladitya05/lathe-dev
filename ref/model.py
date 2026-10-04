@@ -132,9 +132,9 @@ class Model(nn.Module):
         return logits, F.cross_entropy(logits.float().view(-1, logits.size(-1)), targets.view(-1))
 
 
-def init_weights(model, seed=0):
-    # HF Llama init: N(0, initializer_range) for every matrix, ones for norms. CPU RNG for determinism.
-    g = torch.Generator().manual_seed(seed)
+def init_weights(model):
+    # HF Llama init: N(0, initializer_range) for every matrix, ones for norms. CPU RNG with seed 0 for determinism.
+    g = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for p in model.parameters():
             if p.ndim == 2:
@@ -237,13 +237,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", help="export seeded random init to this path")
     ap.add_argument("--pretrained", help="export real SmolLM2 weights to this path")
-    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--model", default="smol135")
     args = ap.parse_args()
     cfg = Config.load(args.model)
     if args.init:
         model = Model(cfg)
-        init_weights(model, args.seed)
+        init_weights(model)
         export(model, args.init)
     if args.pretrained:
         model = Model(cfg)
