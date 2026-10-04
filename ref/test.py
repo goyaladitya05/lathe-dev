@@ -1,9 +1,10 @@
 # Correctness of lathe against the reference.
-#   python ref/test.py [B T]              kernels fwd/bwd, end to end, every parameter grad, AdamW (default 2 512)
-#   python ref/test.py curve [steps]      loss curve vs reference training at 1x2048 (default 1000 steps)
+#   python ref/test.py [--model smol135] [--B 2 --T 512]   kernels fwd/bwd, end to end, every parameter grad, AdamW
+#   python ref/test.py curve [--steps 1000] [--B 1 --T 2048]   loss curve vs reference training
 # Per-kernel checks feed each lathe kernel's dumped inputs to fp32 math (bf16-rounded matmul weights).
 # End-to-end checks measure lathe against an fp32 reference, with PyTorch bf16 autocast's own error as the
 # yardstick: lathe may be at most E2E_RATIO times worse.
+import argparse
 import re
 import struct
 import subprocess
@@ -23,6 +24,7 @@ MEDIAN_RATIO = 1.25
 BIAS_BATCHES = 16
 CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
+MODEL = "smol135"  # set from --model
 
 
 def rel(a, b):
@@ -66,7 +68,7 @@ def lathe_grads(d, cfg):
 
 
 def run_lathe(B, T, *args):
-    out = subprocess.run([ROOT / f"build/train_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
+    out = subprocess.run([ROOT / f"build/train_{MODEL}_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
     return out.stdout
@@ -77,12 +79,12 @@ def losses_from(stdout, kind):
 
 
 def check_header(cfg):
-    src = (ROOT / "src/models/smol135.h").read_text()
+    src = (ROOT / f"src/models/{cfg.name}.h").read_text()
     h = {k: float(v) for k, v in re.findall(r"constexpr \w+ (\w+) = ([\d.e+-]+)f?;", src)}
     want = {"VOCAB": cfg.vocab, "DIM": cfg.dim, "LAYERS": cfg.layers, "HEADS": cfg.heads, "KV_HEADS": cfg.kv_heads,
             "FFN": cfg.ffn, "ROPE_THETA": cfg.rope_theta, "RMS_EPS": cfg.rms_eps}
     bad = {k: (h.get(k), v) for k, v in want.items() if h.get(k) != v}
-    check("smol135.h == config.json", len(bad), 0)
+    check(f"{cfg.name}.h == config.json", len(bad), 0)
 
 
 def rmsnorm(x, w, eps):
@@ -120,13 +122,18 @@ def bf(t):
 
 
 class Weights:
-    # Lathe-order parameters: fp32 (norms, embedding lookup) and bf16-rounded (matmul inputs), per layer.
+    # Lathe-order parameters, moved to the GPU on demand: fp32 (norms, embedding lookup) or bf16-rounded (matmuls).
     def __init__(self, model):
-        self.f = [t.float().cuda() for t in lathe_layout(model.state_dict(), model.cfg)]
-        self.b = [bf(t) for t in self.f]
+        self.cpu = [t.detach().float().cpu() for t in lathe_layout(model.state_dict(), model.cfg)]
+
+    def f(self, i):
+        return self.cpu[i].cuda()
+
+    def b(self, i):
+        return bf(self.f(i))
 
     def layer(self, l, kind):  # kind "f" or "b": [qkv, o, gu, down, ln1, ln2]
-        return getattr(self, kind)[1 + 6 * l:7 + 6 * l]
+        return [getattr(self, kind)(1 + 6 * l + j) for j in range(6)]
 
 
 def forward_kernel_checks(d, W, x, y, cfg, B, T):
@@ -138,7 +145,7 @@ def forward_kernel_checks(d, W, x, y, cfg, B, T):
         *_, ln1, ln2 = W.layer(l, "f")
         print(f" forward layer {l}")
         if l == 0:
-            check("embed", rel(f("res"), W.f[0][x.view(-1).cuda()]), 0)
+            check("embed", rel(f("res"), W.f(0)[x.view(-1).cuda()]), 0)
         check("rmsnorm 1", rel(f("ln1"), rmsnorm(f("res"), ln1, cfg.rms_eps)), KERNEL_TOL)
         pre = bf(f("ln1") @ wqkv.T)  # projection rounded to bf16, then RoPE (PyTorch's two ops)
         qk = rope(pre[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, sin).transpose(1, 2).reshape(B * T, rot)
@@ -155,8 +162,8 @@ def forward_kernel_checks(d, W, x, y, cfg, B, T):
     print(" forward output")
     lnf = d["lnf"].float().cuda()
     res_l = d[f"L{cfg.layers - 1}.res_out"].float().cuda()
-    check("rmsnorm final", rel(lnf, rmsnorm(res_l, W.f[-1], cfg.rms_eps)), KERNEL_TOL)
-    check("matmul lm_head", rel(d["logits"].float().cuda(), lnf @ W.b[0].T), KERNEL_TOL)
+    check("rmsnorm final", rel(lnf, rmsnorm(res_l, W.f(-1), cfg.rms_eps)), KERNEL_TOL)
+    check("matmul lm_head", rel(d["logits"].float().cuda(), lnf @ W.b(0).T), KERNEL_TOL)
     ce = F.cross_entropy(d["logits"].float().cuda(), y.view(-1).cuda(), reduction="none")
     check("cross entropy", rel(d["losses"].view(-1).cuda(), ce), F32_TOL)
 
@@ -170,9 +177,9 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
     onehot = F.one_hot(y.view(-1).cuda(), cfg.vocab).float()
     print(" backward output")
     check("cross entropy bwd", rel(dlogits, (logits.softmax(-1) - onehot) / (B * T)), KERNEL_TOL)
-    check("matmul lm_head dX", rel(d["dlnf"].float().cuda(), dlogits @ W.b[0]), KERNEL_TOL)
+    check("matmul lm_head dX", rel(d["dlnf"].float().cuda(), dlogits @ W.b(0)), KERNEL_TOL)
     L = cfg.layers - 1
-    dx, dw = rmsnorm_grads(d[f"L{L}.res_out"].float().cuda(), W.f[-1], d["dlnf"].float().cuda(), eps)
+    dx, dw = rmsnorm_grads(d[f"L{L}.res_out"].float().cuda(), W.f(-1), d["dlnf"].float().cuda(), eps)
     check("rmsnorm final bwd dx", rel(d[f"L{L}.dres_out"].cuda(), dx), F32_TOL)
     check("rmsnorm final bwd dw", rel(grads["norm.weight"].cuda(), dw), F32_TOL)
     for l in [L, 0]:
@@ -244,7 +251,7 @@ def e2e_checks(d, lathe_losses, model, tokens, B, T):
 
 def ref_grads(model, x, y, bf16):
     model.zero_grad(set_to_none=True)
-    model.ckpt = not bf16
+    model.ckpt = True  # recompute blocks in backward (same numerics) so the reference fits for larger models
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
         _, loss = model(x, y)
     loss.backward()
@@ -277,17 +284,19 @@ def grad_checks(grads, model, x, y, per_tensor):
 
 
 def adamw_check(d, grads, wpath, cfg):
-    # One step of PyTorch fused AdamW on lathe's grads must reproduce lathe's updated weights.
+    # One step of PyTorch fused AdamW on lathe's grads must reproduce lathe's updated weights. On the GPU when
+    # params, grads and both moments fit (bit-exact there), else PyTorch's CPU fused AdamW.
     model = Model(cfg)
     load_lathe(model, wpath)
-    model.cuda()
+    dev = "cuda" if torch.cuda.mem_get_info()[0] > 1.2 * 16 * sum(p.numel() for p in model.parameters()) else "cpu"
+    model.to(dev)
     opt = make_optimizer(model)
     for k, p in model.named_parameters():
-        p.grad = grads[k].cuda()
+        p.grad = grads[k].to(dev)
     opt.step()
+    print(f" optimizer (torch AdamW on {dev})")
     want = torch.cat([t.reshape(-1).cpu() for t in lathe_layout(model.state_dict(), cfg)])
     master = d["master"].view(-1)
-    print(" optimizer")
     check("AdamW step vs torch fused AdamW", rel(master, want), 1e-6)
     check("bf16 copy == bf16(master)", float((d["params"].view(-1) != master.to(torch.bfloat16)).sum()), 0)
 
@@ -295,26 +304,27 @@ def adamw_check(d, grads, wpath, cfg):
 def unit(B, T):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    cfg = Config.load()
-    print("setup")
+    cfg = Config.load(MODEL)
+    print(f"setup ({MODEL}, {B}x{T})")
     check_header(cfg)
     for name in ["init", "pretrained"]:
-        if not (DATA / f"smol135_{name}.bin").exists():
-            subprocess.run([sys.executable, ROOT / "ref/model.py", f"--{name}", DATA / f"smol135_{name}.bin"], check=True)
+        if not (DATA / f"{MODEL}_{name}.bin").exists():
+            subprocess.run([sys.executable, ROOT / "ref/model.py", "--model", MODEL, f"--{name}", DATA / f"{MODEL}_{name}.bin"],
+                           check=True)
     a, b = Model(cfg), Model(cfg)
     init_weights(a)
-    load_lathe(b, DATA / "smol135_init.bin")
+    load_lathe(b, DATA / f"{MODEL}_init.bin")
     check("export/load round trip", max((p - q).abs().max().item() for p, q in zip(a.parameters(), b.parameters())), 0)
-    subprocess.run(["make", "-s", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
+    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
 
     # Run lathe before this process touches the GPU, so its arena never competes with torch for memory.
     val, evals = DATA / "val.bin", {}
     for name in ["init", "pretrained"]:
-        w = DATA / f"smol135_{name}.bin"
-        run_lathe(B, T, "--weights", w, "--data", val, "--steps", 1, "--dump", ROOT / f"build/dump_{name}.bin")
+        w = DATA / f"{MODEL}_{name}.bin"
+        run_lathe(B, T, "--weights", w, "--data", val, "--steps", 1, "--dump", ROOT / f"build/dump_{MODEL}_{name}.bin")
         evals[name] = losses_from(run_lathe(B, T, "--weights", w, "--data", val, "--eval", BIAS_BATCHES), "batch")
 
-    common = ["--weights", DATA / "smol135_init.bin", "--data", val, "--steps", 6, "--group", 6]
+    common = ["--weights", DATA / f"{MODEL}_init.bin", "--data", val, "--steps", 6, "--group", 6]
     graph, eager = (losses_from(run_lathe(B, T, *common, *extra), "step") for extra in [[], ["--eager", 1]])
     check("CUDA graph replay == eager, 6 steps", float(graph != eager), 0)
 
@@ -322,8 +332,8 @@ def unit(B, T):
     x, y = get_batch(tokens, 0, B, T)
     for name in ["init", "pretrained"]:
         print(f"\n{name} weights")
-        wpath = DATA / f"smol135_{name}.bin"
-        d = read_dump(ROOT / f"build/dump_{name}.bin")
+        wpath = DATA / f"{MODEL}_{name}.bin"
+        d = read_dump(ROOT / f"build/dump_{MODEL}_{name}.bin")
         check("batch matches get_batch", float((d["tokens"] != torch.stack([x.view(-1), y.view(-1)])).sum()), 0)
         model = Model(cfg)
         load_lathe(model, wpath)
@@ -344,25 +354,26 @@ def unit(B, T):
     check("pretrained val loss", loss, 3.5)
 
 
-def curve(steps, B=1, T=2048, window=100):
-    # lathe, torch-bf16 and fp32 (checkpointed) train from the same init on the same batches.
+def curve(steps, B=1, T=2048, dev="cuda", window=100):
+    # lathe, torch-bf16 and fp32 (checkpointed) train from the same init on the same batches. dev="cpu" runs the
+    # references on the CPU, for models whose PyTorch training state does not fit on the GPU.
     torch.backends.cuda.matmul.allow_tf32 = False
-    cfg = Config.load()
-    subprocess.run(["make", "-s", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
+    cfg = Config.load(MODEL)
+    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
     train = DATA / "train.bin"
-    out = run_lathe(B, T, "--weights", DATA / "smol135_init.bin", "--data", train, "--steps", steps)
+    out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps)
     curves = {"lathe": np.array(losses_from(out, "step"))}
     tokens = np.memmap(train, dtype=np.uint16, mode="r")
     for name, bf16 in [("torch-bf16", True), ("fp32", False)]:
         model = Model(cfg)
         init_weights(model)
-        model.cuda()
-        model.ckpt = not bf16
+        model.to(dev)
+        model.ckpt = not bf16 and dev == "cuda"
         opt = make_optimizer(model)
         losses = []
         for i in range(steps):
-            x, y = (t.cuda() for t in get_batch(tokens, i, B, T))
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            x, y = (t.to(dev) for t in get_batch(tokens, i, B, T))
+            with torch.autocast(dev, dtype=torch.bfloat16, enabled=bf16):
                 _, loss = model(x, y)
             loss.backward()
             opt.step()
@@ -372,7 +383,7 @@ def curve(steps, B=1, T=2048, window=100):
         del model, opt
         torch.cuda.empty_cache()
     f32, t16, la = curves["fp32"], curves["torch-bf16"], curves["lathe"]
-    np.savetxt(ROOT / f"build/curve_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
+    np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
                header="step,fp32,torch_bf16,lathe", fmt="%.6f")
     print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'lathe':>8} | mean |torch-fp32| |lathe-fp32| |lathe-torch|")
     for s0 in range(0, steps, window):
@@ -392,10 +403,20 @@ def curve(steps, B=1, T=2048, window=100):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "curve":
-        curve(int(sys.argv[2]) if len(sys.argv) > 2 else 1000)
+    global MODEL
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", nargs="?", choices=["unit", "curve"], default="unit")
+    ap.add_argument("--model", default="smol135")
+    ap.add_argument("--B", type=int)
+    ap.add_argument("--T", type=int)
+    ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--ref-device", default="cuda", help="curve: where the PyTorch references train")
+    args = ap.parse_args()
+    MODEL = args.model
+    if args.mode == "curve":
+        curve(args.steps, args.B or 1, args.T or 2048, args.ref_device)
     else:
-        unit(*((int(v) for v in sys.argv[1:3]) if len(sys.argv) == 3 else (2, 512)))
+        unit(args.B or 2, args.T or 512)
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
     sys.exit(1 if failures else 0)
 

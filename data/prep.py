@@ -1,5 +1,6 @@
-# Fetch SmolLM2-135M files and a FineWeb-Edu shard, tokenize to uint16 .bin.
-# Output: data/train.bin, data/val.bin (docs prefixed with <|endoftext|>), data/smol135/*.
+# Fetch SmolLM2 model files and a FineWeb-Edu shard, tokenize to uint16 .bin (the SmolLM2 models share a tokenizer).
+# Output: data/train.bin, data/val.bin (docs prefixed with <|endoftext|>), data/<model>/*.
+#   python data/prep.py [--models smol135,smol360]
 import argparse
 import os
 import sys
@@ -11,9 +12,11 @@ import pyarrow.parquet as pq
 from tokenizers import Tokenizer
 
 DATA = Path(__file__).resolve().parent
-MODEL_REV = "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
+MODELS = {  # name: (HF repo, pinned revision)
+    "smol135": ("HuggingFaceTB/SmolLM2-135M", "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"),
+    "smol360": ("HuggingFaceTB/SmolLM2-360M", "f8027fd0eaeea54caa13c31d31b9fdc459c38b49"),
+}
 DATASET_REV = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
-MODEL_URL = f"https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/{MODEL_REV}/"
 SHARD_URL = f"https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/{DATASET_REV}/sample/10BT/013_00000.parquet"
 
 
@@ -37,10 +40,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--val_tokens", type=int, default=2_000_000)
     ap.add_argument("--train_tokens", type=int, default=100_000_000)
+    ap.add_argument("--models", default="smol135")
     args = ap.parse_args()
 
-    for name in ["config.json", "tokenizer.json", "model.safetensors"]:
-        fetch(MODEL_URL + name, DATA / "smol135" / name)
+    for model in args.models.split(","):
+        repo, rev = MODELS[model]
+        for name in ["config.json", "tokenizer.json", "model.safetensors"]:
+            fetch(f"https://huggingface.co/{repo}/resolve/{rev}/{name}", DATA / model / name)
+    if (DATA / "train.bin").exists() and (DATA / "val.bin").exists():
+        return
     shard = fetch(SHARD_URL, DATA / "fineweb_edu_013.parquet")
 
     tok = Tokenizer.from_file(str(DATA / "smol135" / "tokenizer.json"))

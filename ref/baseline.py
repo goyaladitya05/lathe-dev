@@ -1,7 +1,7 @@
-# Benchmarks with shared timing and clock logging. Prints BENCH.md rows.
-#   python ref/baseline.py --mode eager|compile|lathe --B 1 --T 2048   training step, bf16 mixed precision
+# Benchmarks with shared timing and clock logging. Prints BENCH.md rows ("# <stack> OOM" when it does not fit).
+#   python ref/baseline.py --mode eager|compile|lathe|tinygrad [--model smol135] --B 1 --T 2048   training step
 #   python ref/baseline.py --mode sol                                  bf16 cuBLASLt GEMM speed of light
-#   python ref/baseline.py --mode session --shapes 1x2048,4x512        sol, then eager, compile, lathe per shape
+#   python ref/baseline.py --mode session --shapes 1x2048,4x512        sol, then every stack per shape
 import argparse
 import datetime
 import math
@@ -67,15 +67,16 @@ def commit():
                           text=True).stdout.strip()
 
 
-def train_row(stack, B, T, rates, mem, clocks, versions):
-    tps = statistics.median(rates)
-    mfu = tps * flops_per_token(Config.load(), T) / (sol_tflops() * 1e12)
+def train_row(stack, args, rates, mem, clocks, versions):
+    tps, B, T = statistics.median(rates), args.B, args.T
+    mfu = tps * flops_per_token(Config.load(args.model), T) / (sol_tflops() * 1e12)
+    stack += "" if args.model == "smol135" else f" ({args.model})"
     print(f"| {datetime.date.today()} | {commit()} | {stack} | {B}x{T} | {tps:,.0f} | "
           f"{min(rates):,.0f}-{max(rates):,.0f} | {100 * mfu:.1f}% | {mem} | {clocks} | {versions} |")
 
 
 def torch_train(args):
-    model = Model(Config.load())
+    model = Model(Config.load(args.model))
     init_weights(model)
     model.cuda()
     opt = make_optimizer(model)
@@ -95,9 +96,13 @@ def torch_train(args):
         return loss
 
     t0 = time.perf_counter()
-    for _ in range(args.warmup):
-        step()
-    torch.cuda.synchronize()
+    try:
+        for _ in range(args.warmup):
+            step()
+        torch.cuda.synchronize()
+    except torch.OutOfMemoryError:
+        print(f"# torch {args.mode} OOM at {args.model} {args.B}x{args.T}")
+        sys.exit(3)
     warm = time.perf_counter() - t0
     torch.cuda.reset_peak_memory_stats()
 
@@ -114,7 +119,7 @@ def torch_train(args):
     peak, reserved = torch.cuda.max_memory_allocated() >> 20, torch.cuda.max_memory_reserved() >> 20
     retries = torch.cuda.memory_stats()["num_alloc_retries"]
     print(f"# warmup {warm:.1f}s, last loss {loss.item():.4f}, alloc retries {retries}, runs {[round(r) for r in rates]}")
-    train_row(f"torch {args.mode}", args.B, args.T, rates, f"{peak:,} | {reserved:,} | {pmem:,}", smi.stats,
+    train_row(f"torch {args.mode}", args, rates, f"{peak:,} | {reserved:,} | {pmem:,}", smi.stats,
               f"torch {torch.__version__}")
 
 
@@ -141,17 +146,18 @@ def sol(args):
         del a, b, c
 
 
-def lathe_train(args):
-    # Same warmup / runs / steps as torch; lathe times each group of --steps steps itself (one sync per group).
+def engine_train(args, stack, cmd, env, versions):
+    # A subprocess engine that prints lathe-style "group g steps a-b ms X tok/s Y" lines every --steps steps:
+    # same warmup / runs / steps as torch, timed by the engine with one sync per group.
     assert args.warmup % args.steps == 0
-    subprocess.run(["make", "-s", f"BATCH={args.B}", f"SEQ={args.T}"], cwd=ROOT, check=True)
     total = args.warmup + args.runs * args.steps
-    p = subprocess.Popen([ROOT / f"build/train_b{args.B}_t{args.T}", "--data", DATA / "train.bin", "--steps",
-                          str(total), "--group", str(args.steps)], stdout=subprocess.PIPE, text=True, cwd=ROOT)
-    rates, smi, pmem, arena, loss = [], Smi(), -1, "?", "?"
+    p = subprocess.Popen([*map(str, cmd), "--steps", str(total), "--group", str(args.steps)], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, cwd=ROOT, env={**os.environ, **env})
+    rates, smi, pmem, arena, loss, tail = [], Smi(), -1, "-", "?", []
     for line in p.stdout:
-        if line.startswith("B="):
-            arena = f"{float(re.search(r'arena=([\d.]+)', line).group(1)):,.0f}"
+        tail = (tail + [line.strip()])[-20:]
+        if m := re.search(r"arena=([\d.]+)", line):
+            arena = f"{float(m.group(1)):,.0f}"
         elif line.startswith("step "):
             loss = line.split()[-1]
         elif m := re.match(r"group \d+ steps (\d+)-\d+ ms [\d.]+ tok/s (\d+)", line):
@@ -160,35 +166,53 @@ def lathe_train(args):
             elif int(m.group(1)) + args.steps == args.warmup:  # warmup done: start sampling
                 smi.__enter__()
                 pmem = proc_mem_mib(p.pid)
-    smi.__exit__()
+    if rates:
+        smi.__exit__()
     if p.wait():
-        sys.exit("lathe failed")
+        oom = any(k in l.lower() for l in tail for k in ("out of memory", "outofmemory", "memoryerror"))
+        print(f"# {stack} {'OOM' if oom else 'failed'} at {args.model} {args.B}x{args.T}: {tail[-1] if tail else ''}")
+        sys.exit(3)
     print(f"# last loss {loss}, runs {[round(r) for r in rates]}")
-    train_row("lathe", args.B, args.T, rates, f"{arena} | - | {pmem:,}", smi.stats, "CUDA 12.8")
+    train_row(stack, args, rates, f"{arena} | - | {pmem:,}", smi.stats, versions)
+
+
+def lathe_train(args):
+    subprocess.run(["make", "-s", f"MODEL={args.model}", f"BATCH={args.B}", f"SEQ={args.T}"], cwd=ROOT, check=True)
+    engine_train(args, "lathe", [ROOT / f"build/train_{args.model}_b{args.B}_t{args.T}", "--data", DATA / "train.bin"],
+                 {}, "CUDA 12.8")
+
+
+def tinygrad_train(args):
+    # Own venv; CUDA backend with BEAM search (tinygrad's NV backend fails BEAM here, see BENCH.md).
+    env = {"LD_LIBRARY_PATH": "/usr/local/cuda/lib64", "DEV": "CUDA", "BEAM": "2"}
+    engine_train(args, "tinygrad", [ROOT / ".venv-tinygrad/bin/python", ROOT / "ref/tinygrad_baseline.py", "--model",
+                                    args.model, "--B", args.B, "--T", args.T], env, "tinygrad 0.14.0 BEAM=2")
 
 
 def session(args):
     # One sitting, so lathe is always compared against baselines measured under the same clocks and thermals.
-    run = lambda mode, *extra: subprocess.run([sys.executable, __file__, "--mode", mode, *extra])
+    run = lambda mode, *extra: subprocess.run([sys.executable, __file__, "--mode", mode, "--model", args.model, *extra])
     run("sol")
     for shape in args.shapes.split(","):
         B, T = shape.split("x")
-        for mode in ["eager", "compile", "lathe"]:
+        for mode in args.stacks.split(","):
             if run(mode, "--B", B, "--T", T).returncode and mode == "compile":
                 run(mode, "--B", B, "--T", T)  # first compile of a shape can die in CUDA graph capture (BENCH.md)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["eager", "compile", "lathe", "sol", "session"], default="eager")
+    ap.add_argument("--mode", choices=["eager", "compile", "lathe", "tinygrad", "sol", "session"], default="eager")
+    ap.add_argument("--model", default="smol135")
     ap.add_argument("--B", type=int, default=1)
     ap.add_argument("--T", type=int, default=2048)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--steps", type=int, default=20, help="steps per timed run")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--shapes", default="1x2048", help="session mode: comma-separated BxT")
+    ap.add_argument("--stacks", default="eager,compile,lathe,tinygrad", help="session mode: stacks to run")
     args = ap.parse_args()
-    {"sol": sol, "lathe": lathe_train, "session": session}.get(args.mode, torch_train)(args)
+    {"sol": sol, "lathe": lathe_train, "tinygrad": tinygrad_train, "session": session}.get(args.mode, torch_train)(args)
 
 
 if __name__ == "__main__":

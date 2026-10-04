@@ -7,3 +7,4 @@ BENCH.md
 project.md
 *.nsys-rep
 *.sqlite
+.venv-tinygrad/

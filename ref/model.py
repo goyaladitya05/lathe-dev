@@ -1,6 +1,6 @@
 # Minimal SmolLM2-135M (Llama) reference. HF parameter names, HF init, lathe weight export.
-#   python ref/model.py --init data/smol135_init.bin          random init (seed 0)
-#   python ref/model.py --pretrained data/smol135_pretrained.bin   real SmolLM2-135M weights
+#   python ref/model.py [--model smol135] --init data/smol135_init.bin   random init (seed 0)
+#   python ref/model.py [--model smol135] --pretrained data/smol135_pretrained.bin   real SmolLM2 weights
 import argparse
 import json
 import struct
@@ -20,6 +20,7 @@ MAGIC, VERSION = 0x4854414C, 1  # "LATH"
 
 @dataclass
 class Config:
+    name: str
     vocab: int
     dim: int
     layers: int
@@ -35,11 +36,11 @@ class Config:
         return self.dim // self.heads
 
     @staticmethod
-    def load(path=DATA / "smol135" / "config.json"):
-        c = json.loads(Path(path).read_text())
+    def load(model="smol135"):
+        c = json.loads((DATA / model / "config.json").read_text())
         assert c["tie_word_embeddings"] and not c["attention_bias"] and c["hidden_act"] == "silu"
         assert c["rope_scaling"] is None and not c["rope_interleaved"]
-        return Config(c["vocab_size"], c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"],
+        return Config(model, c["vocab_size"], c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"],
                       c["num_key_value_heads"], c["intermediate_size"], float(c["rope_theta"]),
                       c["rms_norm_eps"], c["initializer_range"])
 
@@ -156,7 +157,7 @@ def load_safetensors(path):
 
 
 def load_pretrained(model):
-    sd = {k.removeprefix("model."): v for k, v in load_safetensors(DATA / "smol135" / "model.safetensors").items()}
+    sd = {k.removeprefix("model."): v for k, v in load_safetensors(DATA / model.cfg.name / "model.safetensors").items()}
     model.load_state_dict(sd, strict=True)
 
 
@@ -235,10 +236,11 @@ def get_batch(tokens, i, B, T):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", help="export seeded random init to this path")
-    ap.add_argument("--pretrained", help="export real SmolLM2-135M weights to this path")
+    ap.add_argument("--pretrained", help="export real SmolLM2 weights to this path")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--model", default="smol135")
     args = ap.parse_args()
-    cfg = Config.load()
+    cfg = Config.load(args.model)
     if args.init:
         model = Model(cfg)
         init_weights(model, args.seed)

@@ -1,7 +1,7 @@
-// lathe: SmolLM2-135M training engine. M2: forward, backward, fused AdamW.
-//   make BATCH=1 SEQ=2048
-//   build/train_b1_t2048 --steps 1000 --data data/train.bin   train from --weights (default seed-0 init)
-//   build/train_b1_t2048 --eval 8 --data data/val.bin         forward-only loss on 8 batches
+// lathe: SmolLM2 training engine, model and GPU fixed at compile time: forward, backward, fused AdamW.
+//   make MODEL=smol135 BATCH=1 SEQ=2048
+//   build/train_smol135_b1_t2048 --steps 1000 --data data/train.bin   train from --weights (default seed-0 init)
+//   build/train_smol135_b1_t2048 --eval 8 --data data/val.bin         forward-only loss on 8 batches
 //   --dump PATH writes step 0 tensors (layer 0, last layer, grads, updated weights) for ref/test.py.
 //   Training steps replay one captured CUDA graph; --eager 1 launches kernels directly instead.
 #include <algorithm>
@@ -22,7 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "models/smol135.h"
+#include MODEL_H  // models/<MODEL>.h, from the Makefile
 #include "targets/sm89.h"
 
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
@@ -461,7 +461,7 @@ static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* so
 }
 
 int main(int argc, char** argv) {
-    const char *weights = "data/smol135_init.bin", *data = "data/train.bin", *dump_path = nullptr;
+    const char *weights = "data/" MODEL "_init.bin", *data = "data/train.bin", *dump_path = nullptr;
     int steps = 0, evals = 0, group = 20, eager = 0;
     for (int i = 1; i < argc; i++) {
         if (i + 1 == argc) die("missing value");
