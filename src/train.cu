@@ -383,7 +383,7 @@ static void forward(State& s, const Lins& L, FILE* df) {
         qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
         mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
-        attention_fwd<<<dim3(NT, HEADS, B), 128, 0, stream>>>(att, lse, qkv);
+        attention_fwd<<<dim3(NT * HEADS, 1, B), 128, 0, stream>>>(att, lse, qkv);
         mark("fwd attention");
         put("att", att, 0, DIM);
         gemm(s, L.o, a.branch, w.o, att);
@@ -436,8 +436,8 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
         bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
         if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
-        attention_bwd_dkv<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
-        attention_bwd_dq<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
+        attention_bwd_dkv<<<dim3(NT * GROUP, 1, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
+        attention_bwd_dq<<<dim3(NT * GROUP, 1, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
     }
     for (int k = 0; k < KV_HEADS; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
