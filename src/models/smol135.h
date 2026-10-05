@@ -17,7 +17,7 @@ constexpr int QKV_DIM = (HEADS + 2 * KV_HEADS) * HEAD_DIM;  // 960, fused q|k|v 
 // AdamW pass schedule (train.cu backward). Layer l + 1's pass starts with kernel ADAMW_AT of layer l's backward:
 // 0 down dX + SwiGLU, 1 down dW, 2 gate_up dX, 3 gate_up dW, 4 o dX, 5 o dW, 6 attention, 7 qkv dX, 8 qkv dW; it runs
 // on ADAMW_BLOCKS persistent blocks. ADAMW_SPLIT_LAST: layer 0's o, gate_up and down go beside its own attention, so
-// only its qkv waits for the end of backward. Tuned at the model's benchmark shape (chisel e049, e051, e054).
+// only its qkv waits for the end of backward. Tuned at 1x2048 (chisel e049, e051).
 constexpr int ADAMW_AT = 2;
 constexpr int ADAMW_BLOCKS = 7;
 constexpr bool ADAMW_SPLIT_LAST = false;
