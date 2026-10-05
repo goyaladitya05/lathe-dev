@@ -366,10 +366,13 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
 
 // dact = bf16(dmo . Wd) (PyTorch's matmul output), then PyTorch's mul and silu backward:
 // ds = bf16(dact * u), du = bf16(dact * s), dg = bf16(ds * silu'(g)), s = bf16(silu(g)), into dgu.
-// Block = GBM tokens x 64 FFN columns.
+// Block = GBM tokens x 64 FFN columns. The block's gate and up lines, the epilogue's only DRAM reads, are prefetched
+// into L2 at the start so they arrive while the GEMM runs (chisel e052).
 __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
+    static_assert(GBM / GWM * 32 == 2 * GBM, "one 128-byte line per thread: GBM rows x (64 gate + 64 up columns)");
     __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
     const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (threadIdx.x >> 1)) * 2 * FFN + (threadIdx.x & 1) * FFN + bn));
     float acc[GWM / 16][8][4] = {};
     gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
@@ -480,95 +483,46 @@ __global__ void __launch_bounds__(128) attention_fwd(bf16* out, float* lse, cons
     }
 }
 
-// dq (before RoPE backward) for 64 query rows of one head, written into dqkv's q columns, and
-// Dsum = rowsum(dO * O), which attention_bwd_dkv reads.
-__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, float* Dsum, const bf16* qkv, const bf16* out,
-                                                        const bf16* dout, const float* lse) {
-    const int qt = NT - 1 - blockIdx.x, h = blockIdx.y, b = blockIdx.z;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
-    const bf16* vg = kg + KV_HEADS * HEAD_DIM;
-    const size_t row0 = (size_t)b * T + qt * 64, lrow = ((size_t)b * HEADS + h) * T + qt * 64;
-    __shared__ __align__(128) bf16 ks[2][TILE], vs[2][TILE];
-    __shared__ float dsm[64];
-
-    load_tile(ks[1], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);  // Q and dO staged in buffer 1
-    load_tile(vs[1], dout + row0 * DIM + h * HEAD_DIM, DIM);
-    load_tile(ks[0], kg, QKV_DIM);
-    load_tile(vs[0], vg, QKV_DIM);
-    cp_commit();
-    {  // D, two threads per row
-        const int r = threadIdx.x >> 1, c0 = (threadIdx.x & 1) * 32;
-        const bf16 *dp = dout + (row0 + r) * DIM + h * HEAD_DIM + c0, *op = out + (row0 + r) * DIM + h * HEAD_DIM + c0;
-        float acc = 0.f;
-#pragma unroll
-        for (int c = 0; c < 32; c += 8) {
-            float a8[8], b8[8];
-            load8(a8, dp + c);
-            load8(b8, op + c);
-#pragma unroll
-            for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
-        }
-        acc += __shfl_xor_sync(0xffffffff, acc, 1);
-        if (!(threadIdx.x & 1)) {
-            dsm[r] = acc;
-            Dsum[lrow + r] = acc;
-        }
-    }
-    cp_wait<0>();
-    __syncthreads();
-    uint32_t qf[4][4], df[4][4];
-    frag_a(qf, ks[1], warp * 16);
-    frag_a(df, vs[1], warp * 16);
-    const int r0 = warp * 16 + g, q0 = qt * 64 + r0;
-    const float dd[2] = {dsm[r0], dsm[r0 + 8]}, l2[2] = {lse[lrow + r0], lse[lrow + r0 + 8]};
-    __syncthreads();
-
-    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
-    float dq[8][4] = {};
-    for (int kt = 0; kt <= qt; kt++) {
-        if (kt < qt) {
-            load_tile(ks[(kt + 1) & 1], kg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
-            load_tile(vs[(kt + 1) & 1], vg + (size_t)(kt + 1) * 64 * QKV_DIM, QKV_DIM);
-        }
-        cp_commit();
-        cp_wait<1>();
-        __syncthreads();
-        float s[8][4] = {}, dp[8][4] = {};
-        mma_abt(s, qf, ks[kt & 1]);
-        mma_abt(dp, df, vs[kt & 1]);
-#pragma unroll
-        for (int j = 0; j < 8; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int r = e >> 1;
-                const bool masked = kt == qt && kt * 64 + 8 * j + 2 * t + (e & 1) > q0 + 8 * r;
-                const float p = masked ? 0.f : exp2f(s[j][e] * scale - l2[r]);
-                s[j][e] = p * (dp[j][e] - dd[r]);
-            }
-        uint32_t sf[4][4];
-        c_to_a(sf, s);
-        mma_ab(dq, sf, ks[kt & 1]);
-        __syncthreads();
-    }
-    const float k = scale / LOG2E;  // dS is w.r.t. scores scaled by 1/sqrt(HEAD_DIM)
-#pragma unroll
-    for (int r = 0; r < 2; r++) {
-        bf16* row = dqkv + (row0 + r0 + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
-#pragma unroll
-        for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
-    }
+// Attention backward runs per KV group (the HEADS / KV_HEADS query heads sharing one K, V head): attention_bwd_dkv
+// computes S, P, dP, dS for every (query tile, key tile) pair of the group's heads and also stores dS (bf16), so
+// attention_bwd_dq is a GEMM over it instead of recomputing S and dP (5 products per tile pair instead of 7). A group's
+// dS (B x GROUP x DS_TILES tiles of 8 KB) stays in L2 between the two. The stored values are the bf16 dS that a dq kernel
+// recomputing it would pack, bit for bit: a bf16 mma product is transpose-symmetric (chisel e050).
+constexpr int GROUP = HEADS / KV_HEADS;
+constexpr int DS_TILES = NT * (NT + 1) / 2;                       // causal (query tile, key tile) pairs per head
+constexpr size_t DS_GROUP = (size_t)B * GROUP * DS_TILES * TILE;  // bf16 elements of one group's dS
+__device__ __forceinline__ size_t ds_tile(int b, int hg, int qt, int kt) {
+    return (((size_t)b * GROUP + hg) * DS_TILES + qt * (qt + 1) / 2 + kt) * TILE;
 }
 
-// dk, dv contributions of one query head for 64 key rows (4 warps x 16 keys), over all query tiles that see
-// them. fp32 partials [N][HEADS][dk 64 | dv 64]; attention_bwd_finish sums the heads of each kv group.
-__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16* qkv, const bf16* dout,
-                                                         const float* lse, const float* Dsum) {
-    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;  // kt = 0 has the most work
+// Dsum = rowsum(dO * O) for 64 query rows of one head (two threads per row, 32 columns each), read by attention_bwd_dkv.
+__global__ void __launch_bounds__(128) attention_dsum(float* Dsum, const bf16* out, const bf16* dout) {
+    const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+    const size_t row0 = (size_t)b * T + qt * 64, lrow = ((size_t)b * HEADS + h) * T + qt * 64;
+    const int r = threadIdx.x >> 1, c0 = (threadIdx.x & 1) * 32;
+    const bf16 *dp = dout + (row0 + r) * DIM + h * HEAD_DIM + c0, *op = out + (row0 + r) * DIM + h * HEAD_DIM + c0;
+    float acc = 0.f;
+#pragma unroll
+    for (int c = 0; c < 32; c += 8) {
+        float a8[8], b8[8];
+        load8(a8, dp + c);
+        load8(b8, op + c);
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
+    }
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+    if (!(threadIdx.x & 1)) Dsum[lrow + r] = acc;
+}
+
+// dk, dv contributions of query head h0 + blockIdx.y for 64 key rows (4 warps x 16 keys), over all query tiles that
+// see them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). fp32 partials [N][HEADS][dk 64 | dv 64];
+// attention_bwd_finish sums the heads of each kv group.
+__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
+                                                         const float* lse, const float* Dsum, int h0) {
+    const int kt = blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
     const size_t lrow = ((size_t)b * HEADS + h) * T;
     __shared__ __align__(128) bf16 qs[2][TILE], dos[2][TILE];
     __shared__ __align__(16) float ls[2][64], dds[2][64];
@@ -615,6 +569,15 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16
         uint32_t pf[4][4], sf[4][4];
         c_to_a(pf, st);
         c_to_a(sf, dpt);
+        // dS^T tile: sf[kk] holds rows g and g + 8 of the warp's 16 keys, query columns 16 kk + 2 t (+1) and + 8
+        uint32_t* d = (uint32_t*)(ds + ds_tile(b, hg, qt, kt) + (warp * 16 + g) * 64 + 2 * t);
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            d[8 * kk] = sf[kk][0];
+            d[8 * kk + 4 * 64] = sf[kk][1];
+            d[8 * kk + 4] = sf[kk][2];
+            d[8 * kk + 4 + 4 * 64] = sf[kk][3];
+        }
         mma_ab(dv, pf, dos[buf]);  // dV += P^T dO
         mma_ab(dk, sf, qs[buf]);   // dK += dS^T Q
         __syncthreads();
@@ -628,6 +591,42 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, const bf16
             *(float2*)(row + 8 * j) = {dk[j][2 * r] * k, dk[j][2 * r + 1] * k};
             *(float2*)(row + HEAD_DIM + 8 * j) = {dv[j][2 * r], dv[j][2 * r + 1]};
         }
+    }
+}
+
+// dq (before RoPE backward) for 64 query rows of head h0 + blockIdx.y, written into dqkv's q columns: dq += dS K over
+// the key tiles kt = 0..qt in order, from the dS^T tiles attention_bwd_dkv stored (A fragments through ldmatrix.trans).
+__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
+    const int qt = NT - 1 - blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;  // longest blocks first
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / GROUP) * HEAD_DIM;
+    __shared__ __align__(128) bf16 dst[2][TILE], ks[2][TILE];
+    auto load = [&](int kt, int buf) {
+        load_tile(dst[buf], ds + ds_tile(b, hg, qt, kt), 64);
+        load_tile(ks[buf], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
+    };
+    load(0, 0);
+    cp_commit();
+    float dq[8][4] = {};
+    for (int kt = 0; kt <= qt; kt++) {
+        if (kt < qt) load(kt + 1, (kt + 1) & 1);
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        uint32_t sf[4][4];
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++)
+            ldsm4t(sf[kk], dst[kt & 1] + swz(kk * 16 + ((lane >> 4) << 3) + (lane & 7), warp * 2 + ((lane >> 3) & 1)));
+        mma_ab(dq, sf, ks[kt & 1]);
+        __syncthreads();
+    }
+    const float k = LOG2E / sqrtf((float)HEAD_DIM) / LOG2E;  // dS is w.r.t. scores scaled by 1/sqrt(HEAD_DIM)
+    const size_t row0 = (size_t)b * T + qt * 64;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        bf16* row = dqkv + (row0 + warp * 16 + g + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
+#pragma unroll
+        for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
     }
 }
 
@@ -781,7 +780,7 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, f
 }
 
 // AdamW for the norm weights (gnorm = [LAYERS x (ln1, ln2)][final norm]), 4 per thread; also refreshes the bf16 copy.
-// Weight matrices and the embedding are updated inside their dW GEMMs (dw_adamw) and embed_bwd_adamw.
+// Layer matrices are updated by adamw_stream, the embedding by head_dw_adamw and embed_bwd_adamw.
 __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, float* v, const float* step_count) {
     const size_t j = 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
     if (j >= G_NORM) return;
@@ -799,24 +798,16 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, fl
     *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
 }
 
-// dW = dY^T X for one weight matrix W [OUT][IN]: reduction over the N tokens with both operands token-major, so both
-// come through ldmatrix.trans. The AdamW update is fused into the epilogue: the grad, rounded to bf16 like PyTorch's
-// dW, updates master, moments and the bf16 copy of W in place while other blocks are still multiplying.
-// gout (optional, tests) also receives the bf16 grad. Block = 64 x 64 of W, 4 warps x 16 rows; DW_ST-stage cp.async.
-// Tied embedding (lm_head dW): rows whose token is in the batch (segmap[row] = its segment, else -1) also get the
-// lookup grad later, so their bf16-rounded head grad goes to gemb_rows[segment] (fp32) and embed_bwd_adamw finishes
-// them. gemb_full (dumps only) receives every row's head grad. EMB is compile-time so layer dWs carry none of this.
+// dW = dY^T X over the N tokens for a 64 x 64 block of W [OUT][IN] (rows bm.., columns bn..): both operands are
+// token-major, so both come through ldmatrix.trans. 4 warps x 16 rows; DW_ST-stage cp.async. acc[j] holds rows g and
+// g + 8 of the warp's 16, columns 8 j + 2 t (+1).
 constexpr int DW_ST = 3;
-template <int OUT, int IN, bool EMB = false>
-__global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, float* v, bf16* gout, const bf16* dY,
-                                                const bf16* X, const float* step_count, float* gemb_rows,
-                                                float* gemb_full, const int* segmap) {
+template <int OUT, int IN>
+__device__ __forceinline__ void dw_loop(float (&acc)[8][4], const bf16* dY, const bf16* X, int bm, int bn, bf16* sm) {
     static_assert(OUT % 64 == 0 && IN % 64 == 0 && N % GBK == 0, "whole dW tiles");
     constexpr int KT = N / GBK;
-    __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
     bf16 *as = sm, *bs = sm + DW_ST * GBK * 64;  // [GBK tokens][64] tiles of dY and X, 128-byte swizzled rows
-    const int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * 16;
+    const int lane = threadIdx.x & 31, wm0 = (threadIdx.x >> 5) * 16;
     auto load = [&](int kt, int st) {
         for (int i = threadIdx.x; i < GBK * 8; i += 128) {
             const size_t row = kt * GBK + (i >> 3);
@@ -824,7 +815,6 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
             cp16(bs + st * GBK * 64 + swz(i >> 3, i & 7), X + row * IN + bn + (i & 7) * 8);
         }
     };
-    float acc[8][4] = {};
 #pragma unroll
     for (int st = 0; st < DW_ST - 1; st++) {
         load(st, st);
@@ -849,6 +839,55 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
             }
         }
     }
+}
+
+// Layer weight grads: dW rounded to bf16 like PyTorch's dW, into g [OUT][IN]; adamw_stream applies them. Shapes that
+// chisel was built for run its hand-scheduled SASS core instead (src/chisel/, same bits: chisel e037).
+template <int OUT, int IN>
+__global__ void __launch_bounds__(128) dw_bf16(bf16* g, const bf16* dY, const bf16* X) {
+    __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
+    const int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    float acc[8][4] = {};
+    dw_loop<OUT, IN>(acc, dY, X, bm, bn, sm);
+    const int lane = threadIdx.x & 31, gr = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * 16;
+#pragma unroll
+    for (int r = 0; r < 2; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            *(bf162*)(g + (size_t)(bm + wm0 + gr + 8 * r) * IN + bn + 8 * j + 2 * t) =
+                __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
+}
+
+// AdamW over n parameters from their bf16 grad (each layer's four matrices, contiguous): the same update as the head's
+// fused epilogue, as one streaming pass on a low-priority stream beside the backward kernels. A few persistent blocks;
+// loads and stores evict-first (ld/st.global.cs) so the pass keeps out of L2's way (chisel e047-e051).
+__global__ void adamw_stream(float* p, float* m, float* v, bf16* pb, const bf16* g, const float* step_count, size_t n) {
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n / 2; i += (size_t)gridDim.x * blockDim.x) {
+        float2 P = __ldcs((float2*)p + i), M = __ldcs((float2*)m + i), V = __ldcs((float2*)v + i);
+        const float2 G = __bfloat1622float2(__ldcs((const bf162*)g + i));
+        adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
+        adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+        __stcs((float2*)p + i, P);
+        __stcs((float2*)m + i, M);
+        __stcs((float2*)v + i, V);
+        __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+    }
+}
+
+// lm_head dW (tied embedding) with AdamW fused into the epilogue: the grad, rounded to bf16 like PyTorch's dW, updates
+// master, moments and the bf16 copy in place while other blocks are still multiplying. Rows whose token is in the
+// batch (segmap[row] = its segment, else -1) also get the lookup grad later, so their bf16-rounded head grad goes to
+// gemb_rows[segment] (fp32) and embed_bwd_adamw finishes them. gemb_full (dumps only) receives every row's head grad.
+__global__ void __launch_bounds__(128) head_dw_adamw(float* p, bf16* pb, float* m, float* v, const bf16* dY,
+                                                     const bf16* X, const float* step_count, float* gemb_rows,
+                                                     float* gemb_full, const int* segmap) {
+    constexpr int OUT = VOCAB, IN = DIM;
+    __shared__ __align__(128) bf16 sm[DW_ST * 2 * GBK * 64];
+    const int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * 16;
+    float acc[8][4] = {};
+    dw_loop<OUT, IN>(acc, dY, X, bm, bn, sm);
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
 #pragma unroll
     for (int r = 0; r < 2; r++)
@@ -858,14 +897,10 @@ __global__ void __launch_bounds__(128) dw_adamw(float* p, bf16* pb, float* m, fl
             const size_t o = (size_t)row * IN + bn + 8 * j + 2 * t;
             const bf162 gb = __floats2bfloat162_rn(acc[j][2 * r], acc[j][2 * r + 1]);
             const float2 gf = __bfloat1622float2(gb);
-            if constexpr (EMB) {
-                if (gemb_full) *(float2*)(gemb_full + o) = gf;
-                if (const int sg = segmap[row]; sg >= 0) {
-                    *(float2*)(gemb_rows + (size_t)sg * IN + bn + 8 * j + 2 * t) = gf;
-                    continue;
-                }
-            } else if (gout) {
-                *(bf162*)(gout + o) = gb;
+            if (gemb_full) *(float2*)(gemb_full + o) = gf;
+            if (const int sg = segmap[row]; sg >= 0) {
+                *(float2*)(gemb_rows + (size_t)sg * IN + bn + 8 * j + 2 * t) = gf;
+                continue;
             }
             float2 P = *(float2*)(p + o), M = *(float2*)(m + o), V = *(float2*)(v + o);
             adamw_update(P.x, M.x, V.x, gf.x, bc1, bc2_sqrt);

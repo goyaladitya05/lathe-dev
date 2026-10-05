@@ -4,6 +4,7 @@
 //   build/train_smol135_b1_t2048 --eval 8 --data data/val.bin         forward-only loss on 8 batches
 //   --dump PATH writes step 0 tensors (layer 0, last layer, grads, updated weights) for ref/test.py.
 //   Training steps replay one captured CUDA graph; --eager 1 launches kernels directly instead.
+//   make ... STEP_TIMES=1 builds a profiling variant: eager steps, a CUDA event after every launch, ms per op at the end.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,10 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <cublasLt.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
@@ -38,21 +41,45 @@ static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 ==
                   P_DOWN * 2 % 256 == 0 && P_LAYER * 2 % 256 == 0,
               "matrices must stay 256B-aligned for cuBLASLt");
 
-// Grads: matrix grads (bf16 like PyTorch's dW) and most embedding rows never leave the dW GEMMs, which apply AdamW
-// directly. Norm weight grads are fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
+// Grads: layer matrix grads are bf16 like PyTorch's dW, in a ring of per-layer buffers until their AdamW pass (see
+// backward); most embedding rows never leave the lm_head dW GEMM, which applies AdamW directly. Norm weight grads are
+// fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
 constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
 constexpr size_t G_NORM = LAYERS * 2 * DIM + DIM;
 
 #include "kernels.cuh"
 
+// Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header
+// per model and token count (CHISEL_DW_H, from the Makefile) with the cubins of the four matrix shapes. Shapes without
+// one use dw_bf16; the bits are the same either way (chisel e037).
+#if __has_include(CHISEL_DW_H)
+#include CHISEL_DW_H
+#define HAVE_CHISEL_DW 1
+static_assert(chisel_dw_qkv_m == QKV_DIM && chisel_dw_qkv_n == DIM && chisel_dw_o_m == DIM && chisel_dw_o_n == DIM &&
+                  chisel_dw_gu_m == 2 * FFN && chisel_dw_gu_n == DIM && chisel_dw_down_m == DIM && chisel_dw_down_n == FFN &&
+                  chisel_dw_qkv_k == N && chisel_dw_o_k == N && chisel_dw_gu_k == N && chisel_dw_down_k == N,
+              "chisel header built for another shape");
+#endif
+
 #define CK(x) ck_cuda((x), #x, __LINE__)
 #define CKB(x) ck_blas((x), #x, __LINE__)
+#define CKD(x) ck_drv((x), #x, __LINE__)
 static void ck_cuda(cudaError_t e, const char* what, int line) {
     if (e != cudaSuccess) {
         fprintf(stderr, "train.cu:%d %s: %s\n", line, what, cudaGetErrorString(e));
         exit(1);
     }
 }
+#ifdef HAVE_CHISEL_DW
+static void ck_drv(CUresult r, const char* what, int line) {
+    if (r != CUDA_SUCCESS) {
+        const char* s = "?";
+        cuGetErrorString(r, &s);
+        fprintf(stderr, "train.cu:%d %s: %s\n", line, what, s);
+        exit(1);
+    }
+}
+#endif
 static void ck_blas(cublasStatus_t s, const char* what, int line) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "train.cu:%d %s: cublas status %d\n", line, what, (int)s);
@@ -109,8 +136,10 @@ struct Bwd {
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
-    bf16* gmat;      // [P_MAT] one layer's matrix grads, dumps only (nullptr otherwise)
+    bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits: carve)
+    bf16* ds;        // [2][DS_GROUP] bf16 dS tiles of two attention groups, attention_backward (likewise)
 };
+constexpr int RING = 3;
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
@@ -176,11 +205,60 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
     g.gemb_rows = ar.take<float>(ND);
-    g.gmat = dumping ? ar.take<bf16>(P_MAT) : nullptr;
+    // The gradient ring and the dS buffers live in the logits buffer when it is large enough: logits are dead from the
+    // lm_head dW (the last backward kernel to read them, on the main stream before any layer) to the next step's lm_head
+    // forward, and the side streams have joined by then.
+    constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
+    constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
+    g.gring = IN_LOGITS ? a.logits : ar.take<bf16>(RING_N);
+    g.ds = IN_LOGITS ? a.logits + RING_N : ar.take<bf16>(DS_N);
 }
 
-static cudaStream_t stream;
+// The main stream runs at the highest priority. Beside it: one stream per attention group (attention_backward, earlier
+// groups higher) and the AdamW side stream at the lowest priority (backward). All fork from and join back into the
+// main stream inside a step, so a step is still one captured graph.
+static cudaStream_t stream, side, att_stream[KV_HEADS];
+static cudaEvent_t ev_fork, ev_join, ev_ring[RING], ev_att[KV_HEADS];
 static cublasLtHandle_t lt;
+#ifdef HAVE_CHISEL_DW
+static CUfunction chisel_dw[4];
+#endif
+
+// Per-op GPU time (make ... STEP_TIMES=1): an event after every launch on the main stream, eager steps, a table at the
+// end; the AdamW passes on the side stream overlap other ops and are timed on their own.
+#ifdef STEP_TIMES
+constexpr bool STEP_TIMED = true;
+struct Mark {
+    const char* name;
+    cudaEvent_t ev;
+};
+static std::vector<Mark> marks;
+static size_t mark_i;
+static void mark(const char* name) {
+    if (mark_i == marks.size()) {
+        cudaEvent_t e;
+        CK(cudaEventCreate(&e));
+        marks.push_back({name, e});
+    }
+    marks[mark_i].name = name;
+    CK(cudaEventRecord(marks[mark_i++].ev, stream));
+}
+static std::vector<std::pair<cudaEvent_t, cudaEvent_t>> side_marks;
+static size_t side_i;
+static void side_mark(bool end) {
+    if (!end && side_i == side_marks.size()) {
+        cudaEvent_t a, b;
+        CK(cudaEventCreate(&a));
+        CK(cudaEventCreate(&b));
+        side_marks.push_back({a, b});
+    }
+    CK(cudaEventRecord(end ? side_marks[side_i++].second : side_marks[side_i].first, side));
+}
+#else
+constexpr bool STEP_TIMED = false;
+static void mark(const char*) {}
+static void side_mark(bool) {}
+#endif
 
 // Column-major D[m x n] = op(A)[m x k] B[k x n], bf16 inputs and output, fp32 accumulate. Built once per shape.
 struct Gemm {
@@ -219,9 +297,24 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 }
 
 // The cuBLASLt GEMMs of linears y = x W^T, W [out][in] row-major, x/y [N][features] row-major. The qkv forward,
-// the down dX and every dW are own kernels with fused epilogues (qkv_rope, down_dx_swiglu, dw_adamw).
+// the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw).
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
 static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
+
+// dW[out][in] = dy^T x rounded to bf16 into g, on the main stream.
+enum { DW_QKV, DW_O, DW_GU, DW_DOWN };
+template <int W, int OUT, int IN>
+static void dw_core(bf16* g, const bf16* dy, const bf16* x) {
+#ifdef HAVE_CHISEL_DW
+    static const unsigned* grid[4] = {chisel_dw_qkv_grid, chisel_dw_o_grid, chisel_dw_gu_grid, chisel_dw_down_grid};
+    static const unsigned block[4] = {chisel_dw_qkv_block, chisel_dw_o_block, chisel_dw_gu_block, chisel_dw_down_block};
+    void* args[] = {&g, &dy, &x};
+    CKD(cuLaunchKernel(chisel_dw[W], grid[W][0], grid[W][1], grid[W][2], block[W], 1, 1, 0, (CUstream)stream, args,
+                       nullptr));
+#else
+    dw_bf16<OUT, IN><<<dim3(IN / 64, OUT / 64), 128, 0, stream>>>(g, dy, x);
+#endif
+}
 static Gemm make_dx(int out, int in) { return make_gemm(false, in, N, out); }
 struct Lins {
     Gemm o, gu, down, head;             // forward
@@ -261,7 +354,9 @@ static void forward(State& s, const Lins& L, FILE* df) {
     const size_t ND = (size_t)N * DIM;
     const int* tokens = a.io;
     embed<<<cdiv(N * DIM / 4, 256), 256, 0, stream>>>(a.res, tokens, s.master);
+    mark("fwd embedding");
     rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(a.ln1, nullptr, a.res, nullptr, layer(s.master, 0).ln1);
+    mark("fwd rmsnorm");
     for (int l = 0; l < LAYERS; l++) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l);
@@ -276,63 +371,101 @@ static void forward(State& s, const Lins& L, FILE* df) {
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
         qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<dim3(NT, HEADS, B), 128, 0, stream>>>(att, lse, qkv);
+        mark("fwd attention");
         put("att", att, 0, DIM);
         gemm(s, L.o, a.branch, w.o, att);
+        mark("fwd o GEMM");
         put("ao", a.branch, 0, DIM);
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2);
+        mark("fwd rmsnorm");
         put("res_mid", res_mid, 1, DIM);
         put("ln2", ln2, 0, DIM);
         gemm(s, L.gu, gu, w.gu, ln2);
+        mark("fwd gate_up GEMM");
         put("gu", gu, 0, 2 * FFN);
         swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu);
+        mark("fwd swiglu");
         put("act", act, 0, FFN);
         gemm(s, L.down, a.branch, w.down, act);
+        mark("fwd down GEMM");
         put("mo", a.branch, 0, DIM);
         // Next layer's input norm, or the final norm.
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(last ? a.lnf : a.ln1 + (l + 1) * ND, res + ND, res_mid, a.branch,
                                                 last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1);
+        mark("fwd rmsnorm");
         put("res_out", res + ND, 1, DIM);
     }
     gemm(s, L.head, a.logits, s.params, a.lnf);  // tied embedding
+    mark("fwd head GEMM");
     dump(df, "lnf", a.lnf, 0, N, DIM);
     dump(df, "logits", a.logits, 0, N, VOCAB);
     cross_entropy<<<N, CE_THREADS, 0, stream>>>(a.losses, a.logits, tokens + N);
+    mark("cross entropy");
     mean_loss<<<1, 1024, 0, stream>>>(a.loss, a.losses);
+    mark("loss");
     CK(cudaGetLastError());
     dump(df, "dlogits", a.logits, 0, N, VOCAB);
     dump(df, "losses", a.losses, 1, N, 1);
     dump(df, "tokens", a.io, 2, 2, N);
 }
 
+// Attention backward of one layer: Dsum, then per attention group (on its own stream, earlier groups at higher
+// priority so later groups fill their tails) dK/dV storing dS and dq as a GEMM over it. Groups alternate between two
+// dS buffers; a group waits until the one two before it has read its buffer.
+static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, const bf16* qkv, const bf16* out,
+                               const bf16* dout, const float* lse) {
+    attention_dsum<<<dim3(NT, HEADS, B), 128, 0, stream>>>(dsum, out, dout);
+    CK(cudaEventRecord(ev_fork, stream));
+    for (int k = 0; k < KV_HEADS; k++) {
+        bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
+        CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
+        if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
+        attention_bwd_dkv<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
+        attention_bwd_dq<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
+        CK(cudaEventRecord(ev_att[k], att_stream[k]));
+    }
+    for (int k = 0; k < KV_HEADS; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
+}
+
+// Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is one
+// adamw_stream pass on the side stream, started at the next layer's gate_up dX GEMM so that it runs beside compute-bound
+// kernels and leaves the attention backward to itself (chisel e048-e051), and joined at the end of backward. The ring
+// slot a layer writes was last read by the pass of the layer RING above. 7 blocks: wider passes slow the kernels they
+// run beside, narrower ones spill into the memory-bound kernels after them (chisel e049, e051).
+constexpr int ADAMW_BLOCKS = 7;
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
+    auto adamw_pass = [&](int l) {  // AdamW of layer l's matrices, beside the kernels issued after this point
+        const size_t o = P_EMBED + l * P_LAYER;
+        CK(cudaEventRecord(ev_fork, stream));
+        CK(cudaStreamWaitEvent(side, ev_fork));
+        side_mark(false);
+        adamw_stream<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o,
+                                                     g.gring + (size_t)(l % RING) * P_MAT, s.step, P_MAT);
+        side_mark(true);
+        CK(cudaEventRecord(ev_ring[l % RING], side));
+    };
     gemm(s, L.head_dx, g.dln, s.params, a.logits);
-    {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
-        constexpr auto k = dw_adamw<VOCAB, DIM, true>;
-        k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, nullptr, a.logits, a.lnf, s.step,
-                                                          g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
-    }
+    mark("bwd head dX GEMM");
+    // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
+    head_dw_adamw<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, a.logits, a.lnf, s.step,
+                                                                  g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
+    mark("bwd head dW + AdamW");
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
+    mark("bwd rmsnorm");
     colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(s.gnorm + G_NORM - DIM, g.dw_part);
+    mark("bwd norm weight colsum");
     for (int l = LAYERS - 1; l >= 0; l--) {
         const LayerP<bf16> w = layer(s.params, l);
         const LayerP<float> wf = layer(s.master, l);
-        bf16* gm = g.gmat;  // matrix grads are only stored when dumping (tests)
-        const LayerP<bf16> gr = df ? LayerP<bf16>{gm, gm + P_QKV, gm + P_QKV + P_O, gm + P_QKV + P_O + P_GU, nullptr, nullptr}
-                                   : LayerP<bf16>{};
-        // dW of one weight matrix of this layer (at layer offset off) with its AdamW update fused in. Each runs
-        // after the matrix's dX GEMM, the last reader of the old weights in this step.
-        auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
-            const size_t o = P_EMBED + l * P_LAYER + off;
-            kernel<<<dim3(in / 64, out / 64), 128, 0, stream>>>(s.master + o, s.params + o, s.m + o, s.v + o, gout, dy, x,
-                                                               s.step, nullptr, nullptr, nullptr);
-        };
+        bf16* gl = g.gring + (size_t)(l % RING) * P_MAT;  // this layer's matrix grads: qkv | o | gu | down
         float* gln = s.gnorm + l * 2 * DIM;
         float *res = a.res + l * ND, *res_mid = a.res_mid + l * ND;
         bf16 *ln1 = a.ln1 + l * ND, *ln2 = a.ln2 + l * ND, *att = a.att + l * ND;
@@ -343,47 +476,69 @@ static void backward(State& s, const Lins& L, FILE* df) {
 
         put("dres_out", g.dres, 1, DIM);
         down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
-        dw(dw_adamw<DIM, FFN>, DIM, FFN, P_QKV + P_O + P_GU, gr.down, g.dres_bf, act);
+        mark("bwd down dX GEMM + SwiGLU bwd");
+        if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
+        dw_core<DW_DOWN, DIM, FFN>(gl + P_QKV + P_O + P_GU, g.dres_bf, act);
+        mark("bwd down dW");
         put("dgu", g.dgu, 0, 2 * FFN);
+        if (l + 1 < LAYERS) adamw_pass(l + 1);
         gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
-        dw(dw_adamw<2 * FFN, DIM>, 2 * FFN, DIM, P_QKV + P_O, gr.gu, g.dgu, ln2);
+        mark("bwd gate_up dX GEMM");
+        dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
+        mark("bwd gate_up dW");
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
+        mark("bwd rmsnorm");
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
+        mark("bwd norm weight colsum");
         put("dres_mid", g.dres, 1, DIM);
         gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
-        dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
+        mark("bwd o dX GEMM");
+        dw_core<DW_O, DIM, DIM>(gl + P_QKV, g.dres_bf, att);
+        mark("bwd o dW");
         put("datt", g.datt, 0, DIM);
-        attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
-        attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.part, qkv, g.datt, lse, g.dsum);
+        attention_backward(g.part, g.dqkv, g.dsum, g.ds, qkv, att, g.datt, lse);
+        mark("bwd attention (Dsum, dK/dV + dS, dq from dS)");
         attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
                                                                                                        s.rope);
+        mark("bwd attention finish");
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
-        dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
+        mark("bwd qkv dX GEMM");
+        dw_core<DW_QKV, QKV_DIM, DIM>(gl, g.dqkv, ln1);
+        mark("bwd qkv dW");
         char nm[48];
         snprintf(nm, sizeof(nm), "gmat.%d", l);
-        dump(df, nm, g.gmat, 0, 1, P_MAT);
+        dump(df, nm, gl, 0, 1, P_MAT);
+        if (l == 0) adamw_pass(0);
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
+        mark("bwd rmsnorm");
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln, g.dw_part);
+        mark("bwd norm weight colsum");
         put("dres_in", g.dres, 1, DIM);
     }
     embed_bwd_adamw<<<N, DIM / 4, 0, stream>>>(s.master, s.params, s.m, s.v, g.gemb_rows, df ? s.gemb : nullptr, g.dres,
                                                a.io, a.io + IO_SEG, s.step);
+    mark("bwd embedding + AdamW");
+    CK(cudaEventRecord(ev_join, side));  // the AdamW passes finish inside the step
+    CK(cudaStreamWaitEvent(stream, ev_join));
     CK(cudaGetLastError());
 }
 
-// AdamW runs inside backward for the weight matrices and the embedding (dw_adamw, embed_bwd_adamw); norms after it.
+// AdamW runs inside backward for the weight matrices and the embedding (adamw_stream, head_dw_adamw, embed_bwd_adamw);
+// norms after it.
 static void train_step(State& s, const Lins& L, FILE* df) {
     next_step<<<1, 1, 0, stream>>>(s.step);
+    mark("step counter");
     forward(s, L, df);
     backward(s, L, df);
     dump(df, "gemb", s.gemb, 1, 1, P_EMBED);
     dump(df, "gnorm", s.gnorm, 1, 1, G_NORM);
     static_assert(G_NORM % 4 == 0, "adamw_norms works on float4");
     adamw_norms<<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gnorm, s.m, s.v, s.step);
+    mark("AdamW norm weights");
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
     dump(df, "params", s.params, 0, 1, P_TOTAL);
@@ -479,8 +634,29 @@ int main(int argc, char** argv) {
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
     CK(cudaSetDevice(0));
-    CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    int least, greatest;
+    CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
+    CK(cudaStreamCreateWithPriority(&side, cudaStreamNonBlocking, least));
+    for (int k = 0; k < KV_HEADS; k++) {
+        CK(cudaStreamCreateWithPriority(&att_stream[k], cudaStreamNonBlocking, std::min(least, greatest + k)));
+        CK(cudaEventCreateWithFlags(&ev_att[k], cudaEventDisableTiming));
+    }
+    for (auto& e : ev_ring) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
     CKB(cublasLtCreate(&lt));
+#ifdef HAVE_CHISEL_DW
+    {  // after the runtime made the context current
+        const unsigned char* image[4] = {chisel_dw_qkv, chisel_dw_o, chisel_dw_gu, chisel_dw_down};
+        const char* name[4] = {chisel_dw_qkv_kernel, chisel_dw_o_kernel, chisel_dw_gu_kernel, chisel_dw_down_kernel};
+        for (int k = 0; k < 4; k++) {
+            CUmodule m;
+            CKD(cuModuleLoadData(&m, image[k]));
+            CKD(cuModuleGetFunction(&chisel_dw[k], m, name[k]));
+        }
+    }
+#endif
 
     State s;
     Arena ar{nullptr, 0};
@@ -506,6 +682,11 @@ int main(int argc, char** argv) {
     CK(cudaStreamSynchronize(stream));
 
     const bool train = steps > 0;
+#ifdef STEP_TIMES
+    std::vector<std::pair<const char*, float>> op_ms;
+    double side_ms = 0;
+    int timed_steps = 0;
+#endif
     cudaGraphExec_t graph = nullptr;
     const int total = train ? steps : evals;
     auto t0 = std::chrono::steady_clock::now();
@@ -517,15 +698,35 @@ int main(int argc, char** argv) {
         FILE* df = i == 0 && dump_path ? fopen(dump_path, "wb") : nullptr;
         if (!train) {
             forward(s, L, df);
-        } else if (df || eager) {  // dumps synchronize, so this step runs eagerly
+        } else if (df || eager || STEP_TIMED) {  // dumps synchronize, so this step runs eagerly
+#ifdef STEP_TIMES
+            mark_i = side_i = 0;
+            mark("start");
+#endif
             train_step(s, L, df);
+#ifdef STEP_TIMES
+            if (i >= 3) {  // after warm-up
+                CK(cudaEventSynchronize(marks[mark_i - 1].ev));
+                for (size_t k = 1; k < mark_i; k++) {
+                    float ms;
+                    CK(cudaEventElapsedTime(&ms, marks[k - 1].ev, marks[k].ev));
+                    op_ms.push_back({marks[k].name, ms});
+                }
+                for (size_t k = 0; k < side_i; k++) {
+                    float ms;
+                    CK(cudaEventElapsedTime(&ms, side_marks[k].first, side_marks[k].second));
+                    side_ms += ms;
+                }
+                timed_steps++;
+            }
+#endif
         } else {  // the whole step is one CUDA graph, captured on first use
             if (!graph) {
                 cudaGraph_t g;
                 CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
                 train_step(s, L, nullptr);
                 CK(cudaStreamEndCapture(stream, &g));
-                CK(cudaGraphInstantiate(&graph, g, 0));
+                CK(cudaGraphInstantiate(&graph, g, cudaGraphInstantiateFlagUseNodePriority));
                 CK(cudaGraphDestroy(g));
             }
             CK(cudaGraphLaunch(graph, stream));
@@ -543,5 +744,23 @@ int main(int argc, char** argv) {
             t0 = now;
         }
     }
+#ifdef STEP_TIMES
+    if (timed_steps) {  // per-op GPU ms per step, summed over layers, largest first
+        std::vector<std::pair<std::string, std::pair<double, int>>> tot;
+        for (auto& op : op_ms) {
+            auto it = std::find_if(tot.begin(), tot.end(), [&](auto& x) { return x.first == op.first; });
+            if (it == tot.end()) tot.push_back({op.first, {op.second, 1}});
+            else it->second.first += op.second, it->second.second++;
+        }
+        std::sort(tot.begin(), tot.end(), [](auto& x, auto& y) { return x.second.first > y.second.first; });
+        double all = 0;
+        for (auto& x : tot) all += x.second.first;
+        printf("step_times steps %d total_ms_per_step %.3f\n", timed_steps, all / timed_steps);
+        for (auto& x : tot)
+            printf("step_time | %s | %.3f | %d\n", x.first.c_str(), x.second.first / timed_steps,
+                   x.second.second / timed_steps);
+        printf("step_time_side | AdamW passes (side stream, overlapping the ops above) | %.3f\n", side_ms / timed_steps);
+    }
+#endif
     return 0;
 }
