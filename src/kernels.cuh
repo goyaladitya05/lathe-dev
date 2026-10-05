@@ -483,16 +483,26 @@ __global__ void __launch_bounds__(128) attention_fwd(bf16* out, float* lse, cons
     }
 }
 
-// Attention backward runs per KV group (the HEADS / KV_HEADS query heads sharing one K, V head): attention_bwd_dkv
-// computes S, P, dP, dS for every (query tile, key tile) pair of the group's heads and also stores dS (bf16), so
-// attention_bwd_dq is a GEMM over it instead of recomputing S and dP (5 products per tile pair instead of 7). A group's
-// dS (B x GROUP x DS_TILES tiles of 8 KB) stays in L2 between the two. The stored values are the bf16 dS that a dq kernel
-// recomputing it would pack, bit for bit: a bf16 mma product is transpose-symmetric (chisel e050).
-constexpr int GROUP = HEADS / KV_HEADS;
-constexpr int DS_TILES = NT * (NT + 1) / 2;                       // causal (query tile, key tile) pairs per head
-constexpr size_t DS_GROUP = (size_t)B * GROUP * DS_TILES * TILE;  // bf16 elements of one group's dS
+// Attention backward runs in passes over ATT_HEADS query heads: attention_bwd_dkv computes S, P, dP, dS for every
+// (query tile, key tile) pair of the pass's heads and also stores dS (bf16), so attention_bwd_dq is a GEMM over it
+// instead of recomputing S and dP (5 products per tile pair instead of 7). A pass's dS stays in L2 between the two:
+// ATT_HEADS is the most heads that divide HEADS with at most DS_L2_BYTES of dS (e.g. 3 at 135M 1x2048, all 15 at 360M
+// 1x704: fewer, larger launches unless L2 overflows; chisel e050, e055). The stored values are the bf16 dS that a dq
+// kernel recomputing it would pack, bit for bit: a bf16 mma product is transpose-symmetric (chisel e050).
+constexpr int KV_GROUP = HEADS / KV_HEADS;                // query heads per K, V head
+constexpr int DS_TILES = NT * (NT + 1) / 2;               // causal (query tile, key tile) pairs per head
+constexpr size_t DS_HEAD = (size_t)B * DS_TILES * TILE;   // bf16 elements of one head's dS
+constexpr size_t DS_L2_BYTES = 13ull << 20;
+constexpr int att_heads() {
+    int n = 1;
+    for (int d = 1; d <= HEADS; d++)
+        if (HEADS % d == 0 && d * DS_HEAD * 2 <= DS_L2_BYTES) n = d;
+    return n;
+}
+constexpr int ATT_HEADS = att_heads(), ATT_PASSES = HEADS / ATT_HEADS;
+constexpr size_t DS_PASS = ATT_HEADS * DS_HEAD;           // bf16 elements of one pass's dS
 __device__ __forceinline__ size_t ds_tile(int b, int hg, int qt, int kt) {
-    return (((size_t)b * GROUP + hg) * DS_TILES + qt * (qt + 1) / 2 + kt) * TILE;
+    return (((size_t)b * ATT_HEADS + hg) * DS_TILES + qt * (qt + 1) / 2 + kt) * TILE;
 }
 
 // Dsum = rowsum(dO * O) for 64 query rows of one head (two threads per row, 32 columns each), read by attention_bwd_dkv.
@@ -522,7 +532,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     const int kt = blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
-    const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
+    const bf16* kg = seq + (HEADS + h / KV_GROUP) * HEAD_DIM;
     const size_t lrow = ((size_t)b * HEADS + h) * T;
     __shared__ __align__(128) bf16 qs[2][TILE], dos[2][TILE];
     __shared__ __align__(16) float ls[2][64], dds[2][64];
@@ -599,7 +609,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
 __global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
     const int qt = NT - 1 - blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;  // longest blocks first
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / GROUP) * HEAD_DIM;
+    const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / KV_GROUP) * HEAD_DIM;
     __shared__ __align__(128) bf16 dst[2][TILE], ks[2][TILE];
     auto load = [&](int kt, int buf) {
         load_tile(dst[buf], ds + ds_tile(b, hg, qt, kt), 64);
