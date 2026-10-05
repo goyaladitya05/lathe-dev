@@ -443,24 +443,25 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
     for (int k = 0; k < KV_HEADS; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
 }
 
-// Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is one
-// adamw_stream pass on the side stream, started at the next layer's gate_up dX GEMM so that it runs beside compute-bound
-// kernels and leaves the attention backward to itself (chisel e048-e051), and joined at the end of backward. The ring
-// slot a layer writes was last read by the pass of the layer RING above. 7 blocks: wider passes slow the kernels they
-// run beside, narrower ones spill into the memory-bound kernels after them (chisel e049, e051).
-constexpr int ADAMW_BLOCKS = 7;
+// Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is
+// adamw_stream on the side stream, started with a kernel of the next layer's backward (ADAMW_AT, models/*.h: a window
+// of compute-bound kernels; wider passes slow what they run beside, narrower ones spill into the memory-bound kernels
+// after it: chisel e048-e051, e054), and joined at the end of backward. The ring slot a layer writes was last read by
+// the pass of the layer RING above.
+static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
-    auto adamw_pass = [&](int l) {  // AdamW of layer l's matrices, beside the kernels issued after this point
-        const size_t o = P_EMBED + l * P_LAYER;
+    // AdamW of parameters [b, e) of layer l's matrices, beside the kernels issued after this point
+    auto adamw_pass = [&](int l, size_t b, size_t e) {
+        const size_t o = P_EMBED + l * P_LAYER + b;
         side_open = true;
         CK(cudaEventRecord(ev_fork, stream));
         CK(cudaStreamWaitEvent(side, ev_fork));
         side_mark(false);
         adamw_stream<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o,
-                                                     g.gring + (size_t)(l % RING) * P_MAT, s.step, P_MAT);
+                                                     g.gring + (size_t)(l % RING) * P_MAT + b, s.step, e - b);
         side_mark(true);
         CK(cudaEventRecord(ev_ring[l % RING], side));
     };
@@ -488,17 +489,24 @@ static void backward(State& s, const Lins& L, FILE* df) {
         bf16* act = a.act + (size_t)l * N * FFN;
         float* lse = a.lse + (size_t)l * N * HEADS;
         const LayerDump put{df, l};
+        auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in models/*.h)
+            if (k == ADAMW_AT && l + 1 < LAYERS) adamw_pass(l + 1, 0, P_MAT);
+            if (ADAMW_SPLIT_LAST && k == 6 && l == 0) adamw_pass(0, P_QKV, P_MAT);
+        };
 
         put("dres_out", g.dres, 1, DIM);
+        at(0);
         down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
         mark("bwd down dX GEMM + SwiGLU bwd");
         if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
+        at(1);
         dw_core<DW_DOWN, DIM, FFN>(gl + P_QKV + P_O + P_GU, g.dres_bf, act);
         mark("bwd down dW");
         put("dgu", g.dgu, 0, 2 * FFN);
-        if (l + 1 < LAYERS) adamw_pass(l + 1);
+        at(2);
         gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM");
+        at(3);
         dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
         mark("bwd gate_up dW");
         put("dln2", g.dln, 0, DIM);
@@ -507,25 +515,30 @@ static void backward(State& s, const Lins& L, FILE* df) {
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         mark("bwd norm weight colsum");
         put("dres_mid", g.dres, 1, DIM);
+        at(4);
         gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
         mark("bwd o dX GEMM");
+        at(5);
         dw_core<DW_O, DIM, DIM>(gl + P_QKV, g.dres_bf, att);
         mark("bwd o dW");
         put("datt", g.datt, 0, DIM);
+        at(6);
         attention_backward(g.part, g.dqkv, g.dsum, g.ds, qkv, att, g.datt, lse);
         mark("bwd attention (Dsum, dK/dV + dS, dq from dS)");
         attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
                                                                                                        s.rope);
         mark("bwd attention finish");
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
+        at(7);
         gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
         mark("bwd qkv dX GEMM");
+        at(8);
         dw_core<DW_QKV, QKV_DIM, DIM>(gl, g.dqkv, ln1);
         mark("bwd qkv dW");
         char nm[48];
         snprintf(nm, sizeof(nm), "gmat.%d", l);
         dump(df, nm, gl, 0, 1, P_MAT);
-        if (l == 0) adamw_pass(0);
+        if (l == 0) adamw_pass(0, 0, ADAMW_SPLIT_LAST ? P_QKV : P_MAT);
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
                                                     wf.ln1);
