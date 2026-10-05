@@ -16,7 +16,7 @@
 #include <vector>
 
 #include <cublasLt.h>
-#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW)
+#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW) || defined(CHISEL_DWS)
 #include <cuda.h>
 #endif
 #include <cuda_bf16.h>
@@ -58,7 +58,7 @@ constexpr size_t G_NORM = LAYERS * 2 * DIM + DIM;
 #include "chisel_gemm.h"
 static_assert(N == chisel_down_m && DIM == chisel_down_n && FFN == chisel_down_k, "regenerate chisel_gemm.h for this shape");
 #endif
-#ifdef PROBE_DW
+#if defined(PROBE_DW) || defined(CHISEL_DWS)
 #include "chisel_dw.h"
 #endif
 #ifdef CHISEL_DW
@@ -208,7 +208,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
 static cudaStream_t stream;
 static cublasLtHandle_t lt;
 
-#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW)
+#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW) || defined(CHISEL_DWS)
 #define CKD(x) ck_drv((x), #x, __LINE__)
 static void ck_drv(CUresult r, const char* what, int line) {
     if (r != CUDA_SUCCESS) {
@@ -272,6 +272,55 @@ static void chisel_dw(int which, float* p, bf16* pb, float* m, float* v, const b
     CKD(cuLaunchKernel(cdw_fn[which], cdw_grid[which][0], cdw_grid[which][1], cdw_grid[which][2], cdw_block[which], 1, 1,
                        0, (CUstream)stream, args, nullptr));
 }
+#endif
+#ifdef CHISEL_DWS
+static cudaStream_t dws_side;  // lowest priority; the main stream gets the highest
+static CUfunction dws_fn[4];
+static bf16* dws_grad[3];      // bf16 dW of a layer's four matrices (lathe's parameter layout), a ring of 3 layers
+static cudaEvent_t dws_dw[3], dws_ad[3], dws_join;
+static const unsigned* dws_grid[4] = {chisel_dw_qkv_grid, chisel_dw_o_grid, chisel_dw_gu_grid, chisel_dw_down_grid};
+static const unsigned dws_block[4] = {chisel_dw_qkv_block, chisel_dw_o_block, chisel_dw_gu_block, chisel_dw_down_block};
+static int dws_which(int out, int in) { return out == QKV_DIM ? 0 : out == 2 * FFN ? 2 : in == FFN ? 3 : 1; }
+// dW[out][in] = dy^T x rounded to bf16, as dw_adamw rounds it (chisel e037: bit-identical)
+static void dws_core(int which, bf16* y, const bf16* dy, const bf16* x) {
+    void* args[] = {&y, &dy, &x};
+    CKD(cuLaunchKernel(dws_fn[which], dws_grid[which][0], dws_grid[which][1], dws_grid[which][2], dws_block[which], 1,
+                       1, 0, (CUstream)stream, args, nullptr));
+}
+// dw_adamw's update from the bf16 gradient, grid-stride (10 persistent blocks: e047)
+__global__ void dws_adamw(float* p, float* m, float* v, bf16* pb, const bf16* g, const float* step_count, size_t n) {
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n / 2; i += (size_t)gridDim.x * blockDim.x) {
+        float2 P = ((float2*)p)[i], M = ((float2*)m)[i], V = ((float2*)v)[i];
+        const float2 G = __bfloat1622float2(((const bf162*)g)[i]);
+        adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
+        adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+        ((float2*)p)[i] = P;
+        ((float2*)m)[i] = M;
+        ((float2*)v)[i] = V;
+        ((bf162*)pb)[i] = __floats2bfloat162_rn(P.x, P.y);
+    }
+}
+static_assert(P_MAT % 2 == 0, "dws_adamw works on pairs");
+static cudaEvent_t dws_go;
+#ifndef DWS_BLOCKS
+#define DWS_BLOCKS 10
+#endif
+// AdamW over params [a, b) of layer l's matrices on the side stream, after everything issued so far on the main stream
+template <class S>
+static void dws_range(S& s, int l, size_t a, size_t b) {
+    const size_t o0 = P_EMBED + l * P_LAYER + a;
+    CK(cudaEventRecord(dws_go, stream));
+    CK(cudaStreamWaitEvent(dws_side, dws_go));
+    dws_adamw<<<DWS_BLOCKS, 256, 0, dws_side>>>(s.master + o0, s.m + o0, s.v + o0, s.params + o0, dws_grad[l % 3] + a,
+                                                s.step, b - a);
+}
+template <class S>
+static void dws_pass(S& s, int l) {  // all of layer l; its ring slot is free after this
+    dws_range(s, l, 0, P_MAT);
+    CK(cudaEventRecord(dws_ad[l % 3], dws_side));
+}
+static_assert(P_QKV % 2 == 0, "dws_adamw works on pairs");
 #endif
 #ifdef CHISEL_DKV
 static CUfunction chisel_dkv_fn;
@@ -486,6 +535,22 @@ static void backward(State& s, const Lins& L, FILE* df) {
         // after the matrix's dX GEMM, the last reader of the old weights in this step.
         auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
             const size_t o = P_EMBED + l * P_LAYER + off;
+#ifdef CHISEL_DWS
+            if (!df) {
+                const int slot = l % 3;
+                if (off == P_QKV + P_O + P_GU && l + 3 < LAYERS)  // the layer's first dW: its ring slot's AdamW done
+                    CK(cudaStreamWaitEvent(stream, dws_ad[slot]));
+                if (CHISEL_DWS == 5 && off == P_QKV + P_O + P_GU && l + 1 < LAYERS) dws_pass(s, l + 1);
+                dws_core(dws_which(out, in), dws_grad[slot] + off, dy, x);
+                if (off == 0 && (CHISEL_DWS == 1 || (CHISEL_DWS != 1 && CHISEL_DWS != 3 && l == 0)))
+                    dws_pass(s, l);  // 2, 4: with the next layer's attention backward / o dX
+                if (off == 0 && CHISEL_DWS == 3 && l == 0) {  // layer 0's qkv; the rest went with its attention
+                    dws_range(s, 0, 0, P_QKV);
+                    CK(cudaEventRecord(dws_ad[0], dws_side));
+                }
+                return;
+            }
+#endif
 #ifdef CHISEL_DW
             if (!df) return chisel_dw(cdw_which(out, in), s.master + o, s.params + o, s.m + o, s.v + o, dy, x);
 #endif
@@ -524,6 +589,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         mark("bwd norm weight colsum");
         put("dres_mid", g.dres, 1, DIM);
+#if defined(CHISEL_DWS) && CHISEL_DWS == 4
+        if (!df && l + 1 < LAYERS) dws_pass(s, l + 1);  // the previous layer's AdamW from this o dX GEMM on
+#endif
         gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
         mark("bwd o dX GEMM 2048x576x576");
         dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
@@ -533,6 +601,18 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("probe chisel dW core o");
 #endif
         put("datt", g.datt, 0, DIM);
+#if defined(CHISEL_DWS) && CHISEL_DWS == 2
+        if (!df && l + 1 < LAYERS) dws_pass(s, l + 1);  // the previous layer's AdamW beside this attention backward
+#endif
+#if defined(CHISEL_DWS) && CHISEL_DWS == 3
+        if (!df) {  // beside this attention backward: the previous layer's qkv (its slot is then free), this layer's rest
+            if (l + 1 < LAYERS) {
+                dws_range(s, l + 1, 0, P_QKV);
+                CK(cudaEventRecord(dws_ad[(l + 1) % 3], dws_side));
+            }
+            dws_range(s, l, P_QKV, P_MAT);
+        }
+#endif
         attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
         mark("bwd attention dq");
 #ifdef CHISEL_DKV
@@ -568,6 +648,12 @@ static void backward(State& s, const Lins& L, FILE* df) {
     embed_bwd_adamw<<<N, DIM / 4, 0, stream>>>(s.master, s.params, s.m, s.v, g.gemb_rows, df ? s.gemb : nullptr, g.dres,
                                                a.io, a.io + IO_SEG, s.step);
     mark("bwd embedding + AdamW (own)");
+#ifdef CHISEL_DWS
+    if (!df) {  // the side stream's AdamW passes finish inside the step
+        CK(cudaEventRecord(dws_join, dws_side));
+        CK(cudaStreamWaitEvent(stream, dws_join));
+    }
+#endif
     CK(cudaGetLastError());
 }
 
@@ -677,13 +763,39 @@ int main(int argc, char** argv) {
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
     CK(cudaSetDevice(0));
+#ifdef CHISEL_DWS
+    {  // highest priority for the main stream, lowest for the AdamW side stream
+        int least, greatest;
+        CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
+    }
+#else
     CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+#endif
     CKB(cublasLtCreate(&lt));
 #ifdef CHISEL_DOWN
     chisel_down_fn = chisel_fn(chisel_down, chisel_down_kernel);
 #endif
 #ifdef CHISEL_DKV
     chisel_dkv_fn = chisel_fn(chisel_dkv, chisel_dkv_kernel);
+#endif
+#ifdef CHISEL_DWS
+    dws_fn[0] = chisel_fn(chisel_dw_qkv, chisel_dw_qkv_kernel);
+    dws_fn[1] = chisel_fn(chisel_dw_o, chisel_dw_o_kernel);
+    dws_fn[2] = chisel_fn(chisel_dw_gu, chisel_dw_gu_kernel);
+    dws_fn[3] = chisel_fn(chisel_dw_down, chisel_dw_down_kernel);
+    {
+        int least, greatest;
+        CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CK(cudaStreamCreateWithPriority(&dws_side, cudaStreamNonBlocking, least));
+    }
+    for (int k = 0; k < 3; k++) {
+        CK(cudaMalloc(&dws_grad[k], P_MAT * 2));
+        CK(cudaEventCreateWithFlags(&dws_dw[k], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&dws_ad[k], cudaEventDisableTiming));
+    }
+    CK(cudaEventCreateWithFlags(&dws_join, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&dws_go, cudaEventDisableTiming));
 #endif
 #ifdef CHISEL_DW
     cdw_fn[0] = chisel_fn(chisel_dwa_qkv, chisel_dwa_qkv_kernel);
@@ -764,7 +876,11 @@ int main(int argc, char** argv) {
                 CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
                 train_step(s, L, nullptr);
                 CK(cudaStreamEndCapture(stream, &g));
+#ifdef CHISEL_DWS
+                CK(cudaGraphInstantiate(&graph, g, cudaGraphInstantiateFlagUseNodePriority));
+#else
                 CK(cudaGraphInstantiate(&graph, g, 0));
+#endif
                 CK(cudaGraphDestroy(g));
             }
             CK(cudaGraphLaunch(graph, stream));
