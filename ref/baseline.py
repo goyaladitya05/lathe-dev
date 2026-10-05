@@ -32,6 +32,12 @@ def flops_per_token(cfg, T):
     return 6 * n + 6 * cfg.layers * cfg.heads * hd * (T + 1)
 
 
+def free_mib():  # free GPU memory before a run allocates anything (what bounds the largest shape that fits)
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True).stdout
+    return int(out.split()[0])
+
+
 def proc_mem_mib(pid):
     out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
                          capture_output=True, text=True).stdout
@@ -76,6 +82,7 @@ def train_row(stack, args, rates, mem, clocks, versions):
 
 
 def torch_train(args):
+    free = free_mib()
     model = Model(Config.load(args.model))
     init_weights(model)
     model.cuda()
@@ -101,7 +108,10 @@ def torch_train(args):
             step()
         torch.cuda.synchronize()
     except torch.OutOfMemoryError:
-        print(f"# torch {args.mode} OOM at {args.model} {args.B}x{args.T}")
+        print(f"# torch {args.mode} OOM at {args.model} {args.B}x{args.T}, free at start {free:,} MiB")
+        sys.exit(3)
+    except Exception as e:  # e.g. the first compile of a shape dying in CUDA graph capture (BENCH.md): rerun once
+        print(f"# torch {args.mode} failed at {args.model} {args.B}x{args.T}: {type(e).__name__}: {str(e)[:200]}")
         sys.exit(3)
     warm = time.perf_counter() - t0
     torch.cuda.reset_peak_memory_stats()
@@ -118,7 +128,7 @@ def torch_train(args):
         pmem = proc_mem_mib(os.getpid())
     peak, reserved = torch.cuda.max_memory_allocated() >> 20, torch.cuda.max_memory_reserved() >> 20
     retries = torch.cuda.memory_stats()["num_alloc_retries"]
-    print(f"# warmup {warm:.1f}s, last loss {loss.item():.4f}, alloc retries {retries}, runs {[round(r) for r in rates]}")
+    print(f"# free at start {free:,} MiB, warmup {warm:.1f}s, last loss {loss.item():.4f}, alloc retries {retries}, runs {[round(r) for r in rates]}")
     train_row(f"torch {args.mode}", args, rates, f"{peak:,} | {reserved:,} | {pmem:,}", smi.stats,
               f"torch {torch.__version__}")
 
@@ -151,6 +161,7 @@ def engine_train(args, stack, cmd, env, versions):
     # same warmup / runs / steps as torch, timed by the engine with one sync per group.
     assert args.warmup % args.steps == 0
     total = args.warmup + args.runs * args.steps
+    free = free_mib()
     p = subprocess.Popen([*map(str, cmd), "--steps", str(total), "--group", str(args.steps)], stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, cwd=ROOT, env={**os.environ, **env})
     rates, smi, pmem, arena, loss, tail = [], Smi(), -1, "-", "?", []
@@ -170,9 +181,10 @@ def engine_train(args, stack, cmd, env, versions):
         smi.__exit__()
     if p.wait():
         oom = any(k in l.lower() for l in tail for k in ("out of memory", "outofmemory", "memoryerror"))
-        print(f"# {stack} {'OOM' if oom else 'failed'} at {args.model} {args.B}x{args.T}: {tail[-1] if tail else ''}")
+        print(f"# {stack} {'OOM' if oom else 'failed'} at {args.model} {args.B}x{args.T}, free at start {free:,} MiB: "
+              f"{tail[-1] if tail else ''}")
         sys.exit(3)
-    print(f"# last loss {loss}, runs {[round(r) for r in rates]}")
+    print(f"# free at start {free:,} MiB, last loss {loss}, runs {[round(r) for r in rates]}")
     train_row(stack, args, rates, f"{arena} | - | {pmem:,}", smi.stats, versions)
 
 
