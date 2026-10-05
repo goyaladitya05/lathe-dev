@@ -465,6 +465,9 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
 // after it: chisel e048-e051, e054), and joined at the end of backward. The ring slot a layer writes was last read by
 // the pass of the layer RING above.
 static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
+// 8-bit state builds have their own start and width (the pass moves 16.25 instead of 28 bytes per parameter).
+constexpr int PASS_AT = ADAM8 ? ADAMW_AT8 : ADAMW_AT, PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
+static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see models/*.h");
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
@@ -479,10 +482,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
         const bf16* gr = g.gring + (size_t)(l % RING) * P_MAT + b;
         if constexpr (ADAM8) {
             const size_t q = (size_t)l * P_MAT + b;  // index into the 8-bit state
-            adamw_stream8<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.qm + q, s.qu + q, s.sm + q / Q8_BLOCK,
+            adamw_stream8<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.qm + q, s.qu + q, s.sm + q / Q8_BLOCK,
                                                           s.su + q / Q8_BLOCK, s.params + o, gr, s.step, e - b);
         } else {
-            adamw_stream<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o, gr, s.step, e - b);
+            adamw_stream<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o, gr, s.step, e - b);
         }
         side_mark(true);
         CK(cudaEventRecord(ev_ring[l % RING], side));
@@ -512,7 +515,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         float* lse = a.lse + (size_t)l * N * HEADS;
         const LayerDump put{df, l};
         auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in models/*.h)
-            if (k == ADAMW_AT && l + 1 < LAYERS) adamw_pass(l + 1, 0, P_MAT);
+            if (k == PASS_AT && l + 1 < LAYERS) adamw_pass(l + 1, 0, P_MAT);
             if (ADAMW_SPLIT_LAST && k == 6 && l == 0) adamw_pass(0, P_QKV, P_MAT);
         };
 
