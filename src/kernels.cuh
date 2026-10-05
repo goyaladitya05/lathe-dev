@@ -524,9 +524,9 @@ __global__ void __launch_bounds__(128) attention_dsum(float* Dsum, const bf16* o
 // dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over all query tiles that
 // see them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). fp32 partials [N][HEADS][dk 64 | dv 64];
 // attention_bwd_finish sums the heads of each kv group.
-__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
-                                                         const float* lse, const float* Dsum, int h0) {
-    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
+__device__ __forceinline__ void dkv_tile(int kt, int hg, float* part, bf16* ds, const bf16* qkv, const bf16* dout,
+                                         const float* lse, const float* Dsum, int h0) {
+    const int h = h0 + hg, b = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
@@ -600,11 +600,15 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
         }
     }
 }
+__global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
+                                                         const float* lse, const float* Dsum, int h0) {
+    dkv_tile(att_tile<GROUP>(), att_head<GROUP>(), part, ds, qkv, dout, lse, Dsum, h0);  // kt = 0 has the most work
+}
 
 // dq (before RoPE backward) for 64 query rows of head h0 + att_head, written into dqkv's q columns: dq += dS K over
 // the key tiles kt = 0..qt in order, from the dS^T tiles attention_bwd_dkv stored (A fragments through ldmatrix.trans).
-__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
-    const int qt = NT - 1 - att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // longest first
+__device__ __forceinline__ void dq_tile(int qt, int hg, bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
+    const int h = h0 + hg, b = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / GROUP) * HEAD_DIM;
     __shared__ __align__(128) bf16 dst[2][TILE], ks[2][TILE];
@@ -634,6 +638,31 @@ __global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* 
         bf16* row = dqkv + (row0 + warp * 16 + g + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
 #pragma unroll
         for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
+    }
+}
+__global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
+    dq_tile(NT - 1 - att_tile<GROUP>(), att_head<GROUP>(), dqkv, ds, qkv, h0);  // longest first
+}
+
+// Paired blocks: one block runs tiles p and NT - 1 - p one after the other (NT + 1 tile steps in all; for odd NT the
+// middle tile runs alone), so every block has the same work instead of 1..NT. Each tile's arithmetic and order are
+// unchanged, so the results are the same bits. Grid (NP, GROUP, B).
+constexpr int NP = (NT + 1) / 2;
+__global__ void __launch_bounds__(128) attention_bwd_dkv_pair(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
+                                                              const float* lse, const float* Dsum, int h0) {
+    const int p = blockIdx.x, hg = blockIdx.y;
+    dkv_tile(p, hg, part, ds, qkv, dout, lse, Dsum, h0);
+    if (NT - 1 - p != p) {
+        __syncthreads();
+        dkv_tile(NT - 1 - p, hg, part, ds, qkv, dout, lse, Dsum, h0);
+    }
+}
+__global__ void __launch_bounds__(128) attention_bwd_dq_pair(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
+    const int p = blockIdx.x, hg = blockIdx.y;
+    dq_tile(NT - 1 - p, hg, dqkv, ds, qkv, h0);
+    if (NT - 1 - p != p) {
+        __syncthreads();
+        dq_tile(p, hg, dqkv, ds, qkv, h0);
     }
 }
 
