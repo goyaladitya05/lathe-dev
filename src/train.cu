@@ -16,7 +16,7 @@
 #include <vector>
 
 #include <cublasLt.h>
-#if defined(CHISEL_DOWN) || defined(CHISEL_DKV)
+#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW)
 #include <cuda.h>
 #endif
 #include <cuda_bf16.h>
@@ -57,6 +57,14 @@ constexpr size_t G_NORM = LAYERS * 2 * DIM + DIM;
 #ifdef CHISEL_DOWN
 #include "chisel_gemm.h"
 static_assert(N == chisel_down_m && DIM == chisel_down_n && FFN == chisel_down_k, "regenerate chisel_gemm.h for this shape");
+#endif
+#ifdef PROBE_DW
+#include "chisel_dw.h"
+#endif
+#ifdef CHISEL_DW
+#include "chisel_dwadam.h"
+static_assert(N == chisel_dwa_qkv_k && QKV_DIM == chisel_dwa_qkv_m && DIM == chisel_dwa_qkv_n && FFN == chisel_dwa_down_n &&
+              VOCAB == chisel_dwa_head_m, "regenerate chisel_dwadam.h for this shape");
 #endif
 #ifdef CHISEL_DKV
 #include "chisel_att.h"
@@ -200,7 +208,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
 static cudaStream_t stream;
 static cublasLtHandle_t lt;
 
-#if defined(CHISEL_DOWN) || defined(CHISEL_DKV)
+#if defined(CHISEL_DOWN) || defined(CHISEL_DKV) || defined(PROBE_DW) || defined(CHISEL_DW)
 #define CKD(x) ck_drv((x), #x, __LINE__)
 static void ck_drv(CUresult r, const char* what, int line) {
     if (r != CUDA_SUCCESS) {
@@ -225,6 +233,44 @@ static void chisel_down_fwd(bf16* y, const bf16* x, const bf16* w) {
     void* args[] = {&y, &x, &w};
     CKD(cuLaunchKernel(chisel_down_fn, chisel_down_grid[0], chisel_down_grid[1], chisel_down_grid[2], chisel_down_block,
                        1, 1, 0, (CUstream)stream, args, nullptr));
+}
+#endif
+#ifdef PROBE_DW
+static CUfunction probe_fn[5];
+static bf16* probe_out;
+static const unsigned* probe_grid[5] = {chisel_dw_qkv_grid, chisel_dw_o_grid, chisel_dw_gu_grid, chisel_dw_down_grid,
+                                        chisel_dw_head_grid};
+static const unsigned probe_block[5] = {chisel_dw_qkv_block, chisel_dw_o_block, chisel_dw_gu_block, chisel_dw_down_block,
+                                        chisel_dw_head_block};
+// chisel's dW core (dW[out][in] = dy^T x, bf16) on the inputs of the dW + AdamW kernel that just ran
+static void probe_dw(int which, const bf16* dy, const bf16* x) {
+    void* args[] = {&probe_out, &dy, &x};
+    CKD(cuLaunchKernel(probe_fn[which], probe_grid[which][0], probe_grid[which][1], probe_grid[which][2],
+                       probe_block[which], 1, 1, 0, (CUstream)stream, args, nullptr));
+}
+#endif
+#ifdef CHISEL_DW
+static CUfunction cdw_fn[5];
+static float* chisel_bc;  // [LR / bc1, bc2_sqrt] of this step
+static const unsigned* cdw_grid[5] = {chisel_dwa_qkv_grid, chisel_dwa_o_grid, chisel_dwa_gu_grid, chisel_dwa_down_grid,
+                                      chisel_dwa_head_grid};
+static const unsigned cdw_block[5] = {chisel_dwa_qkv_block, chisel_dwa_o_block, chisel_dwa_gu_block, chisel_dwa_down_block,
+                                      chisel_dwa_head_block};
+// the bias corrections with dw_adamw's own expressions, once per step (chisel's kernels read them)
+__global__ void chisel_bias(float* bc, const float* step_count) {
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    bc[0] = LR / bc1;
+    bc[1] = bc2_sqrt;
+}
+static int cdw_which(int out, int in) {
+    return out == QKV_DIM ? 0 : out == 2 * FFN ? 2 : in == FFN ? 3 : 1;
+}
+// dw_adamw<out, in>'s contract without gout/gemb_full (bit-identical, chisel e045); head: segmap and gemb_rows
+static void chisel_dw(int which, float* p, bf16* pb, float* m, float* v, const bf16* dy, const bf16* x,
+                      const int* segmap = nullptr, float* gemb = nullptr) {
+    void* args[] = {&p, &pb, &m, &v, &dy, &x, &chisel_bc, &segmap, &gemb};
+    CKD(cuLaunchKernel(cdw_fn[which], cdw_grid[which][0], cdw_grid[which][1], cdw_grid[which][2], cdw_block[which], 1, 1,
+                       0, (CUstream)stream, args, nullptr));
 }
 #endif
 #ifdef CHISEL_DKV
@@ -403,13 +449,26 @@ static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
     const size_t ND = (size_t)N * DIM;
+#ifdef CHISEL_DW
+    chisel_bias<<<1, 1, 0, stream>>>(chisel_bc, s.step);
+    mark("chisel AdamW bias corrections");
+#endif
     gemm(s, L.head_dx, g.dln, s.params, a.logits);
     mark("bwd head dX GEMM 2048x576x49152");
     {  // tied embedding: head dW with AdamW fused for rows not in the batch; the rest finish in embed_bwd_adamw
         constexpr auto k = dw_adamw<VOCAB, DIM, true>;
+#ifdef CHISEL_DW
+        if (!df)
+            chisel_dw(4, s.master, s.params, s.m, s.v, a.logits, a.lnf, a.io + IO_SEGMAP, g.gemb_rows);
+        else
+#endif
         k<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, nullptr, a.logits, a.lnf, s.step,
                                                           g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
         mark("bwd head dW + AdamW (own) 49152x576x2048");
+#ifdef PROBE_DW
+        probe_dw(4, a.logits, a.lnf);
+        mark("probe chisel dW core head");
+#endif
     }
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
@@ -427,6 +486,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         // after the matrix's dX GEMM, the last reader of the old weights in this step.
         auto dw = [&](auto kernel, int out, int in, size_t off, bf16* gout, const bf16* dy, const bf16* x) {
             const size_t o = P_EMBED + l * P_LAYER + off;
+#ifdef CHISEL_DW
+            if (!df) return chisel_dw(cdw_which(out, in), s.master + o, s.params + o, s.m + o, s.v + o, dy, x);
+#endif
             kernel<<<dim3(in / 64, out / 64), 128, 0, stream>>>(s.master + o, s.params + o, s.m + o, s.v + o, gout, dy, x,
                                                                s.step, nullptr, nullptr, nullptr);
         };
@@ -443,11 +505,19 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd down dX GEMM + SwiGLU bwd (own) 2048x1536x576");
         dw(dw_adamw<DIM, FFN>, DIM, FFN, P_QKV + P_O + P_GU, gr.down, g.dres_bf, act);
         mark("bwd down dW + AdamW (own) 576x1536x2048");
+#ifdef PROBE_DW
+        probe_dw(3, g.dres_bf, act);
+        mark("probe chisel dW core down");
+#endif
         put("dgu", g.dgu, 0, 2 * FFN);
         gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM 2048x576x3072");
         dw(dw_adamw<2 * FFN, DIM>, 2 * FFN, DIM, P_QKV + P_O, gr.gu, g.dgu, ln2);
         mark("bwd gate_up dW + AdamW (own) 3072x576x2048");
+#ifdef PROBE_DW
+        probe_dw(2, g.dgu, ln2);
+        mark("probe chisel dW core gate_up");
+#endif
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
         mark("bwd rmsnorm");
@@ -458,6 +528,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd o dX GEMM 2048x576x576");
         dw(dw_adamw<DIM, DIM>, DIM, DIM, P_QKV, gr.o, g.dres_bf, att);
         mark("bwd o dW + AdamW (own) 576x576x2048");
+#ifdef PROBE_DW
+        probe_dw(1, g.dres_bf, att);
+        mark("probe chisel dW core o");
+#endif
         put("datt", g.datt, 0, DIM);
         attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
         mark("bwd attention dq");
@@ -476,6 +550,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd qkv dX GEMM 2048x576x960");
         dw(dw_adamw<QKV_DIM, DIM>, QKV_DIM, DIM, 0, gr.qkv, g.dqkv, ln1);
         mark("bwd qkv dW + AdamW (own) 960x576x2048");
+#ifdef PROBE_DW
+        probe_dw(0, g.dqkv, ln1);
+        mark("probe chisel dW core qkv");
+#endif
         char nm[48];
         snprintf(nm, sizeof(nm), "gmat.%d", l);
         dump(df, nm, g.gmat, 0, 1, P_MAT);
@@ -606,6 +684,22 @@ int main(int argc, char** argv) {
 #endif
 #ifdef CHISEL_DKV
     chisel_dkv_fn = chisel_fn(chisel_dkv, chisel_dkv_kernel);
+#endif
+#ifdef CHISEL_DW
+    cdw_fn[0] = chisel_fn(chisel_dwa_qkv, chisel_dwa_qkv_kernel);
+    cdw_fn[1] = chisel_fn(chisel_dwa_o, chisel_dwa_o_kernel);
+    cdw_fn[2] = chisel_fn(chisel_dwa_gu, chisel_dwa_gu_kernel);
+    cdw_fn[3] = chisel_fn(chisel_dwa_down, chisel_dwa_down_kernel);
+    cdw_fn[4] = chisel_fn(chisel_dwa_head, chisel_dwa_head_kernel);
+    CK(cudaMalloc(&chisel_bc, 8));
+#endif
+#ifdef PROBE_DW
+    probe_fn[0] = chisel_fn(chisel_dw_qkv, chisel_dw_qkv_kernel);
+    probe_fn[1] = chisel_fn(chisel_dw_o, chisel_dw_o_kernel);
+    probe_fn[2] = chisel_fn(chisel_dw_gu, chisel_dw_gu_kernel);
+    probe_fn[3] = chisel_fn(chisel_dw_down, chisel_dw_down_kernel);
+    probe_fn[4] = chisel_fn(chisel_dw_head, chisel_dw_head_kernel);
+    CK(cudaMalloc(&probe_out, (size_t)VOCAB * DIM * 2));
 #endif
 
     State s;
