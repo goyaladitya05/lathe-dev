@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -45,9 +46,13 @@ static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 ==
 // backward); most embedding rows never leave the lm_head dW GEMM, which applies AdamW directly. Norm weight grads are
 // fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
 constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
+#ifndef ADAM8
+#define ADAM8 0  // 1 (make ADAM8=1): 8-bit AdamW moments for the layer matrices (adamw_stream8, BENCH.md)
+#endif
 constexpr size_t G_NORM = LAYERS * 2 * DIM + DIM;
 
 #include "kernels.cuh"
+static_assert(!ADAM8 || (P_MAT % Q8_BLOCK == 0 && P_QKV % Q8_BLOCK == 0), "whole 8-bit blocks per layer");
 
 // Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header
 // per model and token count (CHISEL_DW_H, from the Makefile) with the cubins of the four matrix shapes. Shapes without
@@ -160,7 +165,10 @@ struct State {
     bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
     float* gnorm;   // [G_NORM] norm weight grads
     float* gemb;    // [P_EMBED] full fp32 embedding grad, dumps only (nullptr otherwise)
-    float *m, *v;   // [P_TOTAL] AdamW moments
+    float *m, *v;   // [P_TOTAL] AdamW moments; ADAM8: [P_EMBED], the embedding's only
+    float *mn, *vn;  // ADAM8: [G_NORM] the norm weights' moments (fp32 mode: inside m, v)
+    unsigned char *qm, *qu;  // ADAM8: [LAYERS][P_MAT] E4M3 codes of the layer matrices' m and sqrt(v)
+    float *sm, *su;          // ADAM8: [LAYERS][P_MAT / Q8_BLOCK] their block scales
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
     void* workspace;
@@ -187,8 +195,16 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     s.params = ar.take<bf16>(P_TOTAL);
     s.gnorm = ar.take<float>(G_NORM);
     s.gemb = dumping ? ar.take<float>(P_EMBED) : nullptr;
-    s.m = ar.take<float>(P_TOTAL);
-    s.v = ar.take<float>(P_TOTAL);
+    s.m = ar.take<float>(ADAM8 ? P_EMBED : P_TOTAL);
+    s.v = ar.take<float>(ADAM8 ? P_EMBED : P_TOTAL);
+    if (ADAM8) {
+        s.mn = ar.take<float>(G_NORM);
+        s.vn = ar.take<float>(G_NORM);
+        s.qm = ar.take<unsigned char>(LAYERS * P_MAT);
+        s.qu = ar.take<unsigned char>(LAYERS * P_MAT);
+        s.sm = ar.take<float>(LAYERS * P_MAT / Q8_BLOCK);
+        s.su = ar.take<float>(LAYERS * P_MAT / Q8_BLOCK);
+    }
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
     s.step = ar.take<float>(1);
     s.workspace = ar.take<char>(CUBLAS_WORKSPACE);
@@ -331,10 +347,10 @@ struct Lins {
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
 };
 
-// Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
+// Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32, 3 u8), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
 static void dump(FILE* f, const char* name, const void* p, int dtype, size_t rows, size_t cols) {
     if (!f) return;
-    size_t bytes = rows * cols * (dtype == 0 ? 2 : 4);
+    size_t bytes = rows * cols * (dtype == 0 ? 2 : dtype == 3 ? 1 : 4);
     std::vector<char> h(bytes);
     CK(cudaStreamSynchronize(stream));
     CK(cudaMemcpy(h.data(), p, bytes, cudaMemcpyDeviceToHost));
@@ -460,8 +476,14 @@ static void backward(State& s, const Lins& L, FILE* df) {
         CK(cudaEventRecord(ev_fork, stream));
         CK(cudaStreamWaitEvent(side, ev_fork));
         side_mark(false);
-        adamw_stream<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o,
-                                                     g.gring + (size_t)(l % RING) * P_MAT + b, s.step, e - b);
+        const bf16* gr = g.gring + (size_t)(l % RING) * P_MAT + b;
+        if constexpr (ADAM8) {
+            const size_t q = (size_t)l * P_MAT + b;  // index into the 8-bit state
+            adamw_stream8<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.qm + q, s.qu + q, s.sm + q / Q8_BLOCK,
+                                                          s.su + q / Q8_BLOCK, s.params + o, gr, s.step, e - b);
+        } else {
+            adamw_stream<<<ADAMW_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o, gr, s.step, e - b);
+        }
         side_mark(true);
         CK(cudaEventRecord(ev_ring[l % RING], side));
     };
@@ -566,11 +588,23 @@ static void train_step(State& s, const Lins& L, FILE* df) {
     dump(df, "gemb", s.gemb, 1, 1, P_EMBED);
     dump(df, "gnorm", s.gnorm, 1, 1, G_NORM);
     static_assert(G_NORM % 4 == 0, "adamw_norms works on float4");
-    adamw_norms<<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gnorm, s.m, s.v, s.step);
+    adamw_norms<ADAM8><<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gnorm, ADAM8 ? s.mn : s.m,
+                                                                  ADAM8 ? s.vn : s.v, s.step);
     mark("AdamW norm weights");
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
     dump(df, "params", s.params, 0, 1, P_TOTAL);
+    if (ADAM8)
+        for (int l : {0, LAYERS - 1}) {  // the 8-bit state after the step, checked byte for byte by ref/test.py
+            char nm[48];
+            const size_t q = (size_t)l * P_MAT;
+            for (auto [name, qs, ss] : {std::tuple{"m", s.qm, s.sm}, std::tuple{"u", s.qu, s.su}}) {
+                snprintf(nm, sizeof(nm), "q%s.%d", name, l);
+                dump(df, nm, qs + q, 3, 1, P_MAT);
+                snprintf(nm, sizeof(nm), "s%s.%d", name, l);
+                dump(df, nm, ss + q / Q8_BLOCK, 1, 1, P_MAT / Q8_BLOCK);
+            }
+        }
 }
 
 static void load_weights(State& s, const char* path) {
@@ -590,8 +624,16 @@ static void load_weights(State& s, const char* path) {
     fclose(f);
     CK(cudaMemcpy(s.master, w.data(), P_TOTAL * 4, cudaMemcpyHostToDevice));
     f32_to_bf16<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, P_TOTAL);
-    CK(cudaMemsetAsync(s.m, 0, P_TOTAL * 4, stream));
-    CK(cudaMemsetAsync(s.v, 0, P_TOTAL * 4, stream));
+    CK(cudaMemsetAsync(s.m, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
+    CK(cudaMemsetAsync(s.v, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
+    if (ADAM8) {  // all codes and scales 0: m = v = 0 exactly
+        CK(cudaMemsetAsync(s.mn, 0, G_NORM * 4, stream));
+        CK(cudaMemsetAsync(s.vn, 0, G_NORM * 4, stream));
+        CK(cudaMemsetAsync(s.qm, 0, LAYERS * P_MAT, stream));
+        CK(cudaMemsetAsync(s.qu, 0, LAYERS * P_MAT, stream));
+        CK(cudaMemsetAsync(s.sm, 0, LAYERS * P_MAT / Q8_BLOCK * 4, stream));
+        CK(cudaMemsetAsync(s.su, 0, LAYERS * P_MAT / Q8_BLOCK * 4, stream));
+    }
     CK(cudaMemsetAsync(s.step, 0, sizeof(float), stream));
 }
 
@@ -694,7 +736,8 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&ar.base, arena_bytes));
     ar.used = 0;
     carve(ar, s, dump_path != nullptr);
-    printf("B=%d T=%d params=%zu arena=%.1f MiB\n", B, T, P_TOTAL, arena_bytes / 1048576.0);
+    printf("B=%d T=%d params=%zu arena=%.1f MiB adamw_state=%s\n", B, T, P_TOTAL, arena_bytes / 1048576.0,
+           ADAM8 ? "8bit" : "fp32");
 
     load_weights(s, weights);
     init_rope(s);
