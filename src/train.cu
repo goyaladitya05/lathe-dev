@@ -137,7 +137,7 @@ struct Bwd {
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
     bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits)
-    bf16* ds;        // [min(ATT_PASSES, 2)][DS_PASS] bf16 dS tiles of two attention passes (in a.logits)
+    bf16* ds;        // [2][DS_GROUP] bf16 dS tiles of two attention groups, attention_backward (in a.logits)
 };
 constexpr int RING = 3;
 
@@ -147,7 +147,7 @@ constexpr int RING = 3;
 // issued after head_dw_adamw) and read by the AdamW passes (side stream, joined into main at the end of backward); ds
 // is written and read by attention_backward (attention streams, forked from main and joined within it). alias_check
 // enforces this issue order on the host whenever a step is issued, eager or captured.
-constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(ATT_PASSES, 2) * DS_PASS;
+constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
 constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
 static_assert(RING_N * sizeof(bf16) % 256 == 0, "ds stays 256B-aligned behind the ring");
 static bool logits_live, side_open;  // logits between lm_head forward and head_dw_adamw; AdamW passes not yet joined
@@ -223,11 +223,11 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.ds = IN_LOGITS ? a.logits + RING_N : ar.take<bf16>(DS_N);
 }
 
-// The main stream runs at the highest priority. Beside it: one stream per attention pass (attention_backward, earlier
-// passes higher) and the AdamW side stream at the lowest priority (backward). All fork from and join back into the
+// The main stream runs at the highest priority. Beside it: one stream per attention group (attention_backward, earlier
+// groups higher) and the AdamW side stream at the lowest priority (backward). All fork from and join back into the
 // main stream inside a step, so a step is still one captured graph.
-static cudaStream_t stream, side, att_stream[ATT_PASSES];
-static cudaEvent_t ev_fork, ev_join, ev_ring[RING], ev_att[ATT_PASSES];
+static cudaStream_t stream, side, att_stream[KV_HEADS];
+static cudaEvent_t ev_fork, ev_join, ev_ring[RING], ev_att[KV_HEADS];
 static cublasLtHandle_t lt;
 #ifdef HAVE_CHISEL_DW
 static CUfunction chisel_dw[4];
@@ -424,24 +424,23 @@ static void forward(State& s, const Lins& L, FILE* df) {
     dump(df, "tokens", a.io, 2, 2, N);
 }
 
-// Attention backward of one layer: Dsum, then per pass of ATT_HEADS heads (on its own stream, earlier passes at higher
-// priority so later passes fill their tails) dK/dV storing dS and dq as a GEMM over it. Passes alternate between two
-// dS buffers; a pass waits until the one two before it has read its buffer.
+// Attention backward of one layer: Dsum, then per attention group (on its own stream, earlier groups at higher
+// priority so later groups fill their tails) dK/dV storing dS and dq as a GEMM over it. Groups alternate between two
+// dS buffers; a group waits until the one two before it has read its buffer.
 static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, const bf16* qkv, const bf16* out,
                                const bf16* dout, const float* lse) {
     alias_check(!logits_live, "logits aliasing: attention backward writes ds while logits are live");
     attention_dsum<<<dim3(NT, HEADS, B), 128, 0, stream>>>(dsum, out, dout);
     CK(cudaEventRecord(ev_fork, stream));
-    for (int k = 0; k < ATT_PASSES; k++) {
-        bf16* buf = ds + (size_t)(k % 2) * DS_PASS;
+    for (int k = 0; k < KV_HEADS; k++) {
+        bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
         if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
-        attention_bwd_dkv<<<dim3(NT, ATT_HEADS, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum,
-                                                                             k * ATT_HEADS);
-        attention_bwd_dq<<<dim3(NT, ATT_HEADS, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * ATT_HEADS);
+        attention_bwd_dkv<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
+        attention_bwd_dq<<<dim3(NT, GROUP, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
     }
-    for (int k = 0; k < ATT_PASSES; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
+    for (int k = 0; k < KV_HEADS; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
 }
 
 // Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is
@@ -668,7 +667,7 @@ int main(int argc, char** argv) {
     CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
     CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
     CK(cudaStreamCreateWithPriority(&side, cudaStreamNonBlocking, least));
-    for (int k = 0; k < ATT_PASSES; k++) {
+    for (int k = 0; k < KV_HEADS; k++) {
         CK(cudaStreamCreateWithPriority(&att_stream[k], cudaStreamNonBlocking, std::min(least, greatest + k)));
         CK(cudaEventCreateWithFlags(&ev_att[k], cudaEventDisableTiming));
     }
