@@ -291,14 +291,27 @@ static void dws_core(int which, bf16* y, const bf16* dy, const bf16* x) {
 __global__ void dws_adamw(float* p, float* m, float* v, bf16* pb, const bf16* g, const float* step_count, size_t n) {
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n / 2; i += (size_t)gridDim.x * blockDim.x) {
+#ifdef DWS_CS  // streaming cache hints (evict first): keep the pass out of L2's way
+        float2 P = __ldcs((float2*)p + i), M = __ldcs((float2*)m + i), V = __ldcs((float2*)v + i);
+        const bf162 Gb = __ldcs((const bf162*)g + i);
+        const float2 G = __bfloat1622float2(Gb);
+#else
         float2 P = ((float2*)p)[i], M = ((float2*)m)[i], V = ((float2*)v)[i];
         const float2 G = __bfloat1622float2(((const bf162*)g)[i]);
+#endif
         adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
         adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+#ifdef DWS_CS
+        __stcs((float2*)p + i, P);
+        __stcs((float2*)m + i, M);
+        __stcs((float2*)v + i, V);
+        __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+#else
         ((float2*)p)[i] = P;
         ((float2*)m)[i] = M;
         ((float2*)v)[i] = V;
         ((bf162*)pb)[i] = __floats2bfloat162_rn(P.x, P.y);
+#endif
     }
 }
 static_assert(P_MAT % 2 == 0, "dws_adamw works on pairs");
@@ -321,6 +334,192 @@ static void dws_pass(S& s, int l) {  // all of layer l; its ring slot is free af
     CK(cudaEventRecord(dws_ad[l % 3], dws_side));
 }
 static_assert(P_QKV % 2 == 0, "dws_adamw works on pairs");
+#endif
+#ifdef CHISEL_DSQ
+static_assert(B == 1 && HEADS == 9 && KV_HEADS == 3, "dS reuse: one sequence, three KV groups of three heads");
+constexpr int DSQ_TILES = NT * (NT + 1) / 2;  // causal (qt, kt) tiles per head
+static cudaStream_t dsq_s[3];
+static cudaEvent_t dsq_fork, dsq_g[3];
+static bf16* dsq_buf;                         // dS^T tiles of two groups, bf16 [64 k][64 q]
+__device__ __forceinline__ size_t dsq_tile(int hg, int qt, int kt) {
+    return ((size_t)hg * DSQ_TILES + qt * (qt + 1) / 2 + kt) * TILE;
+}
+// Dsum = rowsum(dO * O) with attention_bwd_dq's arithmetic
+__global__ void __launch_bounds__(128) dsq_dsum(float* Dsum, const bf16* out, const bf16* dout) {
+    const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+    const size_t row0 = (size_t)b * T + qt * 64, lrow = ((size_t)b * HEADS + h) * T + qt * 64;
+    const int r = threadIdx.x >> 1, c0 = (threadIdx.x & 1) * 32;
+    const bf16 *dp = dout + (row0 + r) * DIM + h * HEAD_DIM + c0, *op = out + (row0 + r) * DIM + h * HEAD_DIM + c0;
+    float acc = 0.f;
+#pragma unroll
+    for (int c = 0; c < 32; c += 8) {
+        float a8[8], b8[8];
+        load8(a8, dp + c);
+        load8(b8, op + c);
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc += a8[e] * b8[e];
+    }
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+    if (!(threadIdx.x & 1)) Dsum[lrow + r] = acc;
+}
+// attention_bwd_dkv for heads h0 + blockIdx.y, also storing every tile's dS^T (the bf16 values attention_bwd_dq packs:
+// a bf16 mma product is transpose-symmetric, chisel e050)
+__global__ void __launch_bounds__(128) dsq_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout, const float* lse,
+                                               const float* Dsum, int h0) {
+    const int kt = blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
+    const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    const size_t lrow = ((size_t)b * HEADS + h) * T;
+    __shared__ __align__(128) bf16 qs[2][TILE], dos[2][TILE];
+    __shared__ __align__(16) float ls[2][64], dds[2][64];
+    auto load_q = [&](int qt, int buf) {
+        load_tile(qs[buf], seq + (size_t)qt * 64 * QKV_DIM + h * HEAD_DIM, QKV_DIM);
+        load_tile(dos[buf], dout + ((size_t)b * T + qt * 64) * DIM + h * HEAD_DIM, DIM);
+        if (threadIdx.x < 16) cp16(&ls[buf][threadIdx.x * 4], lse + lrow + qt * 64 + threadIdx.x * 4);
+        else if (threadIdx.x < 32) cp16(&dds[buf][(threadIdx.x - 16) * 4], Dsum + lrow + qt * 64 + (threadIdx.x - 16) * 4);
+    };
+    load_tile(qs[1], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
+    load_tile(dos[1], kg + KV_HEADS * HEAD_DIM + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
+    load_q(kt, 0);
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+    uint32_t kf[4][4], vf[4][4];
+    frag_a(kf, qs[1], warp * 16);
+    frag_a(vf, dos[1], warp * 16);
+    __syncthreads();
+    const float scale = LOG2E / sqrtf((float)HEAD_DIM);
+    const int k0 = kt * 64 + warp * 16 + g;
+    float dk[8][4] = {}, dv[8][4] = {};
+    for (int qt = kt; qt < NT; qt++) {
+        const int buf = (qt - kt) & 1;
+        if (qt + 1 < NT) load_q(qt + 1, buf ^ 1);
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        float st[8][4] = {}, dpt[8][4] = {};
+        mma_abt(st, kf, qs[buf]);
+        mma_abt(dpt, vf, dos[buf]);
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int c = 8 * j + 2 * t + (e & 1);
+                const bool masked = qt == kt && qt * 64 + c < k0 + 8 * (e >> 1);
+                const float p = masked ? 0.f : exp2f(st[j][e] * scale - ls[buf][c]);
+                st[j][e] = p;
+                dpt[j][e] = p * (dpt[j][e] - dds[buf][c]);
+            }
+        uint32_t pf[4][4], sf[4][4];
+        c_to_a(pf, st);
+        c_to_a(sf, dpt);
+        uint32_t* d = (uint32_t*)(ds + dsq_tile(hg, qt, kt) + (warp * 16 + g) * 64 + 2 * t);
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            d[8 * kk] = sf[kk][0];
+            d[8 * kk + 4 * 64] = sf[kk][1];
+            d[8 * kk + 4] = sf[kk][2];
+            d[8 * kk + 4 + 4 * 64] = sf[kk][3];
+        }
+        mma_ab(dv, pf, dos[buf]);
+        mma_ab(dk, sf, qs[buf]);
+        __syncthreads();
+    }
+    const float k = scale / LOG2E;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        float* row = part + (((size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            *(float2*)(row + 8 * j) = {dk[j][2 * r] * k, dk[j][2 * r + 1] * k};
+            *(float2*)(row + HEAD_DIM + 8 * j) = {dv[j][2 * r], dv[j][2 * r + 1]};
+        }
+    }
+}
+// dq of 64 query rows of head h0 + blockIdx.y: dq += dS K over kt = 0..qt, attention_bwd_dq's order and epilogue
+__global__ void __launch_bounds__(128) dsq_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
+    const int qt = NT - 1 - blockIdx.x, hg = blockIdx.y, h = h0 + hg, b = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
+    __shared__ __align__(128) bf16 dst[2][TILE], ks[2][TILE];
+    auto load = [&](int kt, int buf) {
+        load_tile(dst[buf], ds + dsq_tile(hg, qt, kt), 64);
+        load_tile(ks[buf], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
+    };
+    load(0, 0);
+    cp_commit();
+    float dq[8][4] = {};
+    for (int kt = 0; kt <= qt; kt++) {
+        if (kt < qt) load(kt + 1, (kt + 1) & 1);
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        uint32_t sf[4][4];
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++)
+            ldsm4t(sf[kk], dst[kt & 1] + swz(kk * 16 + ((lane >> 4) << 3) + (lane & 7), warp * 2 + ((lane >> 3) & 1)));
+        mma_ab(dq, sf, ks[kt & 1]);
+        __syncthreads();
+    }
+    const float k = LOG2E / sqrtf((float)HEAD_DIM) / LOG2E;
+    const size_t row0 = (size_t)b * T + qt * 64;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        bf16* row = dqkv + (row0 + warp * 16 + g + 8 * r) * QKV_DIM + h * HEAD_DIM + 2 * t;
+#pragma unroll
+        for (int j = 0; j < 8; j++) *(bf162*)(row + 8 * j) = __floats2bfloat162_rn(dq[j][2 * r] * k, dq[j][2 * r + 1] * k);
+    }
+}
+static void dsq_attention(float* part, bf16* dqkv, float* dsum, const bf16* qkv, const bf16* out, const bf16* dout,
+                          const float* lse) {
+    dsq_dsum<<<dim3(NT, HEADS, B), 128, 0, stream>>>(dsum, out, dout);
+    CK(cudaEventRecord(dsq_fork, stream));
+    for (int gi = 0; gi < 3; gi++) {  // group gi reuses buffer gi % 2 after group gi - 2's dq has read it
+        bf16* buf = dsq_buf + (size_t)(gi % 2) * 3 * DSQ_TILES * TILE;
+        CK(cudaStreamWaitEvent(dsq_s[gi], dsq_fork));
+        if (gi >= 2) CK(cudaStreamWaitEvent(dsq_s[gi], dsq_g[gi - 2]));
+        dsq_dkv<<<dim3(NT, 3, B), 128, 0, dsq_s[gi]>>>(part, buf, qkv, dout, lse, dsum, 3 * gi);
+        dsq_dq<<<dim3(NT, 3, B), 128, 0, dsq_s[gi]>>>(dqkv, buf, qkv, 3 * gi);
+        CK(cudaEventRecord(dsq_g[gi], dsq_s[gi]));
+    }
+    for (int gi = 0; gi < 3; gi++) CK(cudaStreamWaitEvent(stream, dsq_g[gi]));
+}
+#endif
+#ifdef CHISEL_DXPF
+// lathe's down_dx_swiglu, plus: the block's gate and up lines (its epilogue's only DRAM reads) prefetched into L2
+// while the GEMM runs; 64 rows x 2 lines of 128 bytes, one per thread
+__global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu_pf(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
+    static_assert(GBM / GWM * 32 == 2 * GBM, "one prefetch per thread");
+    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
+    const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (threadIdx.x >> 1)) * 2 * FFN + (threadIdx.x & 1) * FFN + bn));
+    float acc[GWM / 16][8][4] = {};
+    gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
+#pragma unroll
+    for (int i = 0; i < GWM / 16; i++)
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const size_t n = bm + wm0 + 16 * i + g + 8 * r;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int c = bn + 8 * j + 2 * t;
+                const float2 gf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + c));
+                const float2 uf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + FFN + c));
+                float dg[2], du[2];
+                const float gv[2] = {gf.x, gf.y}, uv[2] = {uf.x, uf.y};
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const float da = round_bf16(acc[i][j][2 * r + e]), sig = 1.f / (1.f + expf(-gv[e]));
+                    du[e] = da * round_bf16(gv[e] / (1.f + expf(-gv[e])));
+                    dg[e] = round_bf16(da * uv[e]) * sig * (1.f + gv[e] * (1.f - sig));
+                }
+                *(bf162*)(dgu + n * 2 * FFN + c) = __floats2bfloat162_rn(dg[0], dg[1]);
+                *(bf162*)(dgu + n * 2 * FFN + FFN + c) = __floats2bfloat162_rn(du[0], du[1]);
+            }
+        }
+}
 #endif
 #ifdef CHISEL_DKV
 static CUfunction chisel_dkv_fn;
@@ -566,8 +765,13 @@ static void backward(State& s, const Lins& L, FILE* df) {
         const LayerDump put{df, l};
 
         put("dres_out", g.dres, 1, DIM);
+#ifdef CHISEL_DXPF
+        down_dx_swiglu_pf<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        mark("bwd down dX GEMM + SwiGLU bwd (own) 2048x1536x576 (chisel)");
+#else
         down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
         mark("bwd down dX GEMM + SwiGLU bwd (own) 2048x1536x576");
+#endif
         dw(dw_adamw<DIM, FFN>, DIM, FFN, P_QKV + P_O + P_GU, gr.down, g.dres_bf, act);
         mark("bwd down dW + AdamW (own) 576x1536x2048");
 #ifdef PROBE_DW
@@ -575,6 +779,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("probe chisel dW core down");
 #endif
         put("dgu", g.dgu, 0, 2 * FFN);
+#if defined(CHISEL_DWS) && CHISEL_DWS == 6
+        if (!df && l + 1 < LAYERS) dws_pass(s, l + 1);  // the previous layer's AdamW from this gate_up dX GEMM on
+#endif
         gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM 2048x576x3072");
         dw(dw_adamw<2 * FFN, DIM>, 2 * FFN, DIM, P_QKV + P_O, gr.gu, g.dgu, ln2);
@@ -613,6 +820,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
             dws_range(s, l, P_QKV, P_MAT);
         }
 #endif
+#ifdef CHISEL_DSQ
+        dsq_attention(g.part, g.dqkv, g.dsum, qkv, att, g.datt, lse);
+        mark("bwd attention dq + dk dv (dS reuse)");
+#else
         attention_bwd_dq<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.dqkv, g.dsum, qkv, att, g.datt, lse);
         mark("bwd attention dq");
 #ifdef CHISEL_DKV
@@ -621,6 +832,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
 #else
         attention_bwd_dkv<<<dim3(NT, HEADS, B), 128, 0, stream>>>(g.part, qkv, g.datt, lse, g.dsum);
         mark("bwd attention dk dv");
+#endif
 #endif
         attention_bwd_finish<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(g.dqkv, g.part,
                                                                                                        s.rope);
@@ -797,6 +1009,18 @@ int main(int argc, char** argv) {
     CK(cudaEventCreateWithFlags(&dws_join, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&dws_go, cudaEventDisableTiming));
 #endif
+#ifdef CHISEL_DSQ
+    {
+        int least, greatest;
+        CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        for (int i = 0; i < 3; i++) {
+            CK(cudaStreamCreateWithPriority(&dsq_s[i], cudaStreamNonBlocking, std::min(least, greatest + i)));
+            CK(cudaEventCreateWithFlags(&dsq_g[i], cudaEventDisableTiming));
+        }
+        CK(cudaEventCreateWithFlags(&dsq_fork, cudaEventDisableTiming));
+        CK(cudaMalloc(&dsq_buf, (size_t)2 * 3 * DSQ_TILES * TILE * 2));
+    }
+#endif
 #ifdef CHISEL_DW
     cdw_fn[0] = chisel_fn(chisel_dwa_qkv, chisel_dwa_qkv_kernel);
     cdw_fn[1] = chisel_fn(chisel_dwa_o, chisel_dwa_o_kernel);
@@ -876,7 +1100,7 @@ int main(int argc, char** argv) {
                 CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
                 train_step(s, L, nullptr);
                 CK(cudaStreamEndCapture(stream, &g));
-#ifdef CHISEL_DWS
+#if defined(CHISEL_DWS) || defined(CHISEL_DSQ)
                 CK(cudaGraphInstantiate(&graph, g, cudaGraphInstantiateFlagUseNodePriority));
 #else
                 CK(cudaGraphInstantiate(&graph, g, 0));
