@@ -21,5 +21,8 @@ constexpr int QKV_DIM = (HEADS + 2 * KV_HEADS) * HEAD_DIM;  // 1600, fused q|k|v
 constexpr int ADAMW_AT = 0;
 constexpr int ADAMW_BLOCKS = 14;
 constexpr bool ADAMW_SPLIT_LAST = false;
+// ADAM8=1 builds (8-bit moments): the same schedule until tuned.
+constexpr int ADAMW_AT8 = ADAMW_AT;
+constexpr int ADAMW_BLOCKS8 = ADAMW_BLOCKS;
 // Attention grids with the head index fastest (kernels.cuh att_grid): -0.22% at 1x704 (chisel e059).
 constexpr bool ATT_HEAD_FASTEST = false;
