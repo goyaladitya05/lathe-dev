@@ -23,6 +23,8 @@ constexpr int ADAMW_BLOCKS = 14;
 constexpr bool ADAMW_SPLIT_LAST = false;
 // ADAM8=1 builds (8-bit moments, 16.25 instead of 28 bytes per parameter per pass): start and width of their pass.
 constexpr int ADAMW_AT8 = ADAMW_AT;
-constexpr int ADAMW_BLOCKS8 = 16;  // chisel e066: 16 blocks from the next layer's down dX, +1.40% at 1x704
+// 8-bit pass width by tokens per step (chisel e066, 8-bit at 1xT): 16 blocks +1.4% over 14 at 704, even at 1536, 14 +0.7-0.9%
+// over 16 at 2304.
+constexpr int ADAMW_BLOCKS8 = BATCH * SEQ <= 1536 ? 16 : 14;
 // Attention grids with the head index fastest (kernels.cuh att_grid): -0.22% at 1x704 (chisel e059).
 constexpr bool ATT_HEAD_FASTEST = false;
