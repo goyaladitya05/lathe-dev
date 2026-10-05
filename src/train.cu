@@ -118,7 +118,7 @@ struct Acts {
     bf16* act;        // [LAYERS][N][FFN]
     bf16* lnf;        // [N][DIM]
     bf16* branch;     // [N][DIM] o_proj / down_proj output before the residual add (scratch)
-    bf16* logits;     // [N][VOCAB], overwritten with dlogits by cross_entropy
+    bf16* logits;     // [N][VOCAB], overwritten with dlogits by cross_entropy; holds gring and ds when dead (RING)
     float* losses;    // [N]
     float* loss;      // [1] mean
     int* io;          // [IO_INTS]
@@ -136,10 +136,24 @@ struct Bwd {
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
-    bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits: carve)
-    bf16* ds;        // [2][DS_GROUP] bf16 dS tiles of two attention groups, attention_backward (likewise)
+    bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits)
+    bf16* ds;        // [2][DS_GROUP] bf16 dS tiles of two attention groups, attention_backward (in a.logits)
 };
 constexpr int RING = 3;
+
+// gring and ds live in the logits buffer when it is large enough (IN_LOGITS). Lifetime of logits in a step: written by
+// the lm_head forward and overwritten in place with dlogits by cross_entropy (main stream), last read by head_dw_adamw
+// (main), dead until the next step's lm_head forward. In that window: gring is written by the layer dW cores (main,
+// issued after head_dw_adamw) and read by the AdamW passes (side stream, joined into main at the end of backward); ds
+// is written and read by attention_backward (attention streams, forked from main and joined within it). alias_check
+// enforces this issue order on the host whenever a step is issued, eager or captured.
+constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
+constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
+static_assert(RING_N * sizeof(bf16) % 256 == 0, "ds stays 256B-aligned behind the ring");
+static bool logits_live, side_open;  // logits between lm_head forward and head_dw_adamw; AdamW passes not yet joined
+static void alias_check(bool ok, const char* what) {
+    if (IN_LOGITS && !ok) die(what);
+}
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
@@ -205,11 +219,6 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
     g.gemb_rows = ar.take<float>(ND);
-    // The gradient ring and the dS buffers live in the logits buffer when it is large enough: logits are dead from the
-    // lm_head dW (the last backward kernel to read them, on the main stream before any layer) to the next step's lm_head
-    // forward, and the side streams have joined by then.
-    constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
-    constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
     g.gring = IN_LOGITS ? a.logits : ar.take<bf16>(RING_N);
     g.ds = IN_LOGITS ? a.logits + RING_N : ar.take<bf16>(DS_N);
 }
@@ -305,6 +314,7 @@ static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
 enum { DW_QKV, DW_O, DW_GU, DW_DOWN };
 template <int W, int OUT, int IN>
 static void dw_core(bf16* g, const bf16* dy, const bf16* x) {
+    alias_check(!logits_live, "logits aliasing: a dW core writes gring while logits are live");
 #ifdef HAVE_CHISEL_DW
     static const unsigned* grid[4] = {chisel_dw_qkv_grid, chisel_dw_o_grid, chisel_dw_gu_grid, chisel_dw_down_grid};
     static const unsigned block[4] = {chisel_dw_qkv_block, chisel_dw_o_block, chisel_dw_gu_block, chisel_dw_down_block};
@@ -398,6 +408,8 @@ static void forward(State& s, const Lins& L, FILE* df) {
         mark("fwd rmsnorm");
         put("res_out", res + ND, 1, DIM);
     }
+    alias_check(!side_open, "logits aliasing: lm_head forward before the AdamW passes joined");
+    logits_live = true;
     gemm(s, L.head, a.logits, s.params, a.lnf);  // tied embedding
     mark("fwd head GEMM");
     dump(df, "lnf", a.lnf, 0, N, DIM);
@@ -417,6 +429,7 @@ static void forward(State& s, const Lins& L, FILE* df) {
 // dS buffers; a group waits until the one two before it has read its buffer.
 static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, const bf16* qkv, const bf16* out,
                                const bf16* dout, const float* lse) {
+    alias_check(!logits_live, "logits aliasing: attention backward writes ds while logits are live");
     attention_dsum<<<dim3(NT, HEADS, B), 128, 0, stream>>>(dsum, out, dout);
     CK(cudaEventRecord(ev_fork, stream));
     for (int k = 0; k < KV_HEADS; k++) {
@@ -442,6 +455,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     const size_t ND = (size_t)N * DIM;
     auto adamw_pass = [&](int l) {  // AdamW of layer l's matrices, beside the kernels issued after this point
         const size_t o = P_EMBED + l * P_LAYER;
+        side_open = true;
         CK(cudaEventRecord(ev_fork, stream));
         CK(cudaStreamWaitEvent(side, ev_fork));
         side_mark(false);
@@ -456,6 +470,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     head_dw_adamw<<<dim3(DIM / 64, VOCAB / 64), 128, 0, stream>>>(s.master, s.params, s.m, s.v, a.logits, a.lnf, s.step,
                                                                   g.gemb_rows, df ? s.gemb : nullptr, a.io + IO_SEGMAP);
     mark("bwd head dW + AdamW");
+    logits_live = false;  // head_dw_adamw was the last reader
     dump(df, "dlnf", g.dln, 0, N, DIM);
     rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, nullptr, g.dln, a.res + LAYERS * ND,
                                                 s.master + P_TOTAL - DIM);
@@ -524,6 +539,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
     mark("bwd embedding + AdamW");
     CK(cudaEventRecord(ev_join, side));  // the AdamW passes finish inside the step
     CK(cudaStreamWaitEvent(stream, ev_join));
+    side_open = false;
     CK(cudaGetLastError());
 }
 
