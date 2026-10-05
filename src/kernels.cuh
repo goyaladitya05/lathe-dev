@@ -2,6 +2,8 @@
 // hyperparameters and the parameter layout from train.cu. Precision follows PyTorch bf16 autocast (BENCH.md).
 #pragma once
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 typedef __nv_bfloat16 bf16;
 typedef __nv_bfloat162 bf162;
@@ -786,20 +788,24 @@ __global__ void __launch_bounds__(DIM / 4) embed_bwd_adamw(float* p, bf16* pb, f
 
 // AdamW for the norm weights (gnorm = [LAYERS x (ln1, ln2)][final norm]), 4 per thread; also refreshes the bf16 copy.
 // Layer matrices are updated by adamw_stream, the embedding by head_dw_adamw and embed_bwd_adamw.
+// COMPACT: m and v are [G_NORM] (8-bit mode, where fp32 moments cover only the embedding and the norms) instead of
+// [P_TOTAL].
+template <bool COMPACT>
 __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, float* v, const float* step_count) {
     const size_t j = 4 * (blockIdx.x * (size_t)blockDim.x + threadIdx.x);
     if (j >= G_NORM) return;
     const size_t o = j < G_NORM - DIM ? P_EMBED + j / (2 * DIM) * P_LAYER + P_MAT + j % (2 * DIM)
                                       : P_TOTAL - DIM + (j - (G_NORM - DIM));  // parameter offset of gnorm[j]
     const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
-    float4 P = *(float4*)(p + o), G = *(const float4*)(gnorm + j), M = *(float4*)(m + o), V = *(float4*)(v + o);
+    const size_t om = COMPACT ? j : o;
+    float4 P = *(float4*)(p + o), G = *(const float4*)(gnorm + j), M = *(float4*)(m + om), V = *(float4*)(v + om);
     adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
     adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
     adamw_update(P.z, M.z, V.z, G.z, bc1, bc2_sqrt);
     adamw_update(P.w, M.w, V.w, G.w, bc1, bc2_sqrt);
     *(float4*)(p + o) = P;
-    *(float4*)(m + o) = M;
-    *(float4*)(v + o) = V;
+    *(float4*)(m + om) = M;
+    *(float4*)(v + om) = V;
     *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
 }
 
@@ -877,6 +883,53 @@ __global__ void adamw_stream(float* p, float* m, float* v, bf16* pb, const bf16*
         __stcs((float2*)m + i, M);
         __stcs((float2*)v + i, V);
         __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+    }
+}
+
+// 8-bit AdamW state for the layer matrices (make ADAM8=1; format in BENCH.md "8-bit AdamW state"). Blocks of 64
+// consecutive parameters, one warp of the pass. m: FP8 E4M3 codes q = e4m3_rn_satfinite(m / s), s = max|m| / 448;
+// v: the same for u = sqrtf(v). Dequantized m = float(q) * s, v = (float(q_u) * s_u)^2. A step dequantizes, runs the
+// fp32 AdamW update (the weight update uses the new fp32 m, v), then requantizes with the new block maxima.
+constexpr int Q8_BLOCK = 64;
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+__device__ __forceinline__ float2 e4m3x2_to_float2(unsigned short q) {
+    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(q, __NV_E4M3)));
+}
+__device__ __forceinline__ unsigned short float2_to_e4m3x2(float2 x, float a) {  // a: block max of |x|
+    if (a == 0.f) return 0;
+    const float s = a / 448.f;
+    return __nv_cvt_float2_to_fp8x2(make_float2(x.x / s, x.y / s), __NV_SATFINITE, __NV_E4M3);
+}
+// Same as adamw_stream over n parameters (n and the start a multiple of Q8_BLOCK), with the moments as codes qm, qu
+// [n] and scales sm, su [n / Q8_BLOCK]. Every warp iteration is exactly one block (the grid stride is a multiple of 32).
+__global__ void adamw_stream8(float* p, unsigned char* qm, unsigned char* qu, float* sm, float* su, bf16* pb,
+                              const bf16* g, const float* step_count, size_t n) {
+    static_assert(Q8_BLOCK == 64, "one warp, two parameters per lane");
+    const float step = *step_count, bc1 = 1.f - powf(BETA1, step), bc2_sqrt = sqrtf(1.f - powf(BETA2, step));
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n / 2; i += (size_t)gridDim.x * blockDim.x) {
+        const size_t blk = i / 32;
+        float2 P = __ldcs((float2*)p + i), M = e4m3x2_to_float2(__ldcs((unsigned short*)qm + i)) ;
+        const float2 U = e4m3x2_to_float2(__ldcs((unsigned short*)qu + i));
+        const float s_m = sm[blk], s_u = su[blk];
+        M = {M.x * s_m, M.y * s_m};
+        float2 V = {U.x * s_u * (U.x * s_u), U.y * s_u * (U.y * s_u)};
+        const float2 G = __bfloat1622float2(__ldcs((const bf162*)g + i));
+        adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
+        adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
+        __stcs((float2*)p + i, P);
+        __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+        const float2 Un = {sqrtf(V.x), sqrtf(V.y)};
+        const float am = warp_max(fmaxf(fabsf(M.x), fabsf(M.y))), au = warp_max(fmaxf(Un.x, Un.y));
+        __stcs((unsigned short*)qm + i, float2_to_e4m3x2(M, am));
+        __stcs((unsigned short*)qu + i, float2_to_e4m3x2(Un, au));
+        if ((threadIdx.x & 31) == 0) {
+            sm[blk] = am / 448.f;
+            su[blk] = au / 448.f;
+        }
     }
 }
 
