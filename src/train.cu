@@ -60,14 +60,6 @@ static_assert(chisel_dw_qkv_m == QKV_DIM && chisel_dw_qkv_n == DIM && chisel_dw_
                   chisel_dw_qkv_k == N && chisel_dw_o_k == N && chisel_dw_gu_k == N && chisel_dw_down_k == N,
               "chisel header built for another shape");
 #endif
-// Attention backward dq (from the stored dS) in SASS from chisel (gen/attention_dq.py): one header per model and batch
-// shape (CHISEL_ATT_H), else attention_bwd_dq; the bits are the same (chisel e058).
-#if __has_include(CHISEL_ATT_H)
-#include CHISEL_ATT_H
-#define HAVE_CHISEL_ATT 1
-static_assert(chisel_dq_b == B && chisel_dq_t == T && chisel_dq_dim == DIM && chisel_dq_heads == HEADS &&
-                  chisel_dq_kv_heads == KV_HEADS, "chisel attention header built for another shape");
-#endif
 
 #define CK(x) ck_cuda((x), #x, __LINE__)
 #define CKB(x) ck_blas((x), #x, __LINE__)
@@ -239,7 +231,6 @@ static cudaEvent_t ev_fork, ev_join, ev_ring[RING], ev_att[KV_HEADS];
 static cublasLtHandle_t lt;
 #ifdef HAVE_CHISEL_DW
 static CUfunction chisel_dw[4];
-static CUfunction chisel_dq_fn;
 #endif
 
 // Per-op GPU time (make ... STEP_TIMES=1): an event after every launch on the main stream, eager steps, a table at the
@@ -446,14 +437,7 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
         if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
         attention_bwd_dkv<<<dim3(NT * GROUP, 1, B), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
-#ifdef HAVE_CHISEL_ATT
-        int h0 = k * GROUP;
-        void* args[] = {&dqkv, &buf, &qkv, &h0};
-        CKD(cuLaunchKernel(chisel_dq_fn, chisel_dq_grid[0], chisel_dq_grid[1], chisel_dq_grid[2], chisel_dq_block, 1, 1, 0,
-                           (CUstream)att_stream[k], args, nullptr));
-#else
         attention_bwd_dq<<<dim3(NT * GROUP, 1, B), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
-#endif
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
     }
     for (int k = 0; k < KV_HEADS; k++) CK(cudaStreamWaitEvent(stream, ev_att[k]));
@@ -700,13 +684,6 @@ int main(int argc, char** argv) {
             CKD(cuModuleLoadData(&m, image[k]));
             CKD(cuModuleGetFunction(&chisel_dw[k], m, name[k]));
         }
-    }
-#endif
-#ifdef HAVE_CHISEL_ATT
-    {
-        CUmodule m;
-        CKD(cuModuleLoadData(&m, chisel_dq));
-        CKD(cuModuleGetFunction(&chisel_dq_fn, m, chisel_dq_kernel));
     }
 #endif
 
