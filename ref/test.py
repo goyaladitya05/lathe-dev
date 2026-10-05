@@ -1,6 +1,7 @@
 # Correctness of lathe against the reference.
 #   python ref/test.py [--model smol135] [--B 2 --T 512]   kernels fwd/bwd, end to end, every parameter grad, AdamW
 #   python ref/test.py curve [--steps 1000] [--B 1 --T 2048]   loss curve vs reference training
+#   --adam8 tests the 8-bit AdamW state build (make ADAM8=1); state8 [--steps 500] compares it with fp32 state
 # Per-kernel checks feed each lathe kernel's dumped inputs to fp32 math (bf16-rounded matmul weights).
 # End-to-end checks measure lathe against an fp32 reference, with PyTorch bf16 autocast's own error as the
 # yardstick: lathe may be at most E2E_RATIO times worse.
@@ -25,6 +26,7 @@ BIAS_BATCHES = 16
 CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
 MODEL = "smol135"  # set from --model
+ADAM8 = False  # --adam8: lathe built with 8-bit AdamW moments for the layer matrices (make ADAM8=1)
 
 
 def rel(a, b):
@@ -50,7 +52,7 @@ def read_dump(path):
     while off < len(raw):
         name = bytes(raw[off:off + 48]).split(b"\0")[0].decode()
         dt, _, rows, cols = struct.unpack("<iiqq", bytes(raw[off + 48:off + 72]))
-        npdt = {0: np.int16, 1: np.float32, 2: np.int32}[dt]
+        npdt = {0: np.int16, 1: np.float32, 2: np.int32, 3: np.uint8}[dt]
         n = rows * cols * np.dtype(npdt).itemsize
         t = torch.from_numpy(raw[off + 72:off + 72 + n].view(npdt).reshape(rows, cols))
         out[name] = t.view(torch.bfloat16) if dt == 0 else t
@@ -67,8 +69,16 @@ def lathe_grads(d, cfg):
     return torch.cat(parts + [gnorm[-D:]])
 
 
-def run_lathe(B, T, *args):
-    out = subprocess.run([ROOT / f"build/train_{MODEL}_b{B}_t{T}", *map(str, args)], capture_output=True, text=True)
+def build_lathe(B, T, adam8=None):
+    adam8 = ADAM8 if adam8 is None else adam8
+    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}", *(["ADAM8=1"] if adam8 else [])], cwd=ROOT,
+                   check=True)
+
+
+def run_lathe(B, T, *args, adam8=None):
+    adam8 = ADAM8 if adam8 is None else adam8
+    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}"
+    out = subprocess.run([exe, *map(str, args)], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
     return out.stdout
@@ -301,6 +311,26 @@ def adamw_check(d, grads, wpath, cfg):
     check("bf16 copy == bf16(master)", float((d["params"].view(-1) != master.to(torch.bfloat16)).sum()), 0)
 
 
+def state8_check(d, cfg):
+    # 8-bit mode: the stored moments after step 1 (m = v = 0 before it), recomputed from lathe's bf16 grads byte for
+    # byte (format in BENCH.md "8-bit AdamW state"). m = fmaf(-b1, g, g) and v = fmaf(-b2, g*g, g*g) are exact in
+    # fp64 before one rounding to fp32; scales a / 448 and codes e4m3(x / s) as in adamw_stream8.
+    b1, b2 = float(np.float32(0.9)), float(np.float32(0.95))  # train.cu BETA1, BETA2
+    print(" 8-bit AdamW state after step 1")
+    for l in [0, cfg.layers - 1]:
+        g = d[f"gmat.{l}"].view(-1).float()
+        gg = (g * g).double()
+        m, v = (g.double() - b1 * g.double()).float(), (gg - b2 * gg).float()
+        for name, x in [("m", m), ("u", v.sqrt())]:
+            blk = x.view(-1, 64)
+            a = blk.abs().amax(1)
+            sc = a / 448
+            q = torch.where(a[:, None] > 0, blk / sc[:, None], torch.zeros_like(blk)).to(torch.float8_e4m3fn)
+            bad = (q.view(torch.uint8).view(-1) != d[f"q{name}.{l}"].view(-1)).sum()
+            check(f"{name} codes, layer {l} (mismatches)", float(bad), 0)
+            check(f"{name} scales, layer {l} (mismatches)", float((sc != d[f"s{name}.{l}"].view(-1)).sum()), 0)
+
+
 def unit(B, T):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -315,7 +345,7 @@ def unit(B, T):
     init_weights(a)
     load_lathe(b, DATA / f"{MODEL}_init.bin")
     check("export/load round trip", max((p - q).abs().max().item() for p, q in zip(a.parameters(), b.parameters())), 0)
-    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
+    build_lathe(B, T)
 
     # Run lathe before this process touches the GPU, so its arena never competes with torch for memory.
     val, evals = DATA / "val.bin", {}
@@ -346,6 +376,8 @@ def unit(B, T):
         grad_checks(grads, model, x, y, per_tensor=name == "init")
         del W
         adamw_check(d, grads, wpath, cfg)
+        if ADAM8:
+            state8_check(d, cfg)
 
     print(f"\nreference sanity: pretrained {MODEL} val loss over 8 batches")
     model.eval()
@@ -401,7 +433,7 @@ def curve(steps, B=1, T=2048, window=100):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     cfg = Config.load(MODEL)
-    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
+    build_lathe(B, T)
     train = DATA / "train.bin"
     out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps)
     la = np.array(losses_from(out, "step"))
@@ -431,18 +463,44 @@ def curve(steps, B=1, T=2048, window=100):
     check(f"last {last[1] - last[0]} steps |mean - fp32|", bias(la, *last), max(CURVE_FINAL_TOL, E2E_RATIO * bias(t16, *last)))
 
 
+def state8(steps, B, T, window=100):
+    # 8-bit vs fp32 AdamW state: the same lathe step otherwise, same init and batches. Step 1 is identical (the state
+    # starts at exactly 0); after it the 8-bit run follows its own trajectory. Windowed biases within the curve bounds.
+    train = DATA / "train.bin"
+    runs = {}
+    for adam8 in (False, True):
+        build_lathe(B, T, adam8)
+        out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps, adam8=adam8)
+        runs[adam8] = np.array(losses_from(out, "step"))
+    f32, q8 = runs[False], runs[True]
+    np.savetxt(ROOT / f"build/state8_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, q8], 1), delimiter=",",
+               header="step,fp32_state,8bit_state", fmt="%.6f")
+    print(f"{'steps':<10} {'fp32 state':>10} {'8-bit':>8} | mean |8bit-fp32| | mean 8bit-fp32")
+    for s0 in range(0, steps, window):
+        w = slice(s0, s0 + window)
+        print(f"{s0:4d}-{min(s0 + window, steps) - 1:<5d} {f32[w].mean():10.4f} {q8[w].mean():8.4f} | "
+              f"{np.abs(q8[w] - f32[w]).mean():16.4f} | {(q8[w] - f32[w]).mean():+14.4f}")
+    check("step 0 loss, 8-bit == fp32 state", abs(q8[0] - f32[0]), 0)
+    check(f"worst {window}-step window |mean 8bit - fp32 state|",
+          max(abs(q8[a:a + window].mean() - f32[a:a + window].mean()) for a in range(0, steps, window)), CURVE_WINDOW_TOL)
+    check(f"last 200 steps |mean 8bit - fp32 state|", abs(q8[-200:].mean() - f32[-200:].mean()), CURVE_FINAL_TOL)
+
+
 def main():
-    global MODEL
+    global MODEL, ADAM8
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", nargs="?", choices=["unit", "curve"], default="unit")
+    ap.add_argument("mode", nargs="?", choices=["unit", "curve", "state8"], default="unit")
     ap.add_argument("--model", default="smol135")
     ap.add_argument("--B", type=int)
     ap.add_argument("--T", type=int)
     ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--adam8", action="store_true", help="test the 8-bit AdamW state build (make ADAM8=1)")
     args = ap.parse_args()
-    MODEL = args.model
+    MODEL, ADAM8 = args.model, args.adam8
     if args.mode == "curve":
         curve(args.steps, args.B or 1, args.T or 2048)
+    elif args.mode == "state8":
+        state8(args.steps, args.B or 1, args.T or 2048)
     else:
         unit(args.B or 2, args.T or 512)
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
