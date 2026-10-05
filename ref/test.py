@@ -354,49 +354,56 @@ def unit(B, T):
     check("pretrained val loss", loss, 3.5)
 
 
-def curve(steps, B=1, T=2048, dev="cuda", window=100):
-    # lathe, torch-bf16 and fp32 (checkpointed) train from the same init on the same batches. dev="cpu" runs the
-    # references on the CPU, for models whose PyTorch training state does not fit on the GPU.
+def ref_curve(cfg, tokens, steps, B, T, bf16):
+    # PyTorch training from the same init on the same batches: autocast bf16 (bf16=True) or fp32, TF32 off, forward and
+    # backward on the GPU. When fp32 weights, grads and both AdamW moments do not fit the GPU (360M), the AdamW state
+    # and its step live on the CPU (fused AdamW, the same update: adamw_check); grads go down and weights come back up
+    # every step.
+    model = Model(cfg)
+    init_weights(model)
+    offload = torch.cuda.mem_get_info()[0] < 1.2 * 16 * sum(p.numel() for p in model.parameters())
+    host = None
+    if offload:
+        host = Model(cfg)
+        host.load_state_dict(model.state_dict())
+        for h in host.parameters():
+            h.data = h.data.pin_memory()
+            h.grad = torch.zeros_like(h.data).pin_memory()
+    model.cuda()
+    model.ckpt = offload or not bf16  # recompute blocks in backward (same numerics) so fp32 and 360M fit
+    opt = make_optimizer(host if offload else model)
+    losses = []
+    for i in range(steps):
+        x, y = (t.cuda() for t in get_batch(tokens, i, B, T))
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            _, loss = model(x, y)
+        loss.backward()
+        if offload:
+            for p, h in zip(model.parameters(), host.parameters()):
+                h.grad.copy_(p.grad)
+            opt.step()
+            for p, h in zip(model.parameters(), host.parameters()):
+                p.data.copy_(h.data)
+            model.zero_grad(set_to_none=True)
+        else:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        losses.append(loss.detach())
+    print(f" {'torch-bf16' if bf16 else 'fp32'} reference: {steps} steps{', AdamW state on the CPU' if offload else ''}")
+    return torch.stack(losses).cpu().numpy()
+
+
+def curve(steps, B=1, T=2048, window=100):
+    # lathe, torch-bf16 and fp32 train from the same init on the same batches.
     torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     cfg = Config.load(MODEL)
     subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}"], cwd=ROOT, check=True)
     train = DATA / "train.bin"
     out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps)
-    curves = {"lathe": np.array(losses_from(out, "step"))}
+    la = np.array(losses_from(out, "step"))
     tokens = np.memmap(train, dtype=np.uint16, mode="r")
-    refs = [("torch-bf16", True), ("fp32", False)] if dev == "cuda" else [("fp32", False)]  # CPU bf16 is ~10x slower
-    for name, bf16 in refs:
-        model = Model(cfg)
-        init_weights(model)
-        model.to(dev)
-        model.ckpt = not bf16 and dev == "cuda"
-        opt = make_optimizer(model)
-        losses = []
-        for i in range(steps):
-            x, y = (t.to(dev) for t in get_batch(tokens, i, B, T))
-            with torch.autocast(dev, dtype=torch.bfloat16, enabled=bf16):
-                _, loss = model(x, y)
-            loss.backward()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            losses.append(loss.detach())
-        curves[name] = torch.stack(losses).cpu().numpy()
-        del model, opt
-        torch.cuda.empty_cache()
-    if dev != "cuda":
-        f32, la = curves["fp32"], curves["lathe"]
-        np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, la], 1), delimiter=",",
-                   header="step,fp32,lathe", fmt="%.6f")
-        for s0 in range(0, steps, 25):
-            w = slice(s0, s0 + 25)
-            print(f"steps {s0:4d}-{min(s0 + 25, steps) - 1:<4d} fp32 {f32[w].mean():.4f}  lathe {la[w].mean():.4f}  "
-                  f"mean |lathe-fp32| {np.abs(la[w] - f32[w]).mean():.4f}")
-        # No torch-bf16 yardstick on CPU: bound from the 135M runs, where bf16 runs sat 0.0007-0.001 off fp32
-        # over the first 50 steps (2x tolerance there ~0.002).
-        check(f"steps 0-{CURVE_EARLY - 1} mean |loss - fp32|", np.abs(la[:CURVE_EARLY] - f32[:CURVE_EARLY]).mean(), 0.004)
-        check("worst step |loss - fp32|", np.abs(la - f32).max(), CURVE_WINDOW_TOL)
-        return
-    f32, t16, la = curves["fp32"], curves["torch-bf16"], curves["lathe"]
+    t16, f32 = ref_curve(cfg, tokens, steps, B, T, True), ref_curve(cfg, tokens, steps, B, T, False)
     np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
                header="step,fp32,torch_bf16,lathe", fmt="%.6f")
     print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'lathe':>8} | mean |torch-fp32| |lathe-fp32| |lathe-torch|")
@@ -404,16 +411,21 @@ def curve(steps, B=1, T=2048, dev="cuda", window=100):
         w = slice(s0, s0 + window)
         print(f"{s0:4d}-{min(s0 + window, steps) - 1:<5d} {f32[w].mean():8.4f} {t16[w].mean():10.4f} {la[w].mean():8.4f} | "
               f"{np.abs(t16[w] - f32[w]).mean():17.4f} {np.abs(la[w] - f32[w]).mean():12.4f} {np.abs(la[w] - t16[w]).mean():12.4f}")
-    # bf16 runs track fp32 closely until the loss transition (steps ~50-100). After it, equally valid bf16
-    # implementations follow nearby trajectories that slowly reconverge: torch-bf16 with flash, cuDNN or
-    # mem-efficient attention, over init seeds 0 and 1, reached window offsets of 0.036 and late offsets of
-    # 0.018, with the sign set by the seed. So: a sharp check before the transition, coarse ones (1.7x) after.
+    # bf16 runs track fp32 closely until the loss transition (steps ~50-100 at 135M). After it, equally valid bf16
+    # implementations follow nearby trajectories that slowly reconverge: torch-bf16 with flash, cuDNN or mem-efficient
+    # attention, over init seeds 0 and 1, reached window offsets of 0.036 and late offsets of 0.018 at 135M, with the
+    # sign set by the seed. So: a sharp check before the transition, and windowed biases after it, each measured
+    # against torch-bf16's own offset from fp32 (E2E_RATIO times it), never tighter than the 135M bounds (1.7x those
+    # offsets). Single steps are not checked: with few tokens per step (360M 1x704) one step's loss is too noisy.
     early = slice(0, CURVE_EARLY)
     check(f"steps 0-{CURVE_EARLY - 1} mean |loss - fp32|", np.abs(la[early] - f32[early]).mean(),
           E2E_RATIO * np.abs(t16[early] - f32[early]).mean())
-    offsets = [abs(la[a:a + window].mean() - f32[a:a + window].mean()) for a in range(0, steps, window)]
-    check(f"worst {window}-step window |mean - fp32|", max(offsets), CURVE_WINDOW_TOL)
-    check("last 200 steps |mean - fp32|", abs(la[-200:].mean() - f32[-200:].mean()), CURVE_FINAL_TOL)
+    bias = lambda c, a, b: abs(c[a:b].mean() - f32[a:b].mean())
+    wins = [(a, a + window) for a in range(0, steps, window)]
+    check(f"worst {window}-step window |mean - fp32|", max(bias(la, a, b) for a, b in wins),
+          max(CURVE_WINDOW_TOL, E2E_RATIO * max(bias(t16, a, b) for a, b in wins)))
+    last = (max(0, steps - 200), steps)
+    check(f"last {last[1] - last[0]} steps |mean - fp32|", bias(la, *last), max(CURVE_FINAL_TOL, E2E_RATIO * bias(t16, *last)))
 
 
 def main():
@@ -424,11 +436,10 @@ def main():
     ap.add_argument("--B", type=int)
     ap.add_argument("--T", type=int)
     ap.add_argument("--steps", type=int, default=1000)
-    ap.add_argument("--ref-device", default="cuda", help="curve: where the PyTorch references train")
     args = ap.parse_args()
     MODEL = args.model
     if args.mode == "curve":
-        curve(args.steps, args.B or 1, args.T or 2048, args.ref_device)
+        curve(args.steps, args.B or 1, args.T or 2048)
     else:
         unit(args.B or 2, args.T or 512)
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
