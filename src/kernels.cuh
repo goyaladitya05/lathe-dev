@@ -404,12 +404,16 @@ __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, cons
 // in those units. P (and dS in backward) are rounded to bf16 for the tensor-core products, as flash attention does.
 // Each thread owns rows g and g+8 of its warp's 16 rows and columns 8j + 2t + {0,1} of the 64-column block.
 constexpr int NT = T / 64;
+// Attention grids: (NT x heads, 1, B) with the head index fastest when ATT_HEAD_FASTEST (models/*.h), so every head's
+// longest blocks dispatch first, else (NT, heads, B). att_tile: the block's tile in dispatch order; att_head: its head.
+template <int H> __device__ __forceinline__ int att_tile() { return ATT_HEAD_FASTEST ? blockIdx.x / H : blockIdx.x; }
+template <int H> __device__ __forceinline__ int att_head() { return ATT_HEAD_FASTEST ? blockIdx.x % H : blockIdx.y; }
+inline dim3 att_grid(int heads) { return ATT_HEAD_FASTEST ? dim3(NT * heads, 1, B) : dim3(NT, heads, B); }
 
-// Causal GQA forward. Block = (64 query rows, head, batch), 4 warps x 16 rows; K/V tiles double-buffered. Grid
-// (NT x HEADS, 1, B), head fastest, so every head's longest blocks go first.
+// Causal GQA forward. Block = (64 query rows, head, batch), 4 warps x 16 rows; K/V tiles double-buffered.
 // qkv [N][QKV_DIM] post-RoPE, out [N][DIM], lse [B][HEADS][T].
 __global__ void __launch_bounds__(128) attention_fwd(bf16* out, float* lse, const bf16* qkv) {
-    const int qt = NT - 1 - blockIdx.x / HEADS, h = blockIdx.x % HEADS, b = blockIdx.z;  // longest blocks first
+    const int qt = NT - 1 - att_tile<HEADS>(), h = att_head<HEADS>(), b = blockIdx.z;  // longest blocks first
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / (HEADS / KV_HEADS)) * HEAD_DIM;
@@ -515,12 +519,12 @@ __global__ void __launch_bounds__(128) attention_dsum(float* Dsum, const bf16* o
     if (!(threadIdx.x & 1)) Dsum[lrow + r] = acc;
 }
 
-// dk, dv contributions of query head h0 + blockIdx.y for 64 key rows (4 warps x 16 keys), over all query tiles that
+// dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over all query tiles that
 // see them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). fp32 partials [N][HEADS][dk 64 | dv 64];
-// attention_bwd_finish sums the heads of each kv group. Grid (NT x GROUP, 1, B), head fastest.
+// attention_bwd_finish sums the heads of each kv group.
 __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
                                                          const float* lse, const float* Dsum, int h0) {
-    const int kt = blockIdx.x / GROUP, hg = blockIdx.x % GROUP, h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
+    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
@@ -595,11 +599,10 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     }
 }
 
-// dq (before RoPE backward) for 64 query rows of head h0 + blockIdx.y, written into dqkv's q columns: dq += dS K over
+// dq (before RoPE backward) for 64 query rows of head h0 + att_head, written into dqkv's q columns: dq += dS K over
 // the key tiles kt = 0..qt in order, from the dS^T tiles attention_bwd_dkv stored (A fragments through ldmatrix.trans).
-// Grid (NT x GROUP, 1, B), head fastest.
 __global__ void __launch_bounds__(128) attention_bwd_dq(bf16* dqkv, const bf16* ds, const bf16* qkv, int h0) {
-    const int qt = NT - 1 - blockIdx.x / GROUP, hg = blockIdx.x % GROUP, h = h0 + hg, b = blockIdx.z;  // longest first
+    const int qt = NT - 1 - att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // longest first
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* kg = qkv + (size_t)b * T * QKV_DIM + (HEADS + h / GROUP) * HEAD_DIM;
     __shared__ __align__(128) bf16 dst[2][TILE], ks[2][TILE];
