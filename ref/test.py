@@ -359,6 +359,7 @@ def ref_curve(cfg, tokens, steps, B, T, bf16):
     # backward on the GPU. When fp32 weights, grads and both AdamW moments do not fit the GPU (360M), the AdamW state
     # and its step live on the CPU (fused AdamW, the same update: adamw_check); grads go down and weights come back up
     # every step.
+    torch.cuda.empty_cache()  # the previous reference's cached blocks would otherwise count as used
     model = Model(cfg)
     init_weights(model)
     offload = torch.cuda.mem_get_info()[0] < 1.2 * 16 * sum(p.numel() for p in model.parameters())
@@ -390,7 +391,9 @@ def ref_curve(cfg, tokens, steps, B, T, bf16):
             opt.zero_grad(set_to_none=True)
         losses.append(loss.detach())
     print(f" {'torch-bf16' if bf16 else 'fp32'} reference: {steps} steps{', AdamW state on the CPU' if offload else ''}")
-    return torch.stack(losses).cpu().numpy()
+    out = torch.stack(losses).cpu().numpy()
+    del model, host, opt
+    return out
 
 
 def curve(steps, B=1, T=2048, window=100):
