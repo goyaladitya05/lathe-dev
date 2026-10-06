@@ -87,6 +87,9 @@ def torch_train(args):
     init_weights(model)
     model.cuda()
     opt = make_optimizer(model)
+    if args.fp8:  # torchao float8 training: every nn.Linear (the tied head is F.linear and stays bf16)
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(args.fp8))
     fwd = torch.compile(model, mode="max-autotune") if args.mode == "compile" else model
     tokens = np.memmap(DATA / "train.bin", dtype=np.uint16, mode="r")
     it = iter(range(1 << 62))
@@ -129,8 +132,9 @@ def torch_train(args):
     peak, reserved = torch.cuda.max_memory_allocated() >> 20, torch.cuda.max_memory_reserved() >> 20
     retries = torch.cuda.memory_stats()["num_alloc_retries"]
     print(f"# free at start {free:,} MiB, warmup {warm:.1f}s, last loss {loss.item():.4f}, alloc retries {retries}, runs {[round(r) for r in rates]}")
-    train_row(f"torch {args.mode}", args, rates, f"{peak:,} | {reserved:,} | {pmem:,}", smi.stats,
-              f"torch {torch.__version__}")
+    fp8 = f" (fp8 {args.fp8})" if args.fp8 else ""
+    versions = f"torch {torch.__version__}" + (f", torchao {__import__('torchao').__version__}" if args.fp8 else "")
+    train_row(f"torch {args.mode}{fp8}", args, rates, f"{peak:,} | {reserved:,} | {pmem:,}", smi.stats, versions)
 
 
 def sol(args):
@@ -226,6 +230,7 @@ def main():
     ap.add_argument("--shapes", default="1x2048", help="session mode: comma-separated BxT")
     ap.add_argument("--stacks", default="eager,compile,lathe,tinygrad", help="session mode: stacks to run")
     ap.add_argument("--adam8", action="store_true", help="lathe mode: the 8-bit AdamW state build (make ADAM8=1)")
+    ap.add_argument("--fp8", choices=["rowwise", "tensorwise"], help="eager/compile: torchao float8 training recipe")
     args = ap.parse_args()
     {"sol": sol, "lathe": lathe_train, "tinygrad": tinygrad_train, "session": session}.get(args.mode, torch_train)(args)
 

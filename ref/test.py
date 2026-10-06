@@ -386,7 +386,7 @@ def unit(B, T):
     check("pretrained val loss", loss, 3.5)
 
 
-def ref_curve(cfg, tokens, steps, B, T, bf16):
+def ref_curve(cfg, tokens, steps, B, T, bf16, fp8=None):
     # PyTorch training from the same init on the same batches: autocast bf16 (bf16=True) or fp32, TF32 off, forward and
     # backward on the GPU. When fp32 weights, grads and both AdamW moments do not fit the GPU (360M), the AdamW state
     # and its step live on the CPU (fused AdamW, the same update: adamw_check); grads go down and weights come back up
@@ -403,6 +403,9 @@ def ref_curve(cfg, tokens, steps, B, T, bf16):
             h.data = h.data.pin_memory()
             h.grad = torch.zeros_like(h.data).pin_memory()
     model.cuda()
+    if fp8:  # torchao float8 training (recipe name) on every nn.Linear, under bf16 autocast; the tied head stays bf16
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(fp8))
     model.ckpt = offload or not bf16  # recompute blocks in backward (same numerics) so fp32 and 360M fit
     opt = make_optimizer(host if offload else model)
     losses = []
@@ -422,7 +425,8 @@ def ref_curve(cfg, tokens, steps, B, T, bf16):
             opt.step()
             opt.zero_grad(set_to_none=True)
         losses.append(loss.detach())
-    print(f" {'torch-bf16' if bf16 else 'fp32'} reference: {steps} steps{', AdamW state on the CPU' if offload else ''}")
+    name = f"torch-fp8 {fp8}" if fp8 else "torch-bf16" if bf16 else "fp32"
+    print(f" {name} reference: {steps} steps{', AdamW state on the CPU' if offload else ''}")
     out = torch.stack(losses).cpu().numpy()
     del model, host, opt
     return out
@@ -486,10 +490,33 @@ def state8(steps, B, T, window=100):
     check(f"last 200 steps |mean 8bit - fp32 state|", abs(q8[-200:].mean() - f32[-200:].mean()), CURVE_FINAL_TOL)
 
 
+def fp8ref(steps, B, T, recipe="rowwise", window=100):
+    # PyTorch fp8 reference (torchao float8, `recipe`) against torch-bf16 and fp32 from the same init and batches: the
+    # yardstick for lathe's FP8 mode (BENCH.md "FP8 mode"). Reports the curves; checks the same windowed bounds.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    cfg = Config.load(MODEL)
+    tokens = np.memmap(DATA / "train.bin", dtype=np.uint16, mode="r")
+    f8 = ref_curve(cfg, tokens, steps, B, T, True, recipe)
+    t16, f32 = ref_curve(cfg, tokens, steps, B, T, True), ref_curve(cfg, tokens, steps, B, T, False)
+    np.savetxt(ROOT / f"build/fp8ref_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, f8], 1), delimiter=",",
+               header=f"step,fp32,torch_bf16,torch_fp8_{recipe}", fmt="%.6f")
+    print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'torch-fp8':>9} | mean |bf16-fp32| |fp8-fp32| |fp8-bf16| | mean fp8-fp32")
+    for s0 in range(0, steps, window):
+        w = slice(s0, s0 + window)
+        print(f"{s0:4d}-{min(s0 + window, steps) - 1:<5d} {f32[w].mean():8.4f} {t16[w].mean():10.4f} {f8[w].mean():9.4f} | "
+              f"{np.abs(t16[w] - f32[w]).mean():16.4f} {np.abs(f8[w] - f32[w]).mean():10.4f} {np.abs(f8[w] - t16[w]).mean():10.4f} | "
+              f"{(f8[w] - f32[w]).mean():+13.4f}")
+    bias = lambda c, a, b: abs(c[a:b].mean() - f32[a:b].mean())
+    wins = [(a, a + window) for a in range(0, steps, window)]
+    check(f"torch-fp8 worst {window}-step window |mean - fp32|", max(bias(f8, a, b) for a, b in wins), CURVE_WINDOW_TOL)
+    check(f"torch-fp8 last 200 steps |mean - fp32|", bias(f8, max(0, steps - 200), steps), CURVE_FINAL_TOL)
+
+
 def main():
     global MODEL, ADAM8
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", nargs="?", choices=["unit", "curve", "state8"], default="unit")
+    ap.add_argument("mode", nargs="?", choices=["unit", "curve", "state8", "fp8ref"], default="unit")
     ap.add_argument("--model", default="smol135")
     ap.add_argument("--B", type=int)
     ap.add_argument("--T", type=int)
@@ -501,6 +528,8 @@ def main():
         curve(args.steps, args.B or 1, args.T or 2048)
     elif args.mode == "state8":
         state8(args.steps, args.B or 1, args.T or 2048)
+    elif args.mode == "fp8ref":
+        fp8ref(args.steps, args.B or 1, args.T or 2048)
     else:
         unit(args.B or 2, args.T or 512)
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
