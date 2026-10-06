@@ -499,6 +499,7 @@ def fp8ref(steps, B, T, recipe="rowwise", window=100):
     tokens = np.memmap(DATA / "train.bin", dtype=np.uint16, mode="r")
     f8 = ref_curve(cfg, tokens, steps, B, T, True, recipe)
     t16, f32 = ref_curve(cfg, tokens, steps, B, T, True), ref_curve(cfg, tokens, steps, B, T, False)
+    (ROOT / "build").mkdir(exist_ok=True)
     np.savetxt(ROOT / f"build/fp8ref_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, f8], 1), delimiter=",",
                header=f"step,fp32,torch_bf16,torch_fp8_{recipe}", fmt="%.6f")
     print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'torch-fp8':>9} | mean |bf16-fp32| |fp8-fp32| |fp8-bf16| | mean fp8-fp32")
