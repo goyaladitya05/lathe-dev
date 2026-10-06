@@ -142,7 +142,7 @@ struct Bwd {
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
     bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits)
-    bf16* ds;        // [2][DS_GROUP] bf16 dS tiles of two attention groups, attention_backward (in a.logits)
+    bf16* ds;        // [DS_BUFS][DS_GROUP] bf16 dS tiles of attention groups, attention_backward (in a.logits)
 };
 constexpr int RING = 3;
 
@@ -152,7 +152,9 @@ constexpr int RING = 3;
 // issued after head_dw_adamw) and read by the AdamW passes (side stream, joined into main at the end of backward); ds
 // is written and read by attention_backward (attention streams, forked from main and joined within it). alias_check
 // enforces this issue order on the host whenever a step is issued, eager or captured.
-constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
+// dS buffers the attention groups take turns on: three when three groups' dS fit in L2 (24 MB), else two.
+constexpr int DS_BUFS = std::min(KV_HEADS, (size_t)3 * DS_GROUP * 2 <= (24u << 20) ? 3 : 2);
+constexpr size_t RING_N = RING * P_MAT, DS_N = DS_BUFS * DS_GROUP;
 constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
 static_assert(RING_N * sizeof(bf16) % 256 == 0, "ds stays 256B-aligned behind the ring");
 static bool logits_live, side_open;  // logits between lm_head forward and head_dw_adamw; AdamW passes not yet joined
@@ -441,17 +443,17 @@ static void forward(State& s, const Lins& L, FILE* df) {
 }
 
 // Attention backward of one layer: Dsum, then per attention group (on its own stream, earlier groups at higher
-// priority so later groups fill their tails) dK/dV storing dS and dq as a GEMM over it. Groups alternate between two
-// dS buffers; a group waits until the one two before it has read its buffer.
+// priority so later groups fill their tails) dK/dV storing dS and dq as a GEMM over it. Groups take turns on DS_BUFS
+// dS buffers; a group waits until the one DS_BUFS before it has read its buffer.
 static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, const bf16* qkv, const bf16* out,
                                const bf16* dout, const float* lse) {
     alias_check(!logits_live, "logits aliasing: attention backward writes ds while logits are live");
     attention_dsum<<<dim3(NT, HEADS, B), 128, 0, stream>>>(dsum, out, dout);
     CK(cudaEventRecord(ev_fork, stream));
     for (int k = 0; k < KV_HEADS; k++) {
-        bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
+        bf16* buf = ds + (size_t)(k % DS_BUFS) * DS_GROUP;
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
-        if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
+        if (k >= DS_BUFS) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - DS_BUFS]));
         attention_bwd_dkv<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
         attention_bwd_dq<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
