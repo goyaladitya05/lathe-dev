@@ -328,6 +328,7 @@ __device__ __forceinline__ void gemm_nn_loop(float (&acc)[WM / 16][8][4], const 
 }
 
 constexpr int GBM = 64, GWM = 16, GST = 3;  // fused-GEMM tiles, swept on sm89 (BENCH.md profiles)
+constexpr int DDX_ST = 4;  // down_dx_swiglu's pipeline depth (chisel e074: 4 beats 3; 5+ costs occupancy)
 static_assert(N % GBM == 0 && QKV_DIM % 64 == 0 && FFN % 64 == 0, "whole GEMM tiles");
 
 // qkv = ln1 . Wqkv^T, then RoPE on the q and k heads, rounding to bf16 before and after the rotation (PyTorch's
@@ -372,11 +373,11 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
 // into L2 at the start so they arrive while the GEMM runs (chisel e052).
 __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
     static_assert(GBM / GWM * 32 == 2 * GBM, "one 128-byte line per thread: GBM rows x (64 gate + 64 up columns)");
-    __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
+    __shared__ __align__(128) bf16 sm[DDX_ST * (GBM + 64) * GBK];
     const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
     asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (threadIdx.x >> 1)) * 2 * FFN + (threadIdx.x & 1) * FFN + bn));
     float acc[GWM / 16][8][4] = {};
-    gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
+    gemm_nn_loop<GBM, GWM, DIM, FFN, DDX_ST>(acc, dmo, bm, wd + bn, sm);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
 #pragma unroll
     for (int i = 0; i < GWM / 16; i++)
