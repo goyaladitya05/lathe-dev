@@ -806,7 +806,7 @@ __global__ void adamw_norms(float* p, bf16* pb, const float* gnorm, float* m, fl
     *(float4*)(p + o) = P;
     *(float4*)(m + om) = M;
     *(float4*)(v + om) = V;
-    *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};
+    if (!FP8 || pb) *(uint2*)(pb + o) = {pack2(P.x, P.y), pack2(P.z, P.w)};  // FP8: no bf16 copy of the layers
 }
 
 // dW = dY^T X over the N tokens for a 64 x 64 block of W [OUT][IN] (rows bm.., columns bn..): both operands are
@@ -882,7 +882,7 @@ __global__ void adamw_stream(float* p, float* m, float* v, bf16* pb, const bf16*
         __stcs((float2*)p + i, P);
         __stcs((float2*)m + i, M);
         __stcs((float2*)v + i, V);
-        __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+        if (!FP8 || pb) __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
     }
 }
 
@@ -921,7 +921,7 @@ __global__ void adamw_stream8(float* p, unsigned char* qm, unsigned char* qu, fl
         adamw_update(P.x, M.x, V.x, G.x, bc1, bc2_sqrt);
         adamw_update(P.y, M.y, V.y, G.y, bc1, bc2_sqrt);
         __stcs((float2*)p + i, P);
-        __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
+        if (!FP8 || pb) __stcs((bf162*)pb + i, __floats2bfloat162_rn(P.x, P.y));
         const float2 Un = {sqrtf(V.x), sqrtf(V.y)};
         const float am = warp_max(fmaxf(fabsf(M.x), fabsf(M.y))), au = warp_max(fmaxf(Un.x, Un.y));
         __stcs((unsigned short*)qm + i, float2_to_e4m3x2(M, am));

@@ -133,7 +133,7 @@ struct Acts {
     float* losses;    // [N]
     float* loss;      // [1] mean
     int* io;          // [IO_INTS]
-    unsigned char* x8;  // FP8: [N][X8_COLS] e4m3 GEMM input, one scale per token (scratch)
+    unsigned char* x8;  // FP8: [N][X8_COLS] e4m3 GEMM input, one scale per token (scratch, in logits when it fits)
     float* x8inv;       // FP8: [N] its 1 / scale
     bf16* dact;         // FP8: [N][FFN] down dX output before the SwiGLU backward
     unsigned char *dy8t, *x8t;  // FP8: [X8_COLS][N] e4m3 dY^T and X^T of a dW GEMM, one scale per feature (scratch)
@@ -165,6 +165,12 @@ constexpr int RING = 3;
 // enforces this issue order on the host whenever a step is issued, eager or captured.
 constexpr size_t RING_N = RING * P_MAT, DS_N = std::min(KV_HEADS, 2) * DS_GROUP;
 constexpr bool IN_LOGITS = RING_N + DS_N <= (size_t)N * VOCAB;
+// FP8 scratch (x8 for the forward and dX casts, dy8t and x8t for dW, dact sharing x8t) is used only by the layers'
+// forward (before the lm_head forward writes logits) and their backward (after head_dw_adamw): logits are dead in both,
+// so it goes behind gring and ds when it fits, under the same alias_check.
+constexpr size_t X8_BYTES = (size_t)N * X8_COLS;
+constexpr bool F8_IN_LOGITS = FP8 && IN_LOGITS && 2 * (RING_N + DS_N) + 3 * (X8_BYTES + 256) <= 2 * (size_t)N * VOCAB;
+static_assert(!FP8 || (size_t)N * FFN * 2 <= X8_BYTES, "dact fits in x8t");
 static_assert(RING_N * sizeof(bf16) % 256 == 0, "ds stays 256B-aligned behind the ring");
 static bool logits_live, side_open;  // logits between lm_head forward and head_dw_adamw; AdamW passes not yet joined
 static void alias_check(bool ok, const char* what) {
@@ -173,7 +179,7 @@ static void alias_check(bool ok, const char* what) {
 
 struct State {
     float* master;  // [P_TOTAL] fp32 master weights
-    bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights)
+    bf16* params;   // [P_TOTAL] bf16 working copy (matmul weights); FP8: [P_EMBED]
     float* gnorm;   // [G_NORM] norm weight grads
     float* gemb;    // [P_EMBED] full fp32 embedding grad, dumps only (nullptr otherwise)
     float *m, *v;   // [P_TOTAL] AdamW moments; ADAM8: [P_EMBED], the embedding's only
@@ -208,7 +214,7 @@ struct Arena {
 static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exist only when dumping
     const size_t ND = (size_t)N * DIM;
     s.master = ar.take<float>(P_TOTAL);
-    s.params = ar.take<bf16>(P_TOTAL);
+    s.params = ar.take<bf16>(FP8 ? P_EMBED : P_TOTAL);  // FP8: only the embedding (lm_head); the layers are e4m3
     s.gnorm = ar.take<float>(G_NORM);
     s.gemb = dumping ? ar.take<float>(P_EMBED) : nullptr;
     s.m = ar.take<float>(ADAM8 ? P_EMBED : P_TOTAL);
@@ -227,11 +233,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
         s.w8t = ar.take<unsigned char>(LAYERS * P_MAT);
         s.w8tinv = ar.take<float>(LAYERS * P_COLS);
         s.w8amax = ar.take<float>(FFN);
-        s.a.x8 = ar.take<unsigned char>((size_t)N * X8_COLS);
         s.a.x8inv = ar.take<float>(N);
-        s.a.dact = ar.take<bf16>((size_t)N * FFN);
-        s.a.dy8t = ar.take<unsigned char>((size_t)X8_COLS * N);
-        s.a.x8t = ar.take<unsigned char>((size_t)X8_COLS * N);
         s.a.dy8inv = ar.take<float>(X8_COLS);
         s.a.x8tinv = ar.take<float>(X8_COLS);
         s.a.amax8 = ar.take<float>(X8_COLS);
@@ -268,6 +270,20 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.gemb_rows = ar.take<float>(ND);
     g.gring = IN_LOGITS ? a.logits : ar.take<bf16>(RING_N);
     g.ds = IN_LOGITS ? a.logits + RING_N : ar.take<bf16>(DS_N);
+    if (FP8) {
+        char* p = (char*)(a.logits + RING_N + DS_N);
+        auto take8 = [&]() {
+            if (!F8_IN_LOGITS) return ar.take<unsigned char>(X8_BYTES);
+            p = (char*)(((uintptr_t)p + 255) & ~uintptr_t(255));
+            unsigned char* r = (unsigned char*)p;
+            p += X8_BYTES;
+            return r;
+        };
+        a.x8 = take8();
+        a.dy8t = take8();
+        a.x8t = take8();
+        a.dact = (bf16*)a.x8t;  // read by the SwiGLU backward before the down dW casts write x8t
+    }
 }
 
 // The main stream runs at the highest priority. Beside it: one stream per attention group (attention_backward, earlier
@@ -409,6 +425,7 @@ static void cast_weights8(const State& s, int l, cudaStream_t st) {
 
 // FP8 input grad dx [N][w.cols] = dy [N][w.rows] W of layer l: row-cast dy, e4m3 GEMM on W^T, rescale.
 static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int l, const Mat8& w) {
+    alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
     cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, dy, N, w.rows);
     gemm(s, g, dx, s.w8t + l * P_MAT + w.off, s.a.x8);
     rescale_bf16<<<cdiv((size_t)N * w.cols / 2, 256), 256, 0, stream>>>(dx, s.a.x8inv, s.w8tinv + l * P_COLS + w.coff,
@@ -430,6 +447,7 @@ static void lin8_dw(const State& s, const Gemm& gm, bf16* g, const bf16* dy, con
 
 // FP8 linear y [N][w.rows] = x [N][w.cols] W^T of layer l: row-cast x, e4m3 GEMM, rescale by 1 / (s_x[n] s_w[j]).
 static void lin8(const State& s, const Gemm& g, bf16* y, const bf16* x, int l, const Mat8& w) {
+    alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
     cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, x, N, w.cols);
     gemm(s, g, y, s.w8 + l * P_MAT + w.off, s.a.x8);
     rescale_bf16<<<cdiv((size_t)N * w.rows / 2, 256), 256, 0, stream>>>(y, s.a.x8inv, s.w8inv + l * P_ROWS + w.roff, N,
@@ -580,9 +598,9 @@ static void backward(State& s, const Lins& L, FILE* df) {
         if constexpr (ADAM8) {
             const size_t q = (size_t)l * P_MAT + b;  // index into the 8-bit state
             adamw_stream8<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.qm + q, s.qu + q, s.sm + q / Q8_BLOCK,
-                                                          s.su + q / Q8_BLOCK, s.params + o, gr, s.step, e - b);
+                                                          s.su + q / Q8_BLOCK, FP8 ? nullptr : s.params + o, gr, s.step, e - b);
         } else {
-            adamw_stream<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o, gr, s.step, e - b);
+            adamw_stream<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, FP8 ? nullptr : s.params + o, gr, s.step, e - b);
         }
         if (FP8 && e == P_MAT) cast_weights8(s, l, side);  // next step's e4m3 weights, from the updated master
         side_mark(true);
@@ -701,12 +719,12 @@ static void train_step(State& s, const Lins& L, FILE* df) {
     dump(df, "gemb", s.gemb, 1, 1, P_EMBED);
     dump(df, "gnorm", s.gnorm, 1, 1, G_NORM);
     static_assert(G_NORM % 4 == 0, "adamw_norms works on float4");
-    adamw_norms<ADAM8><<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, s.params, s.gnorm, ADAM8 ? s.mn : s.m,
+    adamw_norms<ADAM8><<<cdiv(G_NORM / 4, 256), 256, 0, stream>>>(s.master, FP8 ? nullptr : s.params, s.gnorm, ADAM8 ? s.mn : s.m,
                                                                   ADAM8 ? s.vn : s.v, s.step);
     mark("AdamW norm weights");
     CK(cudaGetLastError());
     dump(df, "master", s.master, 1, 1, P_TOTAL);
-    dump(df, "params", s.params, 0, 1, P_TOTAL);
+    dump(df, "params", s.params, 0, 1, FP8 ? P_EMBED : P_TOTAL);
     if (ADAM8)
         for (int l : {0, LAYERS - 1}) {  // the 8-bit state after the step, checked byte for byte by ref/test.py
             char nm[48];
@@ -736,7 +754,7 @@ static void load_weights(State& s, const char* path) {
     if (fread(w.data(), 4, P_TOTAL, f) != P_TOTAL || fgetc(f) != EOF) die("weights size mismatch");
     fclose(f);
     CK(cudaMemcpy(s.master, w.data(), P_TOTAL * 4, cudaMemcpyHostToDevice));
-    f32_to_bf16<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, P_TOTAL);
+    f32_to_bf16<<<cdiv(FP8 ? P_EMBED : P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, FP8 ? P_EMBED : P_TOTAL);
     if (FP8)
         for (int l = 0; l < LAYERS; l++) cast_weights8(s, l, stream);
     CK(cudaMemsetAsync(s.m, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
@@ -892,6 +910,7 @@ int main(int argc, char** argv) {
         FILE* df = i == 0 && dump_path ? fopen(dump_path, "wb") : nullptr;
         if (!train) {
             forward(s, L, df);
+            logits_live = false;  // the loss is computed; the next batch's forward may use the dead logits (FP8 scratch)
         } else if (df || eager || STEP_TIMED) {  // dumps synchronize, so this step runs eagerly
 #ifdef STEP_TIMES
             mark_i = side_i = 0;
