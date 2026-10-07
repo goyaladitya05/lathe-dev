@@ -63,7 +63,9 @@ __device__ __forceinline__ float row_rstd(const float2 (&v)[DIM / 64]) {
 }
 
 // One warp per row. x = res (+ branch, written to res_out in fp32), out = bf16(x * r * w). fp32 weight.
-__global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16* branch, const float* w) {
+// FP8: brinv [N], bcinv [DIM] scale the branch (a raw e4m3 GEMM output) by powers of two on the way in.
+__global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16* branch, const float* w,
+                        const float* brinv = nullptr, const float* bcinv = nullptr) {
     int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= N) return;
     const float2* x = (const float2*)(res + (size_t)row * DIM);
@@ -73,6 +75,10 @@ __global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16*
         v[i] = x[lane + 32 * i];
         if (branch) {
             float2 b = __bfloat1622float2(((const bf162*)(branch + (size_t)row * DIM))[lane + 32 * i]);
+            if (FP8 && brinv) {
+                const int c = 2 * (lane + 32 * i);
+                b = {b.x * brinv[row] * bcinv[c], b.y * brinv[row] * bcinv[c + 1]};
+            }
             v[i].x += b.x;
             v[i].y += b.y;
             ((float2*)(res_out + (size_t)row * DIM))[lane + 32 * i] = v[i];
@@ -93,7 +99,8 @@ __global__ void rmsnorm(bf16* out, float* res_out, const float* res, const bf16*
 constexpr int NORM_ROWS = 16;
 static_assert(N % NORM_ROWS == 0, "whole norm blocks");
 __global__ void __launch_bounds__(256) rmsnorm_bwd(float* dres, bf16* dres_bf, float* dw_part, const float* dres_in,
-                                                   const bf16* dy, const float* x, const float* w) {
+                                                   const bf16* dy, const float* x, const float* w,
+                                                   const float* yrinv = nullptr, const float* ycinv = nullptr) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     float2 acc[DIM / 64] = {};
     for (int k = 0; k < NORM_ROWS / 8; k++) {
@@ -104,6 +111,11 @@ __global__ void __launch_bounds__(256) rmsnorm_bwd(float* dres, bf16* dres_bf, f
         for (int i = 0; i < DIM / 64; i++) {
             v[i] = ((const float2*)(x + o))[lane + 32 * i];
             d[i] = __bfloat1622float2(((const bf162*)(dy + o))[lane + 32 * i]);
+            if (FP8 && yrinv) {  // FP8: dy is a raw e4m3 GEMM output
+                const float r = yrinv[o / DIM];
+                const int c = 2 * (lane + 32 * i);
+                d[i] = {d[i].x * r * ycinv[c], d[i].y * r * ycinv[c + 1]};
+            }
             float2 ww = ((const float2*)w)[lane + 32 * i];
             g[i] = {d[i].x * ww.x, d[i].y * ww.y};
             dot += g[i].x * v[i].x + g[i].y * v[i].y;
@@ -667,13 +679,20 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
 }
 
 // act = bf16(bf16(silu(g)) * u), with gu = [N][gate FFN | up FFN]. Two roundings, as PyTorch silu then mul.
-__global__ void swiglu(bf16* act, const bf16* gu) {
+// FP8: rinv [N], cinv [2 * FFN] scale gu (a raw e4m3 GEMM output) on the way in.
+__global__ void swiglu(bf16* act, const bf16* gu, const float* rinv = nullptr, const float* cinv = nullptr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N * FFN / 8) return;
     int n = i / (FFN / 8), c = i % (FFN / 8) * 8;
     float g[8], u[8];
     load8(g, gu + (size_t)n * 2 * FFN + c);
     load8(u, gu + (size_t)n * 2 * FFN + FFN + c);
+    if (FP8 && rinv)
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            g[k] = g[k] * rinv[n] * cinv[c + k];
+            u[k] = u[k] * rinv[n] * cinv[FFN + c + k];
+        }
 #pragma unroll
     for (int k = 0; k < 8; k++) g[k] = round_bf16(g[k] / (1.f + expf(-g[k]))) * u[k];
     store8(act + (size_t)n * FFN + c, g);
@@ -1062,6 +1081,25 @@ __global__ void rescale_bf16(bf16* y, const float* rinv, const float* cinv, int 
     *(bf162*)(y + i) = __floats2bfloat162_rn(v.x * rinv[r] * cinv[c], v.y * rinv[r] * cinv[c + 1]);
 }
 
+// FP8 qkv: scale the raw e4m3 GEMM output by rinv [N] x cinv [QKV_DIM], then RoPE on the q and k heads (as qkv_rope's
+// epilogue), in place, one pass over every head unit.
+__global__ void rescale_rope(bf16* qkv, const float* rinv, const float* cinv, const float2* cs) {
+    constexpr int HALF = HEAD_DIM / 2, U = HEADS + 2 * KV_HEADS;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * U * HALF) return;
+    const int d = i % HALF, u = i / HALF % U, n = i / (HALF * U), c = u * HEAD_DIM + d;
+    bf16* y = qkv + (size_t)n * QKV_DIM + u * HEAD_DIM;
+    const float x1 = __bfloat162float(y[d]) * rinv[n] * cinv[c], x2 = __bfloat162float(y[d + HALF]) * rinv[n] * cinv[c + HALF];
+    if (u < HEADS + KV_HEADS) {
+        const float2 r = cs[n % T * HALF + d];
+        y[d] = __float2bfloat16(x1 * r.x - x2 * r.y);
+        y[d + HALF] = __float2bfloat16(x2 * r.x + x1 * r.y);
+    } else {
+        y[d] = __float2bfloat16(x1);
+        y[d + HALF] = __float2bfloat16(x2);
+    }
+}
+
 // RoPE in place on the q and k heads of qkv [N][QKV_DIM] (bf16 projection output), as qkv_rope's epilogue.
 __global__ void rope_inplace(bf16* qkv, const float2* cs) {
     constexpr int HALF = HEAD_DIM / 2, U = HEADS + KV_HEADS;
@@ -1077,13 +1115,20 @@ __global__ void rope_inplace(bf16* qkv, const float2* cs) {
 
 // SwiGLU backward from dact = bf16(dmo . Wd) [N][FFN] (FP8 mode: the down dX GEMM runs on its own), the same math
 // as down_dx_swiglu's epilogue: ds = bf16(dact * u), du = bf16(dact * s), dg = bf16(ds * silu'(g)), s = bf16(silu(g)).
-__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
+// FP8: gu and dact are raw e4m3 GEMM outputs: gr [N] x gc [2 * FFN] and dr [N] x dc [FFN] scale them on the way in.
+__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu, const float* gr = nullptr,
+                           const float* gc = nullptr, const float* dr = nullptr, const float* dc = nullptr) {
     const size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 2;
     if (i >= (size_t)N * FFN) return;
     const size_t n = i / FFN, c = i % FFN;
-    const float2 da = __bfloat1622float2(*(const bf162*)(dact + i));
-    const float2 gf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + c));
-    const float2 uf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + FFN + c));
+    float2 da = __bfloat1622float2(*(const bf162*)(dact + i));
+    float2 gf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + c));
+    float2 uf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + FFN + c));
+    if (gr) {
+        gf = {gf.x * gr[n] * gc[c], gf.y * gr[n] * gc[c + 1]};
+        uf = {uf.x * gr[n] * gc[FFN + c], uf.y * gr[n] * gc[FFN + c + 1]};
+    }
+    if (dr) da = {da.x * dr[n] * dc[c], da.y * dr[n] * dc[c + 1]};
     const float dav[2] = {da.x, da.y}, gv[2] = {gf.x, gf.y}, uv[2] = {uf.x, uf.y};
     float dg[2], du[2];
 #pragma unroll

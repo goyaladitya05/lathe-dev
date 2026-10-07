@@ -136,6 +136,7 @@ struct Acts {
     unsigned char* x8;  // FP8: [N][X8_COLS] e4m3 GEMM input, one scale per token (scratch, in logits when it fits)
     float* x8inv;       // FP8: [N] its 1 / scale
     bf16* dact;         // FP8: [N][FFN] down dX output before the SwiGLU backward
+    float* gr8;         // FP8: [LAYERS][N] row factors of the raw gate|up output (the forward and backward SwiGLU)
     unsigned char *dy8t, *x8t;  // FP8: [X8_COLS][N] e4m3 dY^T and X^T of a dW GEMM, one scale per feature (scratch)
     float *dy8inv, *x8tinv, *amax8;  // FP8: [X8_COLS] their 1 / scale, and column amax scratch
 };
@@ -234,6 +235,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
         s.w8tinv = ar.take<float>(LAYERS * P_COLS);
         s.w8amax = ar.take<float>(X8_COLS + FFN);
         s.a.x8inv = ar.take<float>(N);
+        s.a.gr8 = ar.take<float>((size_t)LAYERS * N);
         s.a.dy8inv = ar.take<float>(X8_COLS);
         s.a.x8tinv = ar.take<float>(X8_COLS);
         s.a.amax8 = ar.take<float>(X8_COLS);
@@ -426,12 +428,14 @@ static void cast_weights8(const State& s, int l, cudaStream_t st) {
 }
 
 // FP8 input grad dx [N][w.cols] = dy [N][w.rows] W of layer l: row-cast dy, e4m3 GEMM on W^T, rescale.
-static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int l, const Mat8& w) {
+// raw: leave dx unscaled for the consumer to scale by x8inv [N] x w8tinv (folded into it).
+static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int l, const Mat8& w, bool raw = false) {
     alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
     cast_rows8_e4m3<<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, dy, N, w.rows);
     gemm(s, g, dx, s.w8t + l * P_MAT + w.off, s.a.x8);
-    rescale_bf16<<<cdiv((size_t)N * w.cols / 2, 256), 256, 0, stream>>>(dx, s.a.x8inv, s.w8tinv + l * P_COLS + w.coff,
-                                                                         N, w.cols);
+    if (!raw)
+        rescale_bf16<<<cdiv((size_t)N * w.cols / 2, 256), 256, 0, stream>>>(dx, s.a.x8inv, s.w8tinv + l * P_COLS + w.coff,
+                                                                             N, w.cols);
 }
 
 // FP8 weight grad dW [w.rows][w.cols] = dy^T x (reduction over the N tokens) into g: transposing column casts of dy
@@ -450,12 +454,16 @@ static void lin8_dw(const State& s, const Gemm& gm, bf16* g, const bf16* dy, con
 }
 
 // FP8 linear y [N][w.rows] = x [N][w.cols] W^T of layer l: row-cast x, e4m3 GEMM, rescale by 1 / (s_x[n] s_w[j]).
-static void lin8(const State& s, const Gemm& g, bf16* y, const bf16* x, int l, const Mat8& w) {
+// raw: leave y unscaled for the consumer to scale by xinv [N] x w8inv (folded into it); xinv defaults to x8inv.
+static void lin8(const State& s, const Gemm& g, bf16* y, const bf16* x, int l, const Mat8& w, bool raw = false,
+                 float* xinv = nullptr) {
     alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
-    cast_rows8_e4m3<<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, x, N, w.cols);
+    xinv = xinv ? xinv : s.a.x8inv;
+    cast_rows8_e4m3<<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, xinv, x, N, w.cols);
     gemm(s, g, y, s.w8 + l * P_MAT + w.off, s.a.x8);
-    rescale_bf16<<<cdiv((size_t)N * w.rows / 2, 256), 256, 0, stream>>>(y, s.a.x8inv, s.w8inv + l * P_ROWS + w.roff, N,
-                                                                         w.rows);
+    if (!raw)
+        rescale_bf16<<<cdiv((size_t)N * w.rows / 2, 256), 256, 0, stream>>>(y, xinv, s.w8inv + l * P_ROWS + w.roff, N,
+                                                                             w.rows);
 }
 
 // Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32, 3 u8), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
@@ -509,8 +517,9 @@ static void forward(State& s, const Lins& L, FILE* df) {
         put("ln1", ln1, 0, DIM);
         if constexpr (FP8) cast_weights8(s, l, stream);  // this step's e4m3 W and W^T of the layer, from the master
         if constexpr (FP8) {
-            lin8(s, L.qkv8, qkv, ln1, l, M8_QKV);
-            rope_inplace<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
+            lin8(s, L.qkv8, qkv, ln1, l, M8_QKV, true);
+            rescale_rope<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(
+                qkv, a.x8inv, s.w8inv + l * P_ROWS + M8_QKV.roff, s.rope);
         } else {
             qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
         }
@@ -519,28 +528,33 @@ static void forward(State& s, const Lins& L, FILE* df) {
         attention_fwd<<<att_grid(HEADS), 128, 0, stream>>>(att, lse, qkv);
         mark("fwd attention");
         put("att", att, 0, DIM);
-        if constexpr (FP8) lin8(s, L.o8, a.branch, att, l, M8_O);
+        // FP8: raw outputs (unless dumping) whose power-of-two factors the next kernel applies
+        const bool raw = FP8 && !df;
+        if constexpr (FP8) lin8(s, L.o8, a.branch, att, l, M8_O, raw);
         else gemm(s, L.o, a.branch, w.o, att);
         mark("fwd o GEMM");
         put("ao", a.branch, 0, DIM);
-        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2);
+        rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2, raw ? a.x8inv : nullptr,
+                                                raw ? s.w8inv + l * P_ROWS + M8_O.roff : nullptr);
         mark("fwd rmsnorm");
         put("res_mid", res_mid, 1, DIM);
         put("ln2", ln2, 0, DIM);
-        if constexpr (FP8) lin8(s, L.gu8, gu, ln2, l, M8_GU);
+        if constexpr (FP8) lin8(s, L.gu8, gu, ln2, l, M8_GU, raw, a.gr8 + (size_t)l * N);
         else gemm(s, L.gu, gu, w.gu, ln2);
         mark("fwd gate_up GEMM");
         put("gu", gu, 0, 2 * FFN);
-        swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu);
+        swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu, raw ? a.gr8 + (size_t)l * N : nullptr,
+                                                           raw ? s.w8inv + l * P_ROWS + M8_GU.roff : nullptr);
         mark("fwd swiglu");
         put("act", act, 0, FFN);
-        if constexpr (FP8) lin8(s, L.down8, a.branch, act, l, M8_DOWN);
+        if constexpr (FP8) lin8(s, L.down8, a.branch, act, l, M8_DOWN, raw);
         else gemm(s, L.down, a.branch, w.down, act);
         mark("fwd down GEMM");
         put("mo", a.branch, 0, DIM);
         // Next layer's input norm, or the final norm.
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(last ? a.lnf : a.ln1 + (l + 1) * ND, res + ND, res_mid, a.branch,
-                                                last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1);
+                                                last ? s.master + P_TOTAL - DIM : layer(s.master, l + 1).ln1,
+                                                raw ? a.x8inv : nullptr, raw ? s.w8inv + l * P_ROWS + M8_DOWN.roff : nullptr);
         mark("fwd rmsnorm");
         put("res_out", res + ND, 1, DIM);
     }
@@ -642,8 +656,10 @@ static void backward(State& s, const Lins& L, FILE* df) {
         put("dres_out", g.dres, 1, DIM);
         at(0);
         if constexpr (FP8) {
-            lin8_dx(s, L.down8_dx, a.dact, g.dres_bf, l, M8_DOWN);
-            swiglu_bwd<<<cdiv((size_t)N * FFN / 2, 256), 256, 0, stream>>>(g.dgu, a.dact, gu);
+            lin8_dx(s, L.down8_dx, a.dact, g.dres_bf, l, M8_DOWN, true);
+            swiglu_bwd<<<cdiv((size_t)N * FFN / 2, 256), 256, 0, stream>>>(
+                g.dgu, a.dact, gu, df ? nullptr : a.gr8 + (size_t)l * N, s.w8inv + l * P_ROWS + M8_GU.roff, a.x8inv,
+                s.w8tinv + l * P_COLS + M8_DOWN.coff);
         } else {
             down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
         }
@@ -655,7 +671,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd down dW");
         put("dgu", g.dgu, 0, 2 * FFN);
         at(2);
-        if constexpr (FP8) lin8_dx(s, L.gu8_dx, g.dln, g.dgu, l, M8_GU);
+        const bool raw = FP8 && !df;  // FP8: dln stays raw until the RMSNorm backward (unless dumping)
+        if constexpr (FP8) lin8_dx(s, L.gu8_dx, g.dln, g.dgu, l, M8_GU, raw);
         else gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM");
         at(3);
@@ -663,7 +680,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         else dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
         mark("bwd gate_up dW");
         put("dln2", g.dln, 0, DIM);
-        rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
+        rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2,
+                                                    raw ? a.x8inv : nullptr, raw ? s.w8tinv + l * P_COLS + M8_GU.coff : nullptr);
         mark("bwd rmsnorm");
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln + DIM, g.dw_part);
         mark("bwd norm weight colsum");
@@ -685,7 +703,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd attention finish");
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         at(7);
-        if constexpr (FP8) lin8_dx(s, L.qkv8_dx, g.dln, g.dqkv, l, M8_QKV);
+        if constexpr (FP8) lin8_dx(s, L.qkv8_dx, g.dln, g.dqkv, l, M8_QKV, raw);
         else gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
         mark("bwd qkv dX GEMM");
         at(8);
@@ -698,7 +716,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         if (l == 0) adamw_pass(0, 0, ADAMW_SPLIT_LAST ? P_QKV : P_MAT);
         put("dln1", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, l ? g.dres_bf : nullptr, g.dw_part, g.dres, g.dln, res,
-                                                    wf.ln1);
+                                                    wf.ln1, raw ? a.x8inv : nullptr,
+                                                    raw ? s.w8tinv + l * P_COLS + M8_QKV.coff : nullptr);
         mark("bwd rmsnorm");
         colsum<<<DIM / 32, dim3(32, 8), 0, stream>>>(gln, g.dw_part);
         mark("bwd norm weight colsum");
