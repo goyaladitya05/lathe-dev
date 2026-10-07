@@ -610,7 +610,8 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
 static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
 // 8-bit state builds have their own start and width (the pass moves 16.25 instead of 28 bytes per parameter).
 #ifndef PASS_AT_OVERRIDE  // -DPASS_AT_OVERRIDE=k -DPASS_BLOCKS_OVERRIDE=b for schedule sweeps
-constexpr int PASS_AT = ADAM8 ? ADAMW_AT8 : ADAMW_AT, PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
+constexpr int PASS_AT = FP8 ? ADAMW_AT_FP8 : ADAM8 ? ADAMW_AT8 : ADAMW_AT;
+constexpr int PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
 #else
 constexpr int PASS_AT = PASS_AT_OVERRIDE, PASS_BLOCKS = PASS_BLOCKS_OVERRIDE;
 #endif

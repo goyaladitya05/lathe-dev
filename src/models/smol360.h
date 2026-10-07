@@ -26,5 +26,7 @@ constexpr int ADAMW_AT8 = ADAMW_AT;
 // 8-bit pass width by tokens per step (chisel e066, 8-bit at 1xT): 16 blocks +1.4% over 14 at 704, even at 1536, 14 +0.7-0.9%
 // over 16 at 2304.
 constexpr int ADAMW_BLOCKS8 = BATCH * SEQ <= 1536 ? 16 : 14;
+// FP8=1 builds: AdamW pass start (beside the FP8 gate_up dX GEMM); width as ADAMW_BLOCKS8 / ADAMW_BLOCKS.
+constexpr int ADAMW_AT_FP8 = 2;
 // Attention grids with the head index fastest (kernels.cuh att_grid): -0.22% at 1x704 (chisel e059).
 constexpr bool ATT_HEAD_FASTEST = false;

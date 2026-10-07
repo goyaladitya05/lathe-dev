@@ -24,5 +24,7 @@ constexpr bool ADAMW_SPLIT_LAST = false;
 // ADAM8=1 builds (8-bit moments): the same schedule until tuned.
 constexpr int ADAMW_AT8 = ADAMW_AT;
 constexpr int ADAMW_BLOCKS8 = ADAMW_BLOCKS;
+// FP8=1 builds: AdamW pass start (untuned: the fp32 schedule's start); width as ADAMW_BLOCKS8 / ADAMW_BLOCKS.
+constexpr int ADAMW_AT_FP8 = 2;
 // Attention grids with the head index fastest (kernels.cuh att_grid): +0.74% at 1x2048, +0.17% at 4x512 (chisel e059).
 constexpr bool ATT_HEAD_FASTEST = true;
