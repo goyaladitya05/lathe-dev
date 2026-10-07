@@ -293,6 +293,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
 // main stream inside a step, so a step is still one captured graph.
 static cudaStream_t stream, side, att_stream[KV_HEADS];
 static cudaEvent_t ev_fork, ev_join, ev_ring[RING], ev_att[KV_HEADS];
+static cudaEvent_t ev_w8[LAYERS];  // FP8: layer l's e4m3 weights are cast (side stream, during the forward)
 static cublasLtHandle_t lt;
 #ifdef HAVE_CHISEL_DW
 static CUfunction chisel_dw[4];
@@ -499,6 +500,14 @@ static void forward(State& s, const Lins& L, FILE* df) {
     const size_t ND = (size_t)N * DIM;
     const int* tokens = a.io;
     embed<<<cdiv(N * DIM / 4, 256), 256, 0, stream>>>(a.res, tokens, s.master);
+    if constexpr (FP8) {  // every layer's e4m3 W and W^T from the master, on the side stream (idle in the forward),
+        CK(cudaEventRecord(ev_fork, stream));  // beside the compute-bound forward GEMMs; joined with the AdamW passes
+        CK(cudaStreamWaitEvent(side, ev_fork));
+        for (int l = 0; l < LAYERS; l++) {
+            cast_weights8(s, l, side);
+            CK(cudaEventRecord(ev_w8[l], side));
+        }
+    }
     mark("fwd embedding");
     rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(a.ln1, nullptr, a.res, nullptr, layer(s.master, 0).ln1);
     mark("fwd rmsnorm");
@@ -515,7 +524,7 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
-        if constexpr (FP8) cast_weights8(s, l, stream);  // this step's e4m3 W and W^T of the layer, from the master
+        if constexpr (FP8) CK(cudaStreamWaitEvent(stream, ev_w8[l]));  // this layer's e4m3 weights are ready
         if constexpr (FP8) {
             lin8(s, L.qkv8, qkv, ln1, l, M8_QKV, true);
             rescale_rope<<<cdiv(N * (HEADS + 2 * KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(
@@ -600,7 +609,11 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
 // the pass of the layer RING above.
 static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
 // 8-bit state builds have their own start and width (the pass moves 16.25 instead of 28 bytes per parameter).
+#ifndef PASS_AT_OVERRIDE  // -DPASS_AT_OVERRIDE=k -DPASS_BLOCKS_OVERRIDE=b for schedule sweeps
 constexpr int PASS_AT = ADAM8 ? ADAMW_AT8 : ADAMW_AT, PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
+#else
+constexpr int PASS_AT = PASS_AT_OVERRIDE, PASS_BLOCKS = PASS_BLOCKS_OVERRIDE;
+#endif
 static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see models/*.h");
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
@@ -870,6 +883,8 @@ int main(int argc, char** argv) {
     for (auto& e : ev_ring) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
+    if (FP8)
+        for (auto& e : ev_w8) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CKB(cublasLtCreate(&lt));
 #ifdef HAVE_CHISEL_DW
     {  // after the runtime made the context current
