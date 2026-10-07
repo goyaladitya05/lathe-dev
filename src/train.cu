@@ -50,6 +50,8 @@ constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
 #define FP8 0  // 1 (make FP8=1): the layer linears in e4m3 with power-of-two row scales (BENCH.md "FP8 mode")
 #endif
 constexpr size_t P_ROWS = QKV_DIM + DIM + 2 * FFN + DIM;  // output rows of a layer's four matrices (FP8 scales)
+constexpr size_t P_COLS = DIM + DIM + DIM + FFN;          // and their input columns
+constexpr int X8_COLS = 2 * FFN > QKV_DIM ? 2 * FFN : QKV_DIM;  // widest e4m3 GEMM operand row (FP8)
 #ifndef ADAM8
 #define ADAM8 0  // 1 (make ADAM8=1): 8-bit AdamW moments for the layer matrices (adamw_stream8, BENCH.md)
 #endif
@@ -131,8 +133,9 @@ struct Acts {
     float* losses;    // [N]
     float* loss;      // [1] mean
     int* io;          // [IO_INTS]
-    unsigned char* x8;  // FP8: [N][FFN] e4m3 GEMM input, one scale per token (scratch)
+    unsigned char* x8;  // FP8: [N][X8_COLS] e4m3 GEMM input, one scale per token (scratch)
     float* x8inv;       // FP8: [N] its 1 / scale
+    bf16* dact;         // FP8: [N][FFN] down dX output before the SwiGLU backward
 };
 
 // Backward scratch, reused by every layer.
@@ -176,6 +179,9 @@ struct State {
     unsigned char *qm, *qu;  // ADAM8: [LAYERS][P_MAT] E4M3 codes of the layer matrices' m and sqrt(v)
     unsigned char* w8;       // FP8: [LAYERS][P_MAT] e4m3 layer matrices, one scale per output row
     float* w8inv;            // FP8: [LAYERS][P_ROWS] their 1 / scale
+    unsigned char* w8t;      // FP8: [LAYERS][P_MAT] the transposed matrices W^T [in][out], one scale per input feature
+    float* w8tinv;           // FP8: [LAYERS][P_COLS] their 1 / scale
+    float* w8amax;           // FP8: [FFN] column amax scratch of the weight casts (side stream)
     float *sm, *su;          // ADAM8: [LAYERS][P_MAT / Q8_BLOCK] their block scales
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
@@ -216,8 +222,12 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     if (FP8) {
         s.w8 = ar.take<unsigned char>(LAYERS * P_MAT);
         s.w8inv = ar.take<float>(LAYERS * P_ROWS);
-        s.a.x8 = ar.take<unsigned char>((size_t)N * FFN);
+        s.w8t = ar.take<unsigned char>(LAYERS * P_MAT);
+        s.w8tinv = ar.take<float>(LAYERS * P_COLS);
+        s.w8amax = ar.take<float>(FFN);
+        s.a.x8 = ar.take<unsigned char>((size_t)N * X8_COLS);
         s.a.x8inv = ar.take<float>(N);
+        s.a.dact = ar.take<bf16>((size_t)N * FFN);
     }
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
     s.step = ar.take<float>(1);
@@ -340,6 +350,7 @@ static void gemm(const State& s, const Gemm& g, void* d, const void* a, const vo
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
 static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
 static Gemm make_fwd8(int out, int in) { return make_gemm(true, out, N, in, CUDA_R_8F_E4M3); }  // both K-major (TN)
+static Gemm make_dx8(int out, int in) { return make_gemm(true, in, N, out, CUDA_R_8F_E4M3); }    // A = W^T [in][out]
 
 // dW[out][in] = dy^T x rounded to bf16 into g, on the main stream.
 enum { DW_QKV, DW_O, DW_GU, DW_DOWN };
@@ -361,23 +372,38 @@ struct Lins {
     Gemm o, gu, down, head;             // forward
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
     Gemm qkv8, o8, gu8, down8;          // FP8: forward of the layer linears
+    Gemm qkv8_dx, o8_dx, gu8_dx, down8_dx;  // FP8: their input grads
 };
 
 // FP8: the four matrices of a layer: offset in the layer, rows (outputs), columns (inputs), offset of their row scales.
 struct Mat8 {
     size_t off;
     int rows, cols;
-    size_t roff;
+    size_t roff, coff;  // offsets of its row scales in w8inv, column scales in w8tinv
 };
-constexpr Mat8 M8_QKV{0, QKV_DIM, DIM, 0}, M8_O{P_QKV, DIM, DIM, QKV_DIM},
-    M8_GU{P_QKV + P_O, 2 * FFN, DIM, QKV_DIM + DIM}, M8_DOWN{P_QKV + P_O + P_GU, DIM, FFN, QKV_DIM + DIM + 2 * FFN};
+constexpr Mat8 M8_QKV{0, QKV_DIM, DIM, 0, 0}, M8_O{P_QKV, DIM, DIM, QKV_DIM, DIM},
+    M8_GU{P_QKV + P_O, 2 * FFN, DIM, QKV_DIM + DIM, 2 * DIM},
+    M8_DOWN{P_QKV + P_O + P_GU, DIM, FFN, QKV_DIM + DIM + 2 * FFN, 3 * DIM};
 static_assert(!FP8 || !ADAMW_SPLIT_LAST, "FP8 recasts a layer's weights after its whole AdamW pass");
 
 // FP8: the e4m3 copies of layer l's matrices from the fp32 master (after AdamW updated them), on stream st.
 static void cast_weights8(const State& s, int l, cudaStream_t st) {
-    for (const Mat8& w : {M8_QKV, M8_O, M8_GU, M8_DOWN})
-        cast_rows_e4m3<float><<<cdiv(w.rows, 8), 256, 0, st>>>(s.w8 + l * P_MAT + w.off, s.w8inv + l * P_ROWS + w.roff,
-                                                                s.master + P_EMBED + l * P_LAYER + w.off, w.rows, w.cols);
+    for (const Mat8& w : {M8_QKV, M8_O, M8_GU, M8_DOWN}) {
+        const float* m = s.master + P_EMBED + l * P_LAYER + w.off;
+        cast_rows_e4m3<float><<<cdiv(w.rows, 8), 256, 0, st>>>(s.w8 + l * P_MAT + w.off, s.w8inv + l * P_ROWS + w.roff, m,
+                                                                w.rows, w.cols);
+        col_amax<float><<<cdiv(w.cols, 32), dim3(32, 8), 0, st>>>(s.w8amax, m, w.rows, w.cols);
+        cast_cols_t_e4m3<float><<<dim3(w.cols / 32, w.rows / 32), dim3(32, 8), 0, st>>>(
+            s.w8t + l * P_MAT + w.off, s.w8tinv + l * P_COLS + w.coff, m, s.w8amax, w.rows, w.cols);
+    }
+}
+
+// FP8 input grad dx [N][w.cols] = dy [N][w.rows] W of layer l: row-cast dy, e4m3 GEMM on W^T, rescale.
+static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int l, const Mat8& w) {
+    cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, dy, N, w.rows);
+    gemm(s, g, dx, s.w8t + l * P_MAT + w.off, s.a.x8);
+    rescale_bf16<<<cdiv((size_t)N * w.cols / 2, 256), 256, 0, stream>>>(dx, s.a.x8inv, s.w8tinv + l * P_COLS + w.coff,
+                                                                         N, w.cols);
 }
 
 // FP8 linear y [N][w.rows] = x [N][w.cols] W^T of layer l: row-cast x, e4m3 GEMM, rescale by 1 / (s_x[n] s_w[j]).
@@ -571,7 +597,12 @@ static void backward(State& s, const Lins& L, FILE* df) {
 
         put("dres_out", g.dres, 1, DIM);
         at(0);
-        down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        if constexpr (FP8) {
+            lin8_dx(s, L.down8_dx, a.dact, g.dres_bf, l, M8_DOWN);
+            swiglu_bwd<<<cdiv((size_t)N * FFN / 2, 256), 256, 0, stream>>>(g.dgu, a.dact, gu);
+        } else {
+            down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        }
         mark("bwd down dX GEMM + SwiGLU bwd");
         if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
         at(1);
@@ -579,7 +610,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd down dW");
         put("dgu", g.dgu, 0, 2 * FFN);
         at(2);
-        gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
+        if constexpr (FP8) lin8_dx(s, L.gu8_dx, g.dln, g.dgu, l, M8_GU);
+        else gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM");
         at(3);
         dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
@@ -591,7 +623,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd norm weight colsum");
         put("dres_mid", g.dres, 1, DIM);
         at(4);
-        gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
+        if constexpr (FP8) lin8_dx(s, L.o8_dx, g.datt, g.dres_bf, l, M8_O);
+        else gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
         mark("bwd o dX GEMM");
         at(5);
         dw_core<DW_O, DIM, DIM>(gl + P_QKV, g.dres_bf, att);
@@ -605,7 +638,8 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd attention finish");
         put("dqkv_pre", g.dqkv, 0, QKV_DIM);
         at(7);
-        gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
+        if constexpr (FP8) lin8_dx(s, L.qkv8_dx, g.dln, g.dqkv, l, M8_QKV);
+        else gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
         mark("bwd qkv dX GEMM");
         at(8);
         dw_core<DW_QKV, QKV_DIM, DIM>(gl, g.dqkv, ln1);
@@ -793,14 +827,16 @@ int main(int argc, char** argv) {
     carve(ar, s, dump_path != nullptr);
     printf("B=%d T=%d params=%zu arena=%.1f MiB adamw_state=%s\n", B, T, P_TOTAL, arena_bytes / 1048576.0,
            ADAM8 ? "8bit" : "fp32");
-    if (FP8) printf("gemms=fp8 (layer linears, forward)\n");
+    if (FP8) printf("gemms=fp8 (layer linears, forward and dX)\n");
 
     load_weights(s, weights);
     init_rope(s);
     const Lins L = {make_fwd(DIM, DIM),     make_fwd(2 * FFN, DIM), make_fwd(DIM, FFN),     make_fwd(VOCAB, DIM),
                     make_dx(QKV_DIM, DIM), make_dx(DIM, DIM),       make_dx(2 * FFN, DIM), make_dx(VOCAB, DIM),
                     FP8 ? make_fwd8(QKV_DIM, DIM) : Gemm{}, FP8 ? make_fwd8(DIM, DIM) : Gemm{},
-                    FP8 ? make_fwd8(2 * FFN, DIM) : Gemm{}, FP8 ? make_fwd8(DIM, FFN) : Gemm{}};
+                    FP8 ? make_fwd8(2 * FFN, DIM) : Gemm{}, FP8 ? make_fwd8(DIM, FFN) : Gemm{},
+                    FP8 ? make_dx8(QKV_DIM, DIM) : Gemm{},  FP8 ? make_dx8(DIM, DIM) : Gemm{},
+                    FP8 ? make_dx8(2 * FFN, DIM) : Gemm{},  FP8 ? make_dx8(DIM, FFN) : Gemm{}};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;

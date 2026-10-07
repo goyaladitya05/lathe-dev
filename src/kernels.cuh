@@ -1014,6 +1014,27 @@ __global__ void rope_inplace(bf16* qkv, const float2* cs) {
     y[d + HALF] = __float2bfloat16(x2 * c.x + x1 * c.y);
 }
 
+// SwiGLU backward from dact = bf16(dmo . Wd) [N][FFN] (FP8 mode: the down dX GEMM runs on its own), the same math
+// as down_dx_swiglu's epilogue: ds = bf16(dact * u), du = bf16(dact * s), dg = bf16(ds * silu'(g)), s = bf16(silu(g)).
+__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
+    const size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 2;
+    if (i >= (size_t)N * FFN) return;
+    const size_t n = i / FFN, c = i % FFN;
+    const float2 da = __bfloat1622float2(*(const bf162*)(dact + i));
+    const float2 gf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + c));
+    const float2 uf = __bfloat1622float2(*(const bf162*)(gu + n * 2 * FFN + FFN + c));
+    const float dav[2] = {da.x, da.y}, gv[2] = {gf.x, gf.y}, uv[2] = {uf.x, uf.y};
+    float dg[2], du[2];
+#pragma unroll
+    for (int e = 0; e < 2; e++) {
+        const float sig = 1.f / (1.f + expf(-gv[e]));
+        du[e] = dav[e] * round_bf16(gv[e] / (1.f + expf(-gv[e])));
+        dg[e] = round_bf16(dav[e] * uv[e]) * sig * (1.f + gv[e] * (1.f - sig));
+    }
+    *(bf162*)(dgu + n * 2 * FFN + c) = __floats2bfloat162_rn(dg[0], dg[1]);
+    *(bf162*)(dgu + n * 2 * FFN + FFN + c) = __floats2bfloat162_rn(du[0], du[1]);
+}
+
 // lm_head dW (tied embedding) with AdamW fused into the epilogue: the grad, rounded to bf16 like PyTorch's dW, updates
 // master, moments and the bf16 copy in place while other blocks are still multiplying. Rows whose token is in the
 // batch (segmap[row] = its segment, else -1) also get the lookup grad later, so their bf16-rounded head grad goes to
