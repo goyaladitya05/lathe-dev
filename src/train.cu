@@ -46,6 +46,10 @@ static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 ==
 // backward); most embedding rows never leave the lm_head dW GEMM, which applies AdamW directly. Norm weight grads are
 // fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
 constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
+#ifndef FP8
+#define FP8 0  // 1 (make FP8=1): the layer linears in e4m3 with power-of-two row scales (BENCH.md "FP8 mode")
+#endif
+constexpr size_t P_ROWS = QKV_DIM + DIM + 2 * FFN + DIM;  // output rows of a layer's four matrices (FP8 scales)
 #ifndef ADAM8
 #define ADAM8 0  // 1 (make ADAM8=1): 8-bit AdamW moments for the layer matrices (adamw_stream8, BENCH.md)
 #endif
@@ -127,6 +131,8 @@ struct Acts {
     float* losses;    // [N]
     float* loss;      // [1] mean
     int* io;          // [IO_INTS]
+    unsigned char* x8;  // FP8: [N][FFN] e4m3 GEMM input, one scale per token (scratch)
+    float* x8inv;       // FP8: [N] its 1 / scale
 };
 
 // Backward scratch, reused by every layer.
@@ -168,6 +174,8 @@ struct State {
     float *m, *v;   // [P_TOTAL] AdamW moments; ADAM8: [P_EMBED], the embedding's only
     float *mn, *vn;  // ADAM8: [G_NORM] the norm weights' moments (fp32 mode: inside m, v)
     unsigned char *qm, *qu;  // ADAM8: [LAYERS][P_MAT] E4M3 codes of the layer matrices' m and sqrt(v)
+    unsigned char* w8;       // FP8: [LAYERS][P_MAT] e4m3 layer matrices, one scale per output row
+    float* w8inv;            // FP8: [LAYERS][P_ROWS] their 1 / scale
     float *sm, *su;          // ADAM8: [LAYERS][P_MAT / Q8_BLOCK] their block scales
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
@@ -204,6 +212,12 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
         s.qu = ar.take<unsigned char>(LAYERS * P_MAT);
         s.sm = ar.take<float>(LAYERS * P_MAT / Q8_BLOCK);
         s.su = ar.take<float>(LAYERS * P_MAT / Q8_BLOCK);
+    }
+    if (FP8) {
+        s.w8 = ar.take<unsigned char>(LAYERS * P_MAT);
+        s.w8inv = ar.take<float>(LAYERS * P_ROWS);
+        s.a.x8 = ar.take<unsigned char>((size_t)N * FFN);
+        s.a.x8inv = ar.take<float>(N);
     }
     s.rope = ar.take<float2>(T * HEAD_DIM / 2);
     s.step = ar.take<float>(1);
@@ -292,13 +306,13 @@ struct Gemm {
     cublasLtMatmulAlgo_t algo;
 };
 
-static Gemm make_gemm(bool ta, int m, int n, int k) {
+static Gemm make_gemm(bool ta, int m, int n, int k, cudaDataType_t ab = CUDA_R_16BF) {
     Gemm g;
     CKB(cublasLtMatmulDescCreate(&g.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     const cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opa, sizeof(opa)));
-    CKB(cublasLtMatrixLayoutCreate(&g.a, CUDA_R_16BF, ta ? k : m, ta ? m : k, ta ? k : m));
-    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, k, n, k));
+    CKB(cublasLtMatrixLayoutCreate(&g.a, ab, ta ? k : m, ta ? m : k, ta ? k : m));
+    CKB(cublasLtMatrixLayoutCreate(&g.b, ab, k, n, k));
     CKB(cublasLtMatrixLayoutCreate(&g.d, CUDA_R_16BF, m, n, m));
     cublasLtMatmulPreference_t pref;
     CKB(cublasLtMatmulPreferenceCreate(&pref));
@@ -315,7 +329,7 @@ static Gemm make_gemm(bool ta, int m, int n, int k) {
     return g;
 }
 
-static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf16* b) {
+static void gemm(const State& s, const Gemm& g, void* d, const void* a, const void* b) {
     const float one = 1.f, zero = 0.f;
     CKB(cublasLtMatmul(lt, g.desc, &one, a, g.a, b, g.b, &zero, d, g.d, d, g.d, &g.algo, s.workspace,
                        CUBLAS_WORKSPACE, stream));
@@ -325,6 +339,7 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 // the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw).
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
 static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
+static Gemm make_fwd8(int out, int in) { return make_gemm(true, out, N, in, CUDA_R_8F_E4M3); }  // both K-major (TN)
 
 // dW[out][in] = dy^T x rounded to bf16 into g, on the main stream.
 enum { DW_QKV, DW_O, DW_GU, DW_DOWN };
@@ -345,7 +360,33 @@ static Gemm make_dx(int out, int in) { return make_gemm(false, in, N, out); }
 struct Lins {
     Gemm o, gu, down, head;             // forward
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
+    Gemm qkv8, o8, gu8, down8;          // FP8: forward of the layer linears
 };
+
+// FP8: the four matrices of a layer: offset in the layer, rows (outputs), columns (inputs), offset of their row scales.
+struct Mat8 {
+    size_t off;
+    int rows, cols;
+    size_t roff;
+};
+constexpr Mat8 M8_QKV{0, QKV_DIM, DIM, 0}, M8_O{P_QKV, DIM, DIM, QKV_DIM},
+    M8_GU{P_QKV + P_O, 2 * FFN, DIM, QKV_DIM + DIM}, M8_DOWN{P_QKV + P_O + P_GU, DIM, FFN, QKV_DIM + DIM + 2 * FFN};
+static_assert(!FP8 || !ADAMW_SPLIT_LAST, "FP8 recasts a layer's weights after its whole AdamW pass");
+
+// FP8: the e4m3 copies of layer l's matrices from the fp32 master (after AdamW updated them), on stream st.
+static void cast_weights8(const State& s, int l, cudaStream_t st) {
+    for (const Mat8& w : {M8_QKV, M8_O, M8_GU, M8_DOWN})
+        cast_rows_e4m3<float><<<cdiv(w.rows, 8), 256, 0, st>>>(s.w8 + l * P_MAT + w.off, s.w8inv + l * P_ROWS + w.roff,
+                                                                s.master + P_EMBED + l * P_LAYER + w.off, w.rows, w.cols);
+}
+
+// FP8 linear y [N][w.rows] = x [N][w.cols] W^T of layer l: row-cast x, e4m3 GEMM, rescale by 1 / (s_x[n] s_w[j]).
+static void lin8(const State& s, const Gemm& g, bf16* y, const bf16* x, int l, const Mat8& w) {
+    cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, x, N, w.cols);
+    gemm(s, g, y, s.w8 + l * P_MAT + w.off, s.a.x8);
+    rescale_bf16<<<cdiv((size_t)N * w.rows / 2, 256), 256, 0, stream>>>(y, s.a.x8inv, s.w8inv + l * P_ROWS + w.roff, N,
+                                                                         w.rows);
+}
 
 // Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32, 3 u8), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
 static void dump(FILE* f, const char* name, const void* p, int dtype, size_t rows, size_t cols) {
@@ -396,26 +437,34 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
-        qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        if constexpr (FP8) {
+            lin8(s, L.qkv8, qkv, ln1, l, M8_QKV);
+            rope_inplace<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
+        } else {
+            qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        }
         mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<att_grid(HEADS), 128, 0, stream>>>(att, lse, qkv);
         mark("fwd attention");
         put("att", att, 0, DIM);
-        gemm(s, L.o, a.branch, w.o, att);
+        if constexpr (FP8) lin8(s, L.o8, a.branch, att, l, M8_O);
+        else gemm(s, L.o, a.branch, w.o, att);
         mark("fwd o GEMM");
         put("ao", a.branch, 0, DIM);
         rmsnorm<<<cdiv(N, 8), 256, 0, stream>>>(ln2, res_mid, res, a.branch, wf.ln2);
         mark("fwd rmsnorm");
         put("res_mid", res_mid, 1, DIM);
         put("ln2", ln2, 0, DIM);
-        gemm(s, L.gu, gu, w.gu, ln2);
+        if constexpr (FP8) lin8(s, L.gu8, gu, ln2, l, M8_GU);
+        else gemm(s, L.gu, gu, w.gu, ln2);
         mark("fwd gate_up GEMM");
         put("gu", gu, 0, 2 * FFN);
         swiglu<<<cdiv(N * FFN / 8, 256), 256, 0, stream>>>(act, gu);
         mark("fwd swiglu");
         put("act", act, 0, FFN);
-        gemm(s, L.down, a.branch, w.down, act);
+        if constexpr (FP8) lin8(s, L.down8, a.branch, act, l, M8_DOWN);
+        else gemm(s, L.down, a.branch, w.down, act);
         mark("fwd down GEMM");
         put("mo", a.branch, 0, DIM);
         // Next layer's input norm, or the final norm.
@@ -487,6 +536,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         } else {
             adamw_stream<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, s.params + o, gr, s.step, e - b);
         }
+        if (FP8 && e == P_MAT) cast_weights8(s, l, side);  // next step's e4m3 weights, from the updated master
         side_mark(true);
         CK(cudaEventRecord(ev_ring[l % RING], side));
     };
@@ -627,6 +677,8 @@ static void load_weights(State& s, const char* path) {
     fclose(f);
     CK(cudaMemcpy(s.master, w.data(), P_TOTAL * 4, cudaMemcpyHostToDevice));
     f32_to_bf16<<<cdiv(P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, P_TOTAL);
+    if (FP8)
+        for (int l = 0; l < LAYERS; l++) cast_weights8(s, l, stream);
     CK(cudaMemsetAsync(s.m, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
     CK(cudaMemsetAsync(s.v, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
     if (ADAM8) {  // all codes and scales 0: m = v = 0 exactly
@@ -741,11 +793,14 @@ int main(int argc, char** argv) {
     carve(ar, s, dump_path != nullptr);
     printf("B=%d T=%d params=%zu arena=%.1f MiB adamw_state=%s\n", B, T, P_TOTAL, arena_bytes / 1048576.0,
            ADAM8 ? "8bit" : "fp32");
+    if (FP8) printf("gemms=fp8 (layer linears, forward)\n");
 
     load_weights(s, weights);
     init_rope(s);
     const Lins L = {make_fwd(DIM, DIM),     make_fwd(2 * FFN, DIM), make_fwd(DIM, FFN),     make_fwd(VOCAB, DIM),
-                    make_dx(QKV_DIM, DIM), make_dx(DIM, DIM),       make_dx(2 * FFN, DIM), make_dx(VOCAB, DIM)};
+                    make_dx(QKV_DIM, DIM), make_dx(DIM, DIM),       make_dx(2 * FFN, DIM), make_dx(VOCAB, DIM),
+                    FP8 ? make_fwd8(QKV_DIM, DIM) : Gemm{}, FP8 ? make_fwd8(DIM, DIM) : Gemm{},
+                    FP8 ? make_fwd8(2 * FFN, DIM) : Gemm{}, FP8 ? make_fwd8(DIM, FFN) : Gemm{}};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;

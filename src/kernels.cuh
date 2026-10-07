@@ -933,6 +933,87 @@ __global__ void adamw_stream8(float* p, unsigned char* qm, unsigned char* qu, fl
     }
 }
 
+// ---- FP8 mode (make FP8=1; recipe in BENCH.md "FP8 mode": torchao rowwise). Operands are e4m3 with one power-of-two
+// scale per row along the GEMM's reduction dimension, from that row's amax every step. Scale s = 448 / max(amax, 1e-12)
+// rounded down to a power of two (its mantissa cleared), q = e4m3_rn_satfinite(x * s); the GEMM runs with unit scales
+// and its bf16 output is multiplied by 1 / (s_a s_b) afterwards, which is exact because the factors are powers of two.
+// inv[] stores 1 / s. torchao rounds with floor(log2(s)), which can differ by one when s is a hair below a power of two.
+__device__ __forceinline__ float pow2_scale(float amax) {
+    const float s = 448.f / fmaxf(amax, 1e-12f);
+    return __int_as_float(__float_as_int(s) & 0x7f800000);  // 2^floor(log2 s), s is normal here
+}
+__device__ __forceinline__ unsigned short e4m3x2(float a, float b) {
+    return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+}
+
+// Row cast: dst [R][C] e4m3 and inv [R] from src [R][C] (bf16 or fp32), one warp per row, C a multiple of 2.
+template <class X>
+__global__ void cast_rows_e4m3(unsigned char* dst, float* inv, const X* src, int R, int C) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= R) return;
+    const X* x = src + (size_t)row * C;
+    float a = 0.f;
+    for (int c = lane; c < C; c += 32) a = fmaxf(a, fabsf((float)x[c]));
+    const float s = pow2_scale(warp_max(a));
+    unsigned short* d = (unsigned short*)(dst + (size_t)row * C);
+    for (int c = 2 * lane; c < C; c += 64) d[c / 2] = e4m3x2((float)x[c] * s, (float)x[c + 1] * s);
+    if (lane == 0) inv[row] = 1.f / s;
+}
+
+// Column amax of src [R][C]: amax[c] over the R rows. Block (32, 8) per 32 columns; fixed order.
+template <class X>
+__global__ void col_amax(float* amax, const X* src, int R, int C) {
+    const int c = blockIdx.x * 32 + threadIdx.x;
+    float a = 0.f;
+    if (c < C)
+        for (int r = threadIdx.y; r < R; r += 8) a = fmaxf(a, fabsf((float)src[(size_t)r * C + c]));
+    __shared__ float part[8][32];
+    part[threadIdx.y][threadIdx.x] = a;
+    __syncthreads();
+    if (threadIdx.y == 0 && c < C) {
+        for (int k = 1; k < 8; k++) a = fmaxf(a, part[k][threadIdx.x]);
+        amax[c] = a;
+    }
+}
+
+// Transposing column cast: dst [C][R] e4m3 = src [R][C]^T with one scale per column of src (amax from col_amax, inv
+// [C] written here). Tiles of 32 x 32 through shared memory; R and C multiples of 32.
+template <class X>
+__global__ void cast_cols_t_e4m3(unsigned char* dst, float* inv, const X* src, const float* amax, int R, int C) {
+    __shared__ float tile[32][33];
+    const int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    for (int k = threadIdx.y; k < 32; k += 8) tile[k][threadIdx.x] = (float)src[(size_t)(r0 + k) * C + c0 + threadIdx.x];
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += 8) {  // output row c0 + k (a source column), element r0 + threadIdx.x
+        const float s = pow2_scale(amax[c0 + k]);
+        dst[(size_t)(c0 + k) * R + r0 + threadIdx.x] = (unsigned char)__nv_cvt_float_to_fp8(tile[threadIdx.x][k] * s,
+                                                                                            __NV_SATFINITE, __NV_E4M3);
+        if (blockIdx.y == 0 && threadIdx.x == 0) inv[c0 + k] = 1.f / s;
+    }
+}
+
+// y [R][C] bf16 *= rinv[r] * cinv[c] (in place; exact: both factors are powers of two).
+__global__ void rescale_bf16(bf16* y, const float* rinv, const float* cinv, int R, int C) {
+    const size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 2;
+    if (i >= (size_t)R * C) return;
+    const int r = i / C, c = i % C;
+    float2 v = __bfloat1622float2(*(bf162*)(y + i));
+    *(bf162*)(y + i) = __floats2bfloat162_rn(v.x * rinv[r] * cinv[c], v.y * rinv[r] * cinv[c + 1]);
+}
+
+// RoPE in place on the q and k heads of qkv [N][QKV_DIM] (bf16 projection output), as qkv_rope's epilogue.
+__global__ void rope_inplace(bf16* qkv, const float2* cs) {
+    constexpr int HALF = HEAD_DIM / 2, U = HEADS + KV_HEADS;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * U * HALF) return;
+    const int d = i % HALF, u = i / HALF % U, n = i / (HALF * U);
+    bf16* y = qkv + (size_t)n * QKV_DIM + u * HEAD_DIM;
+    const float x1 = __bfloat162float(y[d]), x2 = __bfloat162float(y[d + HALF]);
+    const float2 c = cs[n % T * HALF + d];
+    y[d] = __float2bfloat16(x1 * c.x - x2 * c.y);
+    y[d + HALF] = __float2bfloat16(x2 * c.x + x1 * c.y);
+}
+
 // lm_head dW (tied embedding) with AdamW fused into the epilogue: the grad, rounded to bf16 like PyTorch's dW, updates
 // master, moments and the bf16 copy in place while other blocks are still multiplying. Rows whose token is in the
 // batch (segmap[row] = its segment, else -1) also get the lookup grad later, so their bf16-rounded head grad goes to
