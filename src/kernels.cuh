@@ -960,6 +960,31 @@ __global__ void cast_rows_e4m3(unsigned char* dst, float* inv, const X* src, int
     if (lane == 0) inv[row] = 1.f / s;
 }
 
+// Row cast for bf16 rows, 8 per lane per access: dst [R][C] e4m3 and inv [R], one warp per row, C a multiple of 8.
+__global__ void cast_rows8_e4m3(unsigned char* dst, float* inv, const bf16* src, int R, int C) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= R) return;
+    const bf16* x = src + (size_t)row * C;
+    float a = 0.f;
+    for (int c = 8 * lane; c < C; c += 256) {
+        float v[8];
+        load8(v, x + c);
+#pragma unroll
+        for (int e = 0; e < 8; e++) a = fmaxf(a, fabsf(v[e]));
+    }
+    const float s = pow2_scale(warp_max(a));
+    for (int c = 8 * lane; c < C; c += 256) {
+        float v[8];
+        load8(v, x + c);
+        uint2 q;
+        unsigned short* h = (unsigned short*)&q;
+#pragma unroll
+        for (int e = 0; e < 4; e++) h[e] = e4m3x2(v[2 * e] * s, v[2 * e + 1] * s);
+        *(uint2*)(dst + (size_t)row * C + c) = q;
+    }
+    if (lane == 0) inv[row] = 1.f / s;
+}
+
 // Column amax of src [R][C]: amax[c] over the R rows. Block (32, 8) per 32 columns; fixed order.
 template <class X>
 __global__ void col_amax(float* amax, const X* src, int R, int C) {
@@ -989,6 +1014,42 @@ __global__ void cast_cols_t_e4m3(unsigned char* dst, float* inv, const X* src, c
         dst[(size_t)(c0 + k) * R + r0 + threadIdx.x] = (unsigned char)__nv_cvt_float_to_fp8(tile[threadIdx.x][k] * s,
                                                                                             __NV_SATFINITE, __NV_E4M3);
         if (blockIdx.y == 0 && threadIdx.x == 0) inv[c0 + k] = 1.f / s;
+    }
+}
+
+// Row and column amax of src [R][C] in 32 x 32 tiles, merged into rmax [R] and cmax [C] (zeroed before) with atomic
+// max on the float bits (valid for non-negative values; max is order-independent, so deterministic). rmax may be null.
+template <class X>
+__global__ void tile_amax(float* rmax, float* cmax, const X* src, int R, int C) {
+    __shared__ float tile[32][33];
+    const int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    for (int k = threadIdx.y; k < 32; k += 8) tile[k][threadIdx.x] = fabsf((float)src[(size_t)(r0 + k) * C + c0 + threadIdx.x]);
+    __syncthreads();
+    if (threadIdx.y == 0) {  // column c0 + x: max over the tile's 32 rows
+        float m = 0.f;
+        for (int k = 0; k < 32; k++) m = fmaxf(m, tile[k][threadIdx.x]);
+        atomicMax((int*)cmax + c0 + threadIdx.x, __float_as_int(m));
+    } else if (threadIdx.y == 1 && rmax) {  // row r0 + x: max over the tile's 32 columns
+        float m = 0.f;
+        for (int k = 0; k < 32; k++) m = fmaxf(m, tile[threadIdx.x][k]);
+        atomicMax((int*)rmax + r0 + threadIdx.x, __float_as_int(m));
+    }
+}
+
+// Weight cast in one read: dst [R][C] with row scales (from rmax) and dstT [C][R] with column scales (from cmax), and
+// their 1 / scale (rinv [R], cinv [C]). 32 x 32 tiles, block (32, 8).
+__global__ void cast_w8(unsigned char* dst, unsigned char* dstT, float* rinv, float* cinv, const float* src,
+                        const float* rmax, const float* cmax, int R, int C) {
+    __shared__ float tile[32][33];
+    const int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    for (int k = threadIdx.y; k < 32; k += 8) tile[k][threadIdx.x] = src[(size_t)(r0 + k) * C + c0 + threadIdx.x];
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const float sr = pow2_scale(rmax[r0 + k]), sc = pow2_scale(cmax[c0 + k]);
+        dst[(size_t)(r0 + k) * C + c0 + threadIdx.x] = __nv_cvt_float_to_fp8(tile[k][threadIdx.x] * sr, __NV_SATFINITE, __NV_E4M3);
+        dstT[(size_t)(c0 + k) * R + r0 + threadIdx.x] = __nv_cvt_float_to_fp8(tile[threadIdx.x][k] * sc, __NV_SATFINITE, __NV_E4M3);
+        if (threadIdx.x == 0 && blockIdx.x == 0) rinv[r0 + k] = 1.f / sr;
+        if (threadIdx.x == 0 && blockIdx.y == 0) cinv[c0 + k] = 1.f / sc;
     }
 }
 

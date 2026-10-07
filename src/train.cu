@@ -189,7 +189,7 @@ struct State {
     float* w8inv;            // FP8: [LAYERS][P_ROWS] their 1 / scale
     unsigned char* w8t;      // FP8: [LAYERS][P_MAT] the transposed matrices W^T [in][out], one scale per input feature
     float* w8tinv;           // FP8: [LAYERS][P_COLS] their 1 / scale
-    float* w8amax;           // FP8: [FFN] column amax scratch of the weight casts (side stream)
+    float* w8amax;           // FP8: [X8_COLS + FFN] row and column amax scratch of the weight casts (side stream)
     float *sm, *su;          // ADAM8: [LAYERS][P_MAT / Q8_BLOCK] their block scales
     float2* rope;   // [T][HEAD_DIM/2] (cos, sin)
     float* step;    // [1] AdamW step count, advanced on the device so a captured step graph can be replayed
@@ -232,7 +232,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
         s.w8inv = ar.take<float>(LAYERS * P_ROWS);
         s.w8t = ar.take<unsigned char>(LAYERS * P_MAT);
         s.w8tinv = ar.take<float>(LAYERS * P_COLS);
-        s.w8amax = ar.take<float>(FFN);
+        s.w8amax = ar.take<float>(X8_COLS + FFN);
         s.a.x8inv = ar.take<float>(N);
         s.a.dy8inv = ar.take<float>(X8_COLS);
         s.a.x8tinv = ar.take<float>(X8_COLS);
@@ -409,24 +409,26 @@ struct Mat8 {
 constexpr Mat8 M8_QKV{0, QKV_DIM, DIM, 0, 0}, M8_O{P_QKV, DIM, DIM, QKV_DIM, DIM},
     M8_GU{P_QKV + P_O, 2 * FFN, DIM, QKV_DIM + DIM, 2 * DIM},
     M8_DOWN{P_QKV + P_O + P_GU, DIM, FFN, QKV_DIM + DIM + 2 * FFN, 3 * DIM};
-static_assert(!FP8 || !ADAMW_SPLIT_LAST, "FP8 recasts a layer's weights after its whole AdamW pass");
+// FP8: a layer's e4m3 weights are cast from the master at the start of its forward and serve that step's backward too.
 
 // FP8: the e4m3 copies of layer l's matrices from the fp32 master (after AdamW updated them), on stream st.
 static void cast_weights8(const State& s, int l, cudaStream_t st) {
     for (const Mat8& w : {M8_QKV, M8_O, M8_GU, M8_DOWN}) {
         const float* m = s.master + P_EMBED + l * P_LAYER + w.off;
-        cast_rows_e4m3<float><<<cdiv(w.rows, 8), 256, 0, st>>>(s.w8 + l * P_MAT + w.off, s.w8inv + l * P_ROWS + w.roff, m,
-                                                                w.rows, w.cols);
-        col_amax<float><<<cdiv(w.cols, 32), dim3(32, 8), 0, st>>>(s.w8amax, m, w.rows, w.cols);
-        cast_cols_t_e4m3<float><<<dim3(w.cols / 32, w.rows / 32), dim3(32, 8), 0, st>>>(
-            s.w8t + l * P_MAT + w.off, s.w8tinv + l * P_COLS + w.coff, m, s.w8amax, w.rows, w.cols);
+        float *rmax = s.w8amax, *cmax = s.w8amax + X8_COLS;
+        CK(cudaMemsetAsync(s.w8amax, 0, (X8_COLS + FFN) * sizeof(float), st));
+        const dim3 tiles(w.cols / 32, w.rows / 32);
+        tile_amax<float><<<tiles, dim3(32, 8), 0, st>>>(rmax, cmax, m, w.rows, w.cols);
+        cast_w8<<<tiles, dim3(32, 8), 0, st>>>(s.w8 + l * P_MAT + w.off, s.w8t + l * P_MAT + w.off,
+                                               s.w8inv + l * P_ROWS + w.roff, s.w8tinv + l * P_COLS + w.coff, m, rmax,
+                                               cmax, w.rows, w.cols);
     }
 }
 
 // FP8 input grad dx [N][w.cols] = dy [N][w.rows] W of layer l: row-cast dy, e4m3 GEMM on W^T, rescale.
 static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int l, const Mat8& w) {
     alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
-    cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, dy, N, w.rows);
+    cast_rows8_e4m3<<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, dy, N, w.rows);
     gemm(s, g, dx, s.w8t + l * P_MAT + w.off, s.a.x8);
     rescale_bf16<<<cdiv((size_t)N * w.cols / 2, 256), 256, 0, stream>>>(dx, s.a.x8inv, s.w8tinv + l * P_COLS + w.coff,
                                                                          N, w.cols);
@@ -437,9 +439,11 @@ static void lin8_dx(const State& s, const Gemm& g, bf16* dx, const bf16* dy, int
 static void lin8_dw(const State& s, const Gemm& gm, bf16* g, const bf16* dy, const bf16* x, const Mat8& w) {
     alias_check(!logits_live, "logits aliasing: a dW GEMM writes gring while logits are live");
     const Acts& a = s.a;
-    col_amax<bf16><<<cdiv(w.rows, 32), dim3(32, 8), 0, stream>>>(a.amax8, dy, N, w.rows);
+    CK(cudaMemsetAsync(a.amax8, 0, X8_COLS * sizeof(float), stream));
+    tile_amax<bf16><<<dim3(w.rows / 32, N / 32), dim3(32, 8), 0, stream>>>(nullptr, a.amax8, dy, N, w.rows);
     cast_cols_t_e4m3<bf16><<<dim3(w.rows / 32, N / 32), dim3(32, 8), 0, stream>>>(a.dy8t, a.dy8inv, dy, a.amax8, N, w.rows);
-    col_amax<bf16><<<cdiv(w.cols, 32), dim3(32, 8), 0, stream>>>(a.amax8, x, N, w.cols);
+    CK(cudaMemsetAsync(a.amax8, 0, X8_COLS * sizeof(float), stream));
+    tile_amax<bf16><<<dim3(w.cols / 32, N / 32), dim3(32, 8), 0, stream>>>(nullptr, a.amax8, x, N, w.cols);
     cast_cols_t_e4m3<bf16><<<dim3(w.cols / 32, N / 32), dim3(32, 8), 0, stream>>>(a.x8t, a.x8tinv, x, a.amax8, N, w.cols);
     gemm(s, gm, g, a.x8t, a.dy8t);
     rescale_bf16<<<cdiv((size_t)w.rows * w.cols / 2, 256), 256, 0, stream>>>(g, a.dy8inv, a.x8tinv, w.rows, w.cols);
@@ -448,7 +452,7 @@ static void lin8_dw(const State& s, const Gemm& gm, bf16* g, const bf16* dy, con
 // FP8 linear y [N][w.rows] = x [N][w.cols] W^T of layer l: row-cast x, e4m3 GEMM, rescale by 1 / (s_x[n] s_w[j]).
 static void lin8(const State& s, const Gemm& g, bf16* y, const bf16* x, int l, const Mat8& w) {
     alias_check(!logits_live, "logits aliasing: an FP8 cast writes x8 while logits are live");
-    cast_rows_e4m3<bf16><<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, x, N, w.cols);
+    cast_rows8_e4m3<<<cdiv(N, 8), 256, 0, stream>>>(s.a.x8, s.a.x8inv, x, N, w.cols);
     gemm(s, g, y, s.w8 + l * P_MAT + w.off, s.a.x8);
     rescale_bf16<<<cdiv((size_t)N * w.rows / 2, 256), 256, 0, stream>>>(y, s.a.x8inv, s.w8inv + l * P_ROWS + w.roff, N,
                                                                          w.rows);
@@ -503,6 +507,7 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
+        if constexpr (FP8) cast_weights8(s, l, stream);  // this step's e4m3 W and W^T of the layer, from the master
         if constexpr (FP8) {
             lin8(s, L.qkv8, qkv, ln1, l, M8_QKV);
             rope_inplace<<<cdiv(N * (HEADS + KV_HEADS) * HEAD_DIM / 2, 256), 256, 0, stream>>>(qkv, s.rope);
@@ -602,7 +607,6 @@ static void backward(State& s, const Lins& L, FILE* df) {
         } else {
             adamw_stream<<<PASS_BLOCKS, 256, 0, side>>>(s.master + o, s.m + o, s.v + o, FP8 ? nullptr : s.params + o, gr, s.step, e - b);
         }
-        if (FP8 && e == P_MAT) cast_weights8(s, l, side);  // next step's e4m3 weights, from the updated master
         side_mark(true);
         CK(cudaEventRecord(ev_ring[l % RING], side));
     };
@@ -755,8 +759,6 @@ static void load_weights(State& s, const char* path) {
     fclose(f);
     CK(cudaMemcpy(s.master, w.data(), P_TOTAL * 4, cudaMemcpyHostToDevice));
     f32_to_bf16<<<cdiv(FP8 ? P_EMBED : P_TOTAL, 256), 256, 0, stream>>>(s.params, s.master, FP8 ? P_EMBED : P_TOTAL);
-    if (FP8)
-        for (int l = 0; l < LAYERS; l++) cast_weights8(s, l, stream);
     CK(cudaMemsetAsync(s.m, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
     CK(cudaMemsetAsync(s.v, 0, (ADAM8 ? P_EMBED : P_TOTAL) * 4, stream));
     if (ADAM8) {  // all codes and scales 0: m = v = 0 exactly
