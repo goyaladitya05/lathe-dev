@@ -2,6 +2,7 @@
 #   python ref/test.py [--model smol135] [--B 2 --T 512]   kernels fwd/bwd, end to end, every parameter grad, AdamW
 #   python ref/test.py curve [--steps 1000] [--B 1 --T 2048]   loss curve vs reference training
 #   --adam8 tests the 8-bit AdamW state build (make ADAM8=1); state8 [--steps 500] compares it with fp32 state
+#   --fp8 tests the FP8 build (make FP8=1) against torchao rowwise fp8 instead of bf16
 # Per-kernel checks feed each lathe kernel's dumped inputs to fp32 math (bf16-rounded matmul weights).
 # End-to-end checks measure lathe against an fp32 reference, with PyTorch bf16 autocast's own error as the
 # yardstick: lathe may be at most E2E_RATIO times worse.
@@ -27,6 +28,7 @@ CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
 MODEL = "smol135"  # set from --model
 ADAM8 = False  # --adam8: lathe built with 8-bit AdamW moments for the layer matrices (make ADAM8=1)
+FP8 = False  # --fp8: lathe built with e4m3 layer linears (make FP8=1); yardstick torch-fp8 (torchao rowwise), not bf16
 
 
 def rel(a, b):
@@ -71,13 +73,13 @@ def lathe_grads(d, cfg):
 
 def build_lathe(B, T, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}", *(["ADAM8=1"] if adam8 else [])], cwd=ROOT,
-                   check=True)
+    flags = (["ADAM8=1"] if adam8 else []) + (["FP8=1"] if FP8 else [])
+    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}", *flags], cwd=ROOT, check=True)
 
 
 def run_lathe(B, T, *args, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}"
+    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_fp8' if FP8 else ''}"
     out = subprocess.run([exe, *map(str, args)], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
@@ -131,6 +133,23 @@ def bf(t):
     return t.to(torch.bfloat16).float()
 
 
+def f8(t, dim=-1):
+    # FP8 recipe rounding (BENCH.md "FP8 mode"): one power-of-two scale per slice along dim, s = 448 / amax rounded down
+    # to a power of two (lathe clears the mantissa: frexp's exponent), e4m3 round to nearest, back to fp32.
+    if not FP8:
+        return t
+    s = 448.0 / t.abs().amax(dim, keepdim=True).clamp(min=1e-12)
+    s = torch.ldexp(torch.ones_like(s), torch.frexp(s).exponent - 1)
+    return (t * s).to(torch.float8_e4m3fn).float() / s
+
+
+def fp8_model(model):
+    # torch-fp8 yardstick: a copy of the reference with torchao float8 training (rowwise) on every nn.Linear.
+    import copy
+    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+    return convert_to_float8_training(copy.deepcopy(model), config=Float8LinearConfig.from_recipe_name("rowwise"))
+
+
 class Weights:
     # Lathe-order parameters, moved to the GPU on demand: fp32 (norms, embedding lookup) or bf16-rounded (matmuls).
     def __init__(self, model):
@@ -151,23 +170,23 @@ def forward_kernel_checks(d, W, x, y, cfg, B, T):
     rot = (cfg.heads + cfg.kv_heads) * cfg.head_dim
     for l in [0, cfg.layers - 1]:
         f = lambda name: d[f"L{l}.{name}"].float().cuda()
-        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "b")
+        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "f" if FP8 else "b")
         *_, ln1, ln2 = W.layer(l, "f")
         print(f" forward layer {l}")
         if l == 0:
             check("embed", rel(f("res"), W.f(0)[x.view(-1).cuda()]), 0)
         check("rmsnorm 1", rel(f("ln1"), rmsnorm(f("res"), ln1, cfg.rms_eps)), KERNEL_TOL)
-        pre = bf(f("ln1") @ wqkv.T)  # projection rounded to bf16, then RoPE (PyTorch's two ops)
+        pre = bf(f8(f("ln1")) @ f8(wqkv).T)  # projection rounded to bf16, then RoPE (PyTorch's two ops)
         qk = rope(pre[:, :rot].view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, sin).transpose(1, 2).reshape(B * T, rot)
         check("matmul qkv + rope", rel(f("qkv"), torch.cat([qk, pre[:, rot:]], 1)), KERNEL_TOL)
         check("attention", rel(f("att"), attention(f("qkv"), cfg, B, T)), KERNEL_TOL)
-        check("matmul o", rel(f("ao"), f("att") @ wo.T), KERNEL_TOL)
+        check("matmul o", rel(f("ao"), f8(f("att")) @ f8(wo).T), KERNEL_TOL)
         check("residual add 1 (fp32)", rel(f("res_mid"), f("res") + f("ao")), 0)
         check("rmsnorm 2", rel(f("ln2"), rmsnorm(f("res_mid"), ln2, cfg.rms_eps)), KERNEL_TOL)
-        check("matmul gate|up", rel(f("gu"), f("ln2") @ wgu.T), KERNEL_TOL)
+        check("matmul gate|up", rel(f("gu"), f8(f("ln2")) @ f8(wgu).T), KERNEL_TOL)
         g, u = d[f"L{l}.gu"].cuda().chunk(2, -1)
         check("swiglu (vs torch bf16 ops)", rel(f("act"), (F.silu(g) * u).float()), KERNEL_TOL)
-        check("matmul down", rel(f("mo"), f("act") @ wdown.T), KERNEL_TOL)
+        check("matmul down", rel(f("mo"), f8(f("act")) @ f8(wdown).T), KERNEL_TOL)
         check("residual add 2 (fp32)", rel(f("res_out"), f("res_mid") + f("mo")), 0)
     print(" forward output")
     lnf = d["lnf"].float().cuda()
@@ -196,31 +215,31 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         f = lambda name: d[f"L{l}.{name}"].float().cuda()
         p = f"layers.{l}."
         G = lambda name: grads[p + name].cuda()
-        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "b")
+        wqkv, wo, wgu, wdown, _, _ = W.layer(l, "f" if FP8 else "b")
         *_, ln1, ln2 = W.layer(l, "f")
         print(f" backward layer {l}")
         dmo = bf(f("dres_out"))
         g, u = (t.clone().requires_grad_() for t in d[f"L{l}.gu"].cuda().chunk(2, -1))
-        (F.silu(g) * u).backward((dmo @ wdown).to(torch.bfloat16))  # bf16 dact, then PyTorch's bf16 backward
+        (F.silu(g) * u).backward((f8(dmo) @ f8(wdown, 0)).to(torch.bfloat16))  # bf16 dact, then PyTorch's bf16 backward
         check("matmul down dX + swiglu bwd", rel(f("dgu"), torch.cat([g.grad, u.grad], -1).float()), KERNEL_TOL)
-        check("matmul down dW", rel(G("mlp.down_proj.weight"), dmo.T @ f("act")), KERNEL_TOL)
-        check("matmul gate|up dX", rel(f("dln2"), f("dgu") @ wgu), KERNEL_TOL)
-        gate, up = (f("dgu").T @ f("ln2")).chunk(2)
+        check("matmul down dW", rel(G("mlp.down_proj.weight"), f8(dmo, 0).T @ f8(f("act"), 0)), KERNEL_TOL)
+        check("matmul gate|up dX", rel(f("dln2"), f8(f("dgu")) @ f8(wgu, 0)), KERNEL_TOL)
+        gate, up = (f8(f("dgu"), 0).T @ f8(f("ln2"), 0)).chunk(2)
         check("matmul gate|up dW", rel(torch.cat([G("mlp.gate_proj.weight"), G("mlp.up_proj.weight")]),
                                                torch.cat([gate, up])), KERNEL_TOL)
         dx, dw = rmsnorm_grads(f("res_mid"), ln2, f("dln2"), eps)
         check("rmsnorm 2 bwd dx + residual", rel(f("dres_mid"), f("dres_out") + dx), F32_TOL)
         check("rmsnorm 2 bwd dw", rel(G("post_attention_layernorm.weight"), dw), F32_TOL)
         dao = bf(f("dres_mid"))
-        check("matmul o dX", rel(f("datt"), dao @ wo), KERNEL_TOL)
-        check("matmul o dW", rel(G("self_attn.o_proj.weight"), dao.T @ f("att")), KERNEL_TOL)
+        check("matmul o dX", rel(f("datt"), f8(dao) @ f8(wo, 0)), KERNEL_TOL)
+        check("matmul o dW", rel(G("self_attn.o_proj.weight"), f8(dao, 0).T @ f8(f("att"), 0)), KERNEL_TOL)
         hq, hk = cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
         dq, dk, dv = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
         unrope = lambda t: rope(t.view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, -sin).transpose(1, 2).reshape(B * T, -1)
         for name, got, w in zip(["dq", "dk", "dv"], f("dqkv_pre").split([hq, hk, hk], -1), [unrope(dq), unrope(dk), dv]):
             check(f"attention + rope bwd {name}", rel(got, w), KERNEL_TOL)
-        check("matmul qkv dX", rel(f("dln1"), f("dqkv_pre") @ wqkv), KERNEL_TOL)
-        q, k, v = (f("dqkv_pre").T @ f("ln1")).split([hq, hk, hk])
+        check("matmul qkv dX", rel(f("dln1"), f8(f("dqkv_pre")) @ f8(wqkv, 0)), KERNEL_TOL)
+        q, k, v = (f8(f("dqkv_pre"), 0).T @ f8(f("ln1"), 0)).split([hq, hk, hk])
         check("matmul qkv dW", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),
                                                      G("self_attn.v_proj.weight")]), torch.cat([q, k, v])), KERNEL_TOL)
         dx, dw = rmsnorm_grads(f("res"), ln1, f("dln1"), eps)
@@ -236,19 +255,22 @@ def e2e_checks(d, lathe_losses, model, tokens, B, T):
     # Accuracy on batch 0 (dumped logits); bias on mean loss over BIAS_BATCHES batches.
     x, y = (t.cuda() for t in get_batch(tokens, 0, B, T))
     ce = lambda lg: F.cross_entropy(lg.float().view(-1, lg.size(-1)), y.view(-1), reduction="none").double()
+    yard = fp8_model(model) if FP8 else model  # the yardstick runs under bf16 autocast: torch-bf16 or torch-fp8
     with torch.no_grad():
         lg32 = model(x)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            lg16 = model(x)
+            lg16 = yard(x)
         batches = [[t.cuda() for t in get_batch(tokens, i, B, T)] for i in range(BIAS_BATCHES)]
         ref = [model(*xy)[1].item() for xy in batches]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            ref16 = [model(*xy)[1].item() for xy in batches]
+            ref16 = [yard(*xy)[1].item() for xy in batches]
+    del yard
+    name = "torch-fp8" if FP8 else "torch-bf16"
     lg = d["logits"].cuda().view_as(lg32)
     dl, dl16 = ce(lg) - ce(lg32), ce(lg16) - ce(lg32)
-    print(f" end to end   batch 0 loss: fp32 {ce(lg32).mean():.6f}  torch-bf16 {ce(lg16).mean():.6f}  "
+    print(f" end to end   batch 0 loss: fp32 {ce(lg32).mean():.6f}  {name} {ce(lg16).mean():.6f}  "
           f"lathe {ce(lg).mean():.6f}")
-    print(f"   mean loss over {BIAS_BATCHES} batches: fp32 {np.mean(ref):.6f}  torch-bf16 {np.mean(ref16):.6f}  "
+    print(f"   mean loss over {BIAS_BATCHES} batches: fp32 {np.mean(ref):.6f}  {name} {np.mean(ref16):.6f}  "
           f"lathe {np.mean(lathe_losses):.6f}")
     check("logits rel err vs fp32", rel(lg, lg32), E2E_RATIO * rel(lg16, lg32))
     rms = lambda t: t.pow(2).mean().sqrt().item()
@@ -276,13 +298,19 @@ def grad_checks(grads, model, x, y, per_tensor):
     # near massive activations swing several x between equally valid bf16 implementations (rounding luck after
     # catastrophic cancellation), while the median over layers is stable.
     x, y = x.cuda(), y.cuda()
-    g32, g16 = ref_grads(model, x, y, False), ref_grads(model, x, y, True)
+    g32 = ref_grads(model, x, y, False)
+    if FP8:
+        yard = fp8_model(model)
+        g16 = ref_grads(yard, x, y, True)
+        del yard
+    else:
+        g16 = ref_grads(model, x, y, True)
     model.zero_grad(set_to_none=True)
     groups = {}
     for k in g32:
         kind = re.sub(r"layers\.\d+\.", "", k).removesuffix(".weight")
         groups.setdefault(kind, []).append((rel(grads[k], g32[k]), rel(g16[k], g32[k]), k))
-    print(f" every parameter grad ({len(g32)} tensors) vs fp32: lathe / torch-bf16 error ratio by kind")
+    print(f" every parameter grad ({len(g32)} tensors) vs fp32: lathe / {'torch-fp8' if FP8 else 'torch-bf16'} error ratio by kind")
     for kind, rows in groups.items():
         ratios = [e_l / e_t for e_l, e_t, _ in rows]
         if per_tensor:
@@ -308,7 +336,8 @@ def adamw_check(d, grads, wpath, cfg):
     want = torch.cat([t.reshape(-1).cpu() for t in lathe_layout(model.state_dict(), cfg)])
     master = d["master"].view(-1)
     check("AdamW step vs torch fused AdamW", rel(master, want), 1e-6)
-    check("bf16 copy == bf16(master)", float((d["params"].view(-1) != master.to(torch.bfloat16)).sum()), 0)
+    pb = d["params"].view(-1)  # FP8 builds keep a bf16 copy of the embedding only
+    check("bf16 copy == bf16(master)", float((pb != master[:pb.numel()].to(torch.bfloat16)).sum()), 0)
 
 
 def state8_check(d, cfg):
@@ -442,7 +471,8 @@ def curve(steps, B=1, T=2048, window=100):
     out = run_lathe(B, T, "--weights", DATA / f"{MODEL}_init.bin", "--data", train, "--steps", steps)
     la = np.array(losses_from(out, "step"))
     tokens = np.memmap(train, dtype=np.uint16, mode="r")
-    t16, f32 = ref_curve(cfg, tokens, steps, B, T, True), ref_curve(cfg, tokens, steps, B, T, False)
+    t16 = ref_curve(cfg, tokens, steps, B, T, True, "rowwise" if FP8 else None)  # yardstick: torch-fp8 or torch-bf16
+    f32 = ref_curve(cfg, tokens, steps, B, T, False)
     np.savetxt(ROOT / f"build/curve_{MODEL}_b{B}_t{T}.csv", np.stack([np.arange(steps), f32, t16, la], 1), delimiter=",",
                header="step,fp32,torch_bf16,lathe", fmt="%.6f")
     print(f"{'steps':<10} {'fp32':>8} {'torch-bf16':>10} {'lathe':>8} | mean |torch-fp32| |lathe-fp32| |lathe-torch|")
@@ -515,7 +545,7 @@ def fp8ref(steps, B, T, recipe="rowwise", window=100):
 
 
 def main():
-    global MODEL, ADAM8
+    global MODEL, ADAM8, FP8
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", nargs="?", choices=["unit", "curve", "state8", "fp8ref"], default="unit")
     ap.add_argument("--model", default="smol135")
@@ -523,8 +553,9 @@ def main():
     ap.add_argument("--T", type=int)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--adam8", action="store_true", help="test the 8-bit AdamW state build (make ADAM8=1)")
+    ap.add_argument("--fp8", action="store_true", help="test the FP8 build (make FP8=1) against torchao rowwise fp8")
     args = ap.parse_args()
-    MODEL, ADAM8 = args.model, args.adam8
+    MODEL, ADAM8, FP8 = args.model, args.adam8, args.fp8
     if args.mode == "curve":
         curve(args.steps, args.B or 1, args.T or 2048)
     elif args.mode == "state8":
