@@ -189,11 +189,12 @@ def engine_train(args, stack, cmd, env, versions):
 
 
 def lathe_train(args):
-    subprocess.run(["make", "-s", f"MODEL={args.model}", f"BATCH={args.B}", f"SEQ={args.T}",
-                    *(["ADAM8=1"] if args.adam8 else [])], cwd=ROOT, check=True)
-    exe = ROOT / f"build/train_{args.model}_b{args.B}_t{args.T}{'_adam8' if args.adam8 else ''}"
-    engine_train(args, "lathe (8-bit state)" if args.adam8 else "lathe", [exe, "--data", DATA / "train.bin"], {},
-                 "CUDA 12.8")
+    flags = (["ADAM8=1"] if args.adam8 else []) + (["DW_LT=1"] if args.dw_lt else [])
+    subprocess.run(["make", "-s", f"MODEL={args.model}", f"BATCH={args.B}", f"SEQ={args.T}", *flags], cwd=ROOT, check=True)
+    exe = ROOT / f"build/train_{args.model}_b{args.B}_t{args.T}{'_adam8' if args.adam8 else ''}{'_dwlt' if args.dw_lt else ''}"
+    tags = [t for t, on in (("8-bit state", args.adam8), ("tuned gemms", args.tuned), ("cuBLASLt dW", args.dw_lt)) if on]
+    engine_train(args, "lathe" + (f" ({', '.join(tags)})" if tags else ""),
+                 [exe, "--data", DATA / "train.bin", *(["--tuned", 1] if args.tuned else [])], {}, "CUDA 12.8")
 
 
 def tinygrad_train(args):
@@ -226,6 +227,8 @@ def main():
     ap.add_argument("--shapes", default="1x2048", help="session mode: comma-separated BxT")
     ap.add_argument("--stacks", default="eager,compile,lathe,tinygrad", help="session mode: stacks to run")
     ap.add_argument("--adam8", action="store_true", help="lathe mode: the 8-bit AdamW state build (make ADAM8=1)")
+    ap.add_argument("--tuned", action="store_true", help="lathe mode: measured cuBLASLt algorithms (build/lt_cache.txt)")
+    ap.add_argument("--dw-lt", action="store_true", help="lathe mode: cuBLASLt layer weight grads (make DW_LT=1)")
     args = ap.parse_args()
     {"sol": sol, "lathe": lathe_train, "tinygrad": tinygrad_train, "session": session}.get(args.mode, torch_train)(args)
 

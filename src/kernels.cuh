@@ -41,6 +41,15 @@ __device__ __forceinline__ void store8(bf16* p, const float* f) {
     *(uint4*)p = u;
 }
 
+// Deterministic pseudo-random bf16 in [-1, 1) (GEMM tuning inputs).
+__global__ void fill_bf16(bf16* p, size_t n, uint32_t seed) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t x = (uint32_t)i * 2654435761u ^ seed * 0x9e3779b9u;
+    x ^= x >> 13, x *= 0x5bd1e995u, x ^= x >> 15;
+    p[i] = __float2bfloat16((x & 0xffff) / 32768.f - 1.f);
+}
+
 __global__ void f32_to_bf16(bf16* out, const float* in, size_t n) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16(in[i]);

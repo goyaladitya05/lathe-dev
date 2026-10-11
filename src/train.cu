@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <cmath>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -46,6 +47,9 @@ static_assert(P_EMBED * 2 % 256 == 0 && P_QKV * 2 % 256 == 0 && P_O * 2 % 256 ==
 // backward); most embedding rows never leave the lm_head dW GEMM, which applies AdamW directly. Norm weight grads are
 // fp32 in gnorm = [LAYERS x (ln1, ln2)][final norm].
 constexpr size_t P_MAT = P_QKV + P_O + P_GU + P_DOWN;
+#ifndef DW_LT
+#define DW_LT 0  // 1 (make DW_LT=1): the layer weight grads by cuBLASLt (tunable) instead of chisel's / dw_bf16
+#endif
 #ifndef ADAM8
 #define ADAM8 0  // 1 (make ADAM8=1): 8-bit AdamW moments for the layer matrices (adamw_stream8, BENCH.md)
 #endif
@@ -285,32 +289,37 @@ static void mark(const char*) {}
 static void side_mark(bool) {}
 #endif
 
-// Column-major D[m x n] = op(A)[m x k] B[k x n], bf16 inputs and output, fp32 accumulate. Built once per shape.
+// Column-major D[m x n] = op(A)[m x k] op(B)[k x n], bf16 inputs and output, fp32 accumulate. Built once per shape;
+// the algorithm is cuBLASLt's heuristic pick unless --tuned reads a measured one from the cache (tune_gemms).
 struct Gemm {
     cublasLtMatmulDesc_t desc;
     cublasLtMatrixLayout_t a, b, d;
     cublasLtMatmulAlgo_t algo;
+    cublasLtMatmulPreference_t pref;
+    const char* name;
+    int m, n, k;
+    bool ta, tb;
 };
 
-static Gemm make_gemm(bool ta, int m, int n, int k) {
-    Gemm g;
+static Gemm make_gemm(const char* name, bool ta, bool tb, int m, int n, int k) {
+    Gemm g{};
+    g.name = name, g.m = m, g.n = n, g.k = k, g.ta = ta, g.tb = tb;
     CKB(cublasLtMatmulDescCreate(&g.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    const cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opa = ta ? CUBLAS_OP_T : CUBLAS_OP_N, opb = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
     CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opa, sizeof(opa)));
+    CKB(cublasLtMatmulDescSetAttribute(g.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opb, sizeof(opb)));
     CKB(cublasLtMatrixLayoutCreate(&g.a, CUDA_R_16BF, ta ? k : m, ta ? m : k, ta ? k : m));
-    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, k, n, k));
+    CKB(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_16BF, tb ? n : k, tb ? k : n, tb ? n : k));
     CKB(cublasLtMatrixLayoutCreate(&g.d, CUDA_R_16BF, m, n, m));
-    cublasLtMatmulPreference_t pref;
-    CKB(cublasLtMatmulPreferenceCreate(&pref));
+    CKB(cublasLtMatmulPreferenceCreate(&g.pref));
     size_t ws = CUBLAS_WORKSPACE;
-    CKB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+    CKB(cublasLtMatmulPreferenceSetAttribute(g.pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
     uint32_t red = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;  // split-K partials summed in fp32, never in bf16
-    CKB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red)));
+    CKB(cublasLtMatmulPreferenceSetAttribute(g.pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red)));
     cublasLtMatmulHeuristicResult_t h;
     int found = 0;
-    CKB(cublasLtMatmulAlgoGetHeuristic(lt, g.desc, g.a, g.b, g.d, g.d, pref, 1, &h, &found));
+    CKB(cublasLtMatmulAlgoGetHeuristic(lt, g.desc, g.a, g.b, g.d, g.d, g.pref, 1, &h, &found));
     if (!found) die("no cuBLASLt algo");
-    CKB(cublasLtMatmulPreferenceDestroy(pref));
     g.algo = h.algo;
     return g;
 }
@@ -324,7 +333,9 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 // The cuBLASLt GEMMs of linears y = x W^T, W [out][in] row-major, x/y [N][features] row-major. The qkv forward,
 // the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw).
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
-static Gemm make_fwd(int out, int in) { return make_gemm(true, out, N, in); }
+static Gemm make_fwd(const char* name, int out, int in) { return make_gemm(name, true, false, out, N, in); }
+// DW_LT=1: weight grad dW[out][in] = dy^T x by cuBLASLt into the gradient ring (A = x [N][in], B = dy [N][out]^T).
+static Gemm make_dw(const char* name, int out, int in) { return make_gemm(name, false, true, in, out, N); }
 
 // dW[out][in] = dy^T x rounded to bf16 into g, on the main stream.
 enum { DW_QKV, DW_O, DW_GU, DW_DOWN };
@@ -341,11 +352,161 @@ static void dw_core(bf16* g, const bf16* dy, const bf16* x) {
     dw_bf16<OUT, IN><<<dim3(IN / 64, OUT / 64), 128, 0, stream>>>(g, dy, x);
 #endif
 }
-static Gemm make_dx(int out, int in) { return make_gemm(false, in, N, out); }
+static Gemm make_dx(const char* name, int out, int in) { return make_gemm(name, false, false, in, N, out); }
 struct Lins {
     Gemm o, gu, down, head;             // forward
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
+    Gemm qkv_dw, o_dw, gu_dw, down_dw;  // DW_LT: weight grads
 };
+
+// cuBLASLt algorithm by measurement. --tune 1: for every GEMM, up to LT_CANDIDATES heuristic candidates are timed on
+// the real shape (random inputs, temporary buffers before the arena exists); a candidate counts only if two runs are
+// bit-identical (graph == eager stays exact) and its output is within bf16 rounding (rel L2 <= 2^-8) of the heuristic
+// pick's. Winners go to LT_CACHE keyed by shape, transposes and cuBLASLt version; --tuned 1 reads them back.
+constexpr int LT_CANDIDATES = 32;
+constexpr const char* LT_CACHE = "build/lt_cache.txt";
+static std::string lt_key(const Gemm& g) {
+    char b[96];
+    snprintf(b, sizeof(b), "v%zu bf16 m%d n%d k%d t%d%d", cublasLtGetVersion(), g.m, g.n, g.k, g.ta, g.tb);
+    return b;
+}
+static std::vector<std::pair<std::string, std::string>> lt_read() {  // key -> rest of the line (algo bytes in hex, ...)
+    std::vector<std::pair<std::string, std::string>> c;
+    FILE* f = fopen(LT_CACHE, "r");
+    if (!f) return c;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char* bar = strchr(line, '|');
+        if (!bar) continue;
+        *bar = 0;
+        line[strcspn(line, "\n")] = 0, bar[1 + strcspn(bar + 1, "\n")] = 0;
+        c.push_back({line, bar + 1});
+    }
+    fclose(f);
+    return c;
+}
+static void lt_hex(char* out, const cublasLtMatmulAlgo_t& a) {
+    const unsigned char* p = (const unsigned char*)&a;
+    for (size_t i = 0; i < sizeof(a); i++) sprintf(out + 2 * i, "%02x", p[i]);
+}
+static bool lt_unhex(cublasLtMatmulAlgo_t& a, const char* hex) {
+    unsigned char* p = (unsigned char*)&a;
+    for (size_t i = 0; i < sizeof(a); i++)
+        if (sscanf(hex + 2 * i, "%2hhx", p + i) != 1) return false;
+    return true;
+}
+static int lt_attr(const cublasLtMatmulAlgo_t& a, cublasLtMatmulAlgoConfigAttributes_t attr) {
+    int v = 0;
+    size_t sz;
+    cublasLtMatmulAlgoConfigGetAttribute(&a, attr, &v, sizeof(v), &sz);
+    return v;
+}
+static double rel_bf16(const std::vector<bf16>& x, const std::vector<bf16>& y) {
+    double num = 0, den = 0;
+    for (size_t i = 0; i < x.size(); i++) {
+        const double a = __bfloat162float(x[i]), b = __bfloat162float(y[i]);
+        num += (a - b) * (a - b), den += b * b;
+    }
+    return std::sqrt(num / std::max(den, 1e-30));
+}
+
+// Measure every GEMM in gs, keep the fastest acceptable candidate, rewrite LT_CACHE; prints heuristic vs best per GEMM.
+static void tune_gemms(std::vector<Gemm*> gs) {
+    auto cache = lt_read();
+    void* ws;
+    CK(cudaMalloc(&ws, CUBLAS_WORKSPACE));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    printf("gemm tuning (%s): name m n k | heuristic ms | best ms | gain | candidates ok/total | algo id tile splitk stages\n",
+           LT_CACHE);
+    for (Gemm* g : gs) {
+        const size_t na = (size_t)g->m * g->k, nb = (size_t)g->k * g->n, nd = (size_t)g->m * g->n;
+        bf16 *A, *Bm, *D0, *D1, *D2;
+        CK(cudaMalloc(&A, na * 2));
+        CK(cudaMalloc(&Bm, nb * 2));
+        CK(cudaMalloc(&D0, nd * 2));
+        CK(cudaMalloc(&D1, nd * 2));
+        CK(cudaMalloc(&D2, nd * 2));
+        fill_bf16<<<cdiv(na, 256), 256, 0, stream>>>(A, na, 1u);
+        fill_bf16<<<cdiv(nb, 256), 256, 0, stream>>>(Bm, nb, 2u);
+        cublasLtMatmulHeuristicResult_t h[LT_CANDIDATES];
+        int found = 0;
+        CKB(cublasLtMatmulAlgoGetHeuristic(lt, g->desc, g->a, g->b, g->d, g->d, g->pref, LT_CANDIDATES, h, &found));
+        const float one = 1.f, zero = 0.f;
+        auto run = [&](const cublasLtMatmulAlgo_t& al, void* D) {
+            return cublasLtMatmul(lt, g->desc, &one, A, g->a, Bm, g->b, &zero, D, g->d, D, g->d, &al, ws, CUBLAS_WORKSPACE,
+                                  stream);
+        };
+        auto time = [&](const cublasLtMatmulAlgo_t& al) {  // median of 3 trials of 20 calls, ms per call
+            for (int i = 0; i < 3; i++) run(al, D1);
+            float t[3];
+            for (float& x : t) {
+                CK(cudaEventRecord(e0, stream));
+                for (int i = 0; i < 20; i++) run(al, D1);
+                CK(cudaEventRecord(e1, stream));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&x, e0, e1));
+            }
+            std::sort(t, t + 3);
+            return t[1] / 20;
+        };
+        CKB(run(g->algo, D0));  // the heuristic pick (also h[0]) is the reference
+        std::vector<bf16> ref(nd), x1(nd), x2(nd);
+        CK(cudaMemcpy(ref.data(), D0, nd * 2, cudaMemcpyDeviceToHost));
+        const float t_heur = time(g->algo);
+        float t_best = t_heur;
+        cublasLtMatmulAlgo_t best = g->algo;
+        int ok = 0;
+        for (int j = 0; j < found; j++) {
+            if (h[j].state != CUBLAS_STATUS_SUCCESS || run(h[j].algo, D1) != CUBLAS_STATUS_SUCCESS) continue;
+            CKB(run(h[j].algo, D2));
+            CK(cudaMemcpy(x1.data(), D1, nd * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(x2.data(), D2, nd * 2, cudaMemcpyDeviceToHost));
+            if (memcmp(x1.data(), x2.data(), nd * 2) || rel_bf16(x1, ref) > 1.0 / 256) continue;  // nondeterministic or off
+            ok++;
+            const float t = time(h[j].algo);
+            if (t < t_best) t_best = t, best = h[j].algo;
+        }
+        g->algo = best;
+        printf("gemm_tune | %s %d %d %d | %.4f | %.4f | %+.1f%% | %d/%d | %d %d %d %d\n", g->name, g->m, g->n, g->k, t_heur,
+               t_best, 100.0 * (t_heur / t_best - 1), ok, found, lt_attr(best, CUBLASLT_ALGO_CONFIG_ID),
+               lt_attr(best, CUBLASLT_ALGO_CONFIG_TILE_ID), lt_attr(best, CUBLASLT_ALGO_CONFIG_SPLITK_NUM),
+               lt_attr(best, CUBLASLT_ALGO_CONFIG_STAGES_ID));
+        char hex[2 * sizeof(cublasLtMatmulAlgo_t) + 1];
+        lt_hex(hex, best);
+        const std::string key = lt_key(*g);
+        char rest[256];
+        snprintf(rest, sizeof(rest), "%s %.4f %.4f %s", hex, t_heur, t_best, g->name);
+        bool replaced = false;
+        for (auto& [k, v] : cache)
+            if (k == key) v = rest, replaced = true;
+        if (!replaced) cache.push_back({key, rest});
+        for (bf16* p : {A, Bm, D0, D1, D2}) CK(cudaFree(p));
+    }
+    CK(cudaFree(ws));
+    FILE* f = fopen(LT_CACHE, "w");
+    if (!f) die("cannot write the cuBLASLt cache");
+    for (auto& [k, v] : cache) fprintf(f, "%s|%s\n", k.c_str(), v.c_str());
+    fclose(f);
+}
+
+// --tuned 1: each GEMM takes its measured algorithm from LT_CACHE (checked by cuBLASLt), else keeps the heuristic pick.
+static void load_tuned(std::vector<Gemm*> gs) {
+    const auto cache = lt_read();
+    for (Gemm* g : gs) {
+        bool hit = false;
+        for (const auto& [k, v] : cache) {
+            if (k != lt_key(*g)) continue;
+            cublasLtMatmulAlgo_t a;
+            cublasLtMatmulHeuristicResult_t r;
+            if (lt_unhex(a, v.c_str()) &&
+                cublasLtMatmulAlgoCheck(lt, g->desc, g->a, g->b, g->d, g->d, &a, &r) == CUBLAS_STATUS_SUCCESS)
+                g->algo = a, hit = true;
+        }
+        if (!hit) printf("gemm %s: no tuned algorithm in %s, heuristic pick kept\n", g->name, LT_CACHE);
+    }
+}
 
 // Test hook: [name[48], dtype i32 (0 bf16, 1 f32, 2 i32, 3 u8), pad i32, rows i64, cols i64] + data. Read by ref/test.py.
 static void dump(FILE* f, const char* name, const void* p, int dtype, size_t rows, size_t cols) {
@@ -525,14 +686,24 @@ static void backward(State& s, const Lins& L, FILE* df) {
         mark("bwd down dX GEMM + SwiGLU bwd");
         if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
         at(1);
-        dw_core<DW_DOWN, DIM, FFN>(gl + P_QKV + P_O + P_GU, g.dres_bf, act);
+        if constexpr (DW_LT) {
+            alias_check(!logits_live, "logits aliasing: a dW GEMM writes gring while logits are live");
+            gemm(s, L.down_dw, gl + P_QKV + P_O + P_GU, act, g.dres_bf);
+        } else {
+            dw_core<DW_DOWN, DIM, FFN>(gl + P_QKV + P_O + P_GU, g.dres_bf, act);
+        }
         mark("bwd down dW");
         put("dgu", g.dgu, 0, 2 * FFN);
         at(2);
         gemm(s, L.gu_dx, g.dln, w.gu, g.dgu);
         mark("bwd gate_up dX GEMM");
         at(3);
-        dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
+        if constexpr (DW_LT) {
+            alias_check(!logits_live, "logits aliasing: a dW GEMM writes gring while logits are live");
+            gemm(s, L.gu_dw, gl + P_QKV + P_O, ln2, g.dgu);
+        } else {
+            dw_core<DW_GU, 2 * FFN, DIM>(gl + P_QKV + P_O, g.dgu, ln2);
+        }
         mark("bwd gate_up dW");
         put("dln2", g.dln, 0, DIM);
         rmsnorm_bwd<<<N / NORM_ROWS, 256, 0, stream>>>(g.dres, g.dres_bf, g.dw_part, g.dres, g.dln, res_mid, wf.ln2);
@@ -544,7 +715,12 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.o_dx, g.datt, w.o, g.dres_bf);
         mark("bwd o dX GEMM");
         at(5);
-        dw_core<DW_O, DIM, DIM>(gl + P_QKV, g.dres_bf, att);
+        if constexpr (DW_LT) {
+            alias_check(!logits_live, "logits aliasing: a dW GEMM writes gring while logits are live");
+            gemm(s, L.o_dw, gl + P_QKV, att, g.dres_bf);
+        } else {
+            dw_core<DW_O, DIM, DIM>(gl + P_QKV, g.dres_bf, att);
+        }
         mark("bwd o dW");
         put("datt", g.datt, 0, DIM);
         at(6);
@@ -558,7 +734,12 @@ static void backward(State& s, const Lins& L, FILE* df) {
         gemm(s, L.qkv_dx, g.dln, w.qkv, g.dqkv);
         mark("bwd qkv dX GEMM");
         at(8);
-        dw_core<DW_QKV, QKV_DIM, DIM>(gl, g.dqkv, ln1);
+        if constexpr (DW_LT) {
+            alias_check(!logits_live, "logits aliasing: a dW GEMM writes gring while logits are live");
+            gemm(s, L.qkv_dw, gl, ln1, g.dqkv);
+        } else {
+            dw_core<DW_QKV, QKV_DIM, DIM>(gl, g.dqkv, ln1);
+        }
         mark("bwd qkv dW");
         char nm[48];
         snprintf(nm, sizeof(nm), "gmat.%d", l);
@@ -693,7 +874,7 @@ static void load_batch(const Tokens& d, long i, int* io, std::pair<int, int>* so
 
 int main(int argc, char** argv) {
     const char *weights = "data/" MODEL "_init.bin", *data = "data/train.bin", *dump_path = nullptr;
-    int steps = 0, evals = 0, group = 20, eager = 0;
+    int steps = 0, evals = 0, group = 20, eager = 0, tune = 0, tuned = 0;
     for (int i = 1; i < argc; i++) {
         if (i + 1 == argc) die("missing value");
         if (!strcmp(argv[i], "--weights")) weights = argv[++i];
@@ -703,7 +884,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--eval")) evals = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--group")) group = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--eager")) eager = atoi(argv[++i]);
-        else die("usage: train [--weights f] [--data f] [--steps n | --eval n] [--group n] [--dump f] [--eager 1]");
+        else if (!strcmp(argv[i], "--tune")) tune = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tuned")) tuned = atoi(argv[++i]);
+        else die("usage: train [--weights f] [--data f] [--steps n | --eval n] [--group n] [--dump f] [--eager 1] "
+                 "[--tune 1 | --tuned 1]");
     }
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
@@ -732,6 +916,17 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    Lins L = {make_fwd("o fwd", DIM, DIM),           make_fwd("gate_up fwd", 2 * FFN, DIM),
+              make_fwd("down fwd", DIM, FFN),         make_fwd("head fwd", VOCAB, DIM),
+              make_dx("qkv dX", QKV_DIM, DIM),        make_dx("o dX", DIM, DIM),
+              make_dx("gate_up dX", 2 * FFN, DIM),    make_dx("head dX", VOCAB, DIM),
+              DW_LT ? make_dw("qkv dW", QKV_DIM, DIM) : Gemm{}, DW_LT ? make_dw("o dW", DIM, DIM) : Gemm{},
+              DW_LT ? make_dw("gate_up dW", 2 * FFN, DIM) : Gemm{}, DW_LT ? make_dw("down dW", DIM, FFN) : Gemm{}};
+    std::vector<Gemm*> all = {&L.o, &L.gu, &L.down, &L.head, &L.qkv_dx, &L.o_dx, &L.gu_dx, &L.head_dx};
+    if (DW_LT) all.insert(all.end(), {&L.qkv_dw, &L.o_dw, &L.gu_dw, &L.down_dw});
+    if (tune) tune_gemms(all);
+    else if (tuned) load_tuned(all);
+
     State s;
     Arena ar{nullptr, 0};
     carve(ar, s, dump_path != nullptr);
@@ -739,13 +934,11 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&ar.base, arena_bytes));
     ar.used = 0;
     carve(ar, s, dump_path != nullptr);
-    printf("B=%d T=%d params=%zu arena=%.1f MiB adamw_state=%s\n", B, T, P_TOTAL, arena_bytes / 1048576.0,
-           ADAM8 ? "8bit" : "fp32");
+    printf("B=%d T=%d params=%zu arena=%.1f MiB adamw_state=%s gemms=%s dw=%s\n", B, T, P_TOTAL, arena_bytes / 1048576.0,
+           ADAM8 ? "8bit" : "fp32", tune || tuned ? "tuned" : "heuristic", DW_LT ? "cublaslt" : "own");
 
     load_weights(s, weights);
     init_rope(s);
-    const Lins L = {make_fwd(DIM, DIM),     make_fwd(2 * FFN, DIM), make_fwd(DIM, FFN),     make_fwd(VOCAB, DIM),
-                    make_dx(QKV_DIM, DIM), make_dx(DIM, DIM),       make_dx(2 * FFN, DIM), make_dx(VOCAB, DIM)};
     const Tokens d = map_tokens(data);
     int* h_io;
     float* h_loss;

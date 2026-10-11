@@ -27,6 +27,8 @@ CURVE_EARLY, CURVE_WINDOW_TOL, CURVE_FINAL_TOL = 50, 0.06, 0.03  # see curve()
 failures = []
 MODEL = "smol135"  # set from --model
 ADAM8 = False  # --adam8: lathe built with 8-bit AdamW moments for the layer matrices (make ADAM8=1)
+DW_LT = False  # --dw-lt: lathe built with cuBLASLt layer weight grads (make DW_LT=1)
+TUNED = False  # --tuned: lathe runs with the measured cuBLASLt algorithms (build/lt_cache.txt)
 
 
 def rel(a, b):
@@ -71,14 +73,14 @@ def lathe_grads(d, cfg):
 
 def build_lathe(B, T, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}", *(["ADAM8=1"] if adam8 else [])], cwd=ROOT,
-                   check=True)
+    flags = (["ADAM8=1"] if adam8 else []) + (["DW_LT=1"] if DW_LT else [])
+    subprocess.run(["make", "-s", f"MODEL={MODEL}", f"BATCH={B}", f"SEQ={T}", *flags], cwd=ROOT, check=True)
 
 
 def run_lathe(B, T, *args, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}"
-    out = subprocess.run([exe, *map(str, args)], capture_output=True, text=True)
+    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_dwlt' if DW_LT else ''}"
+    out = subprocess.run([exe, *map(str, args), *(["--tuned", "1"] if TUNED else [])], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
     return out.stdout
@@ -487,7 +489,7 @@ def state8(steps, B, T, window=100):
 
 
 def main():
-    global MODEL, ADAM8
+    global MODEL, ADAM8, DW_LT, TUNED
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", nargs="?", choices=["unit", "curve", "state8"], default="unit")
     ap.add_argument("--model", default="smol135")
@@ -495,8 +497,10 @@ def main():
     ap.add_argument("--T", type=int)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--adam8", action="store_true", help="test the 8-bit AdamW state build (make ADAM8=1)")
+    ap.add_argument("--dw-lt", action="store_true", help="test the cuBLASLt weight-grad build (make DW_LT=1)")
+    ap.add_argument("--tuned", action="store_true", help="run lathe with the measured cuBLASLt algorithms")
     args = ap.parse_args()
-    MODEL, ADAM8 = args.model, args.adam8
+    MODEL, ADAM8, DW_LT, TUNED = args.model, args.adam8, args.dw_lt, args.tuned
     if args.mode == "curve":
         curve(args.steps, args.B or 1, args.T or 2048)
     elif args.mode == "state8":
