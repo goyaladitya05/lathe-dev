@@ -80,7 +80,8 @@ def front(args):
     # process; a combination that does not fit 1 x 64 is skipped. Memory only: few steps per probe.
     for combo in itertools.product([False, True], repeat=4):
         flags = [f"--{n}" for n, on in zip(("compile", "ckpt", "adam8", "fused"), combo) if on]
-        probe = lambda T: subprocess.run([sys.executable, __file__, "--model", args.model, "--B", "1", "--T", str(T),
+        probe = lambda T: subprocess.run(["flock", "/tmp/gpu-bench.lock",  # shared GPU: each probe holds the lock
+                                          sys.executable, __file__, "--model", args.model, "--B", "1", "--T", str(T),
                                           "--warmup", "2", "--steps", "2", *flags], capture_output=True, text=True)
         lo, hi = 0, 4096 // 64 + 1  # in units of 64 tokens: lo fits (0 = none yet), hi does not
         last = None
