@@ -288,7 +288,9 @@ def ref_grads(model, x, y, bf16):
         _, loss = model(x, y)
     loss.backward()
     model.ckpt = False
-    return {k: p.grad.cpu() for k, p in model.named_parameters()}
+    g = {k: p.grad.cpu() for k, p in model.named_parameters()}
+    model.zero_grad(set_to_none=True)  # free the GPU grads (deepcopy for the fp8 yardstick would copy them)
+    return g
 
 
 def grad_checks(grads, model, x, y, per_tensor):
