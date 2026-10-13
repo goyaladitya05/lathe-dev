@@ -32,8 +32,11 @@ def run(args):
         make = lambda ps: torch.optim.AdamW(ps, lr=LR, betas=BETAS, eps=EPS, weight_decay=WD, fused=True)
     if args.fused:  # one optimizer per parameter, stepped as soon as that parameter's grad is complete
         opts = {p: make([p]) for p in params}
+        def hook(q):  # must return None
+            opts[q].step()
+            opts[q].zero_grad(set_to_none=True)
         for p in params:
-            p.register_post_accumulate_grad_hook(lambda q: (opts[q].step(), opts[q].zero_grad(set_to_none=True)))
+            p.register_post_accumulate_grad_hook(hook)
         opt = None
     else:
         opt = make(params) if args.adam8 else make_optimizer(model)
@@ -58,17 +61,19 @@ def run(args):
             loss = step()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
-        for _ in range(args.steps):
-            loss = step()
-        torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
+        rates = []
+        for _ in range(args.runs):
+            t0 = time.perf_counter()
+            for _ in range(args.steps):
+                loss = step()
+            torch.cuda.synchronize()
+            rates.append(args.B * args.T * args.steps / (time.perf_counter() - t0))
     except torch.OutOfMemoryError:
         print(f"# OOM {args.model} {args.B}x{args.T} {switches(args)}")
         sys.exit(3)
     peak, reserved = torch.cuda.max_memory_allocated() >> 20, torch.cuda.max_memory_reserved() >> 20
     print(f"# ok {args.model} {args.B}x{args.T} {switches(args)} loss {loss.item():.4f} peak {peak} MiB reserved "
-          f"{reserved} MiB tok/s {args.B * args.T * args.steps / dt:.0f}")
+          f"{reserved} MiB tok/s {np.median(rates):.0f} spread {100 * (max(rates) - min(rates)) / np.median(rates):.2f}%")
 
 
 def switches(args):
@@ -80,6 +85,8 @@ def front(args):
     # process; a combination that does not fit 1 x 64 is skipped. Memory only: few steps per probe.
     for combo in itertools.product([False, True], repeat=4):
         flags = [f"--{n}" for n, on in zip(("compile", "ckpt", "adam8", "fused"), combo) if on]
+        if not all(f"--{n}" in flags for n in args.only):
+            continue
         probe = lambda T: subprocess.run(["flock", "/tmp/gpu-bench.lock",  # shared GPU: each probe holds the lock
                                           sys.executable, __file__, "--model", args.model, "--B", "1", "--T", str(T),
                                           "--warmup", "2", "--steps", "2", *flags], capture_output=True, text=True)
@@ -106,6 +113,8 @@ def main():
     ap.add_argument("--T", type=int, default=1024)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--runs", type=int, default=1, help="timed segments of --steps steps: median and spread")
+    ap.add_argument("--only", nargs="*", default=[], help="front: only combinations containing these switches")
     for n in ("compile", "ckpt", "adam8", "fused"):
         ap.add_argument(f"--{n}", action="store_true")
     ap.add_argument("--front", action="store_true", help="largest tokens per step for every switch combination")
