@@ -1,6 +1,6 @@
 # lathe on a Modal L4 (sm_89, 24 GB): every correctness test (the 360M ones need ~10 GB of host RAM) and the v0
 # result set measured on the L4. Code comes from build/modal/{main,fp8} (release/modal_l4.sh stages it).
-#   release/modal_l4.sh [tests|bench|all]
+#   release/modal_l4.sh [bench|fp8|all]   (MODAL_PROFILE picks the account)
 # Logs: printed, and kept in the lathe-data volume under logs/ (modal volume get lathe-data logs/ build/modal/).
 import re
 import subprocess
@@ -18,7 +18,8 @@ image = (modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_p
          .add_local_dir(STAGE, "/src"))
 vol = modal.Volume.from_name("lathe-data", create_if_missing=True)
 app = modal.App("lathe-l4", image=image)
-GPU = dict(gpu="L4", volumes={"/vol": vol}, cpu=8, memory=32768)
+GPU = dict(gpu="L4", volumes={"/vol": vol}, cpu=4, memory=16384)  # CPU and memory are billed too: keep them small
+CPU = dict(volumes={"/vol": vol}, cpu=4, memory=16384)
 # The L4 is power-capped (72 W): clocks fall from ~2 GHz to ~0.9-1.5 GHz as it heats, so every row warms up for
 # 400 steps (about 1-2 minutes) and is timed at the settled clock.
 TIMING = "--warmup 400 --steps 40 --runs 5"
@@ -60,11 +61,10 @@ def tune(log, w, m, b, t, *flags):
             f"build/train_{m}_b{b}_t{t}{suf} --tune 1 --steps 1 --data data/train.bin | grep -E 'gemm_tune|rror'", w)
 
 
-@app.function(timeout=3600, **GPU)
-def prep():
+@app.function(timeout=3600, **CPU)
+def prep():  # downloads and weight export: no GPU
     w = setup("main")
     log = Log("prep.log")
-    log.run("nvidia-smi; python -c 'import torch; print(torch.__version__, torch.version.cuda)'", w)
     log.run("python data/prep.py --models smol135,smol360", w)
     for m in ("smol135", "smol360"):
         for k in ("init", "pretrained"):
@@ -90,38 +90,47 @@ def tests():
     log.say("== tests done")
 
 
-@app.function(timeout=6 * 3600, **GPU)
-def bench():
-    # MFU against the L4's own measured bf16 GEMM peak (written into this copy's targets/sm89.h).
+@app.function(timeout=3600, **GPU)
+def fp8_check():
+    log = Log("fp8_check.log")
+    log.run("python ref/test.py --fp8 --adam8 --model smol360 --B 1 --T 256", setup("fp8"))
+
+
+SHAPES = [(m, b, t) for m in ("smol135", "smol360") for b, t in ((1, 2048), (2, 1024), (4, 512))]
+
+
+@app.function(timeout=3 * 3600, **GPU)
+def bench(m: str, b: int, t: int):
+    # One shape per container, every stack on the same card (Modal L4s differ by ~10% in measured peak), two sittings.
+    # MFU against this card's measured bf16 GEMM peak (written into this copy's targets/sm89.h).
     w = setup("main")
-    log = Log("bench.log")
-    log.run("nvidia-smi -q -d CLOCK,POWER | grep -E 'Max Clocks|Graphics|Power Limit' | head -12", w)
+    log = Log(f"bench_{m}_{b}x{t}.log")
     out = log.run("python ref/baseline.py --mode sol", w)
     peak = max(float(x) for x in re.findall(r"\d+\^3 \| ([\d.]+)", out))  # best size, as on the laptop
     h = w / "src/targets/sm89.h"
     h.write_text(re.sub(r"SOL_BF16_TFLOPS = [\d.]+", f"SOL_BF16_TFLOPS = {peak}", h.read_text()))
-    log.say(f"# MFU below against {peak} TFLOPS (L4, measured)")
+    log.say(f"# MFU below against {peak} TFLOPS (this L4, measured)")
+    tune(log, w, m, b, t, "DW_LT=1")
+    if m == "smol360":
+        tune(log, w, m, b, t, "ADAM8=1", "DW_LT=1")
+    rows = f"--model {m} --B {b} --T {t} {TIMING}"
     for sitting in (1, 2):
         log.say(f"== sitting {sitting}")
-        for m in ("smol135", "smol360"):
-            for b, t in ((1, 2048), (2, 1024), (4, 512)):
-                rows = f"--model {m} --B {b} --T {t} {TIMING}"
-                for mode in ("eager", "compile"):
-                    if "failed" in log.run(f"python ref/baseline.py --mode {mode} {rows}", w):
-                        log.run(f"python ref/baseline.py --mode {mode} {rows}", w)  # first compile can die in capture
-                log.run(f"python ref/baseline.py --mode lathe {rows}", w)
-                tune(log, w, m, b, t, "DW_LT=1")
-                log.run(f"python ref/baseline.py --mode lathe {rows} --tuned --dw-lt", w)
-                if m == "smol360":
-                    tune(log, w, m, b, t, "ADAM8=1", "DW_LT=1")
-                    log.run(f"python ref/baseline.py --mode lathe --adam8 {rows} --tuned --dw-lt", w)
+        for mode in ("eager", "compile"):
+            if "failed" in log.run(f"python ref/baseline.py --mode {mode} {rows}", w):
+                log.run(f"python ref/baseline.py --mode {mode} {rows}", w)  # first compile can die in capture
+        log.run(f"python ref/baseline.py --mode lathe {rows}", w)
+        log.run(f"python ref/baseline.py --mode lathe {rows} --tuned --dw-lt", w)
+        if m == "smol360":
+            log.run(f"python ref/baseline.py --mode lathe --adam8 {rows} --tuned --dw-lt", w)
     log.say("== bench done")
 
 
 @app.local_entrypoint()
 def main(only: str = "all"):
     prep.remote()
-    calls = [f.spawn() for f in ((tests, bench) if only == "all" else (tests,) if only == "tests" else (bench,))]
+    calls = [bench.spawn(*sh_) for sh_ in SHAPES] if only in ("all", "bench") else []
+    calls += [fp8_check.spawn()] if only in ("all", "fp8") else []
     for c in calls:
         c.get()
 
