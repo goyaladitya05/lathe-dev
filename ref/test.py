@@ -219,8 +219,16 @@ def backward_kernel_checks(d, grads, W, x, y, cfg, B, T):
         hq, hk = cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
         dq, dk, dv = attention_bwd(f("qkv"), f("att"), f("datt"), cfg, B, T)
         unrope = lambda t: rope(t.view(B, T, -1, cfg.head_dim).transpose(1, 2), cos, -sin).transpose(1, 2).reshape(B * T, -1)
-        for name, got, w in zip(["dq", "dk", "dv"], f("dqkv_pre").split([hq, hk, hk], -1), [unrope(dq), unrope(dk), dv]):
-            check(f"attention + rope bwd {name}", rel(got, w), KERNEL_TOL)
+        # Yardstick: PyTorch's bf16 SDPA backward on the same inputs. bf16 P makes flash backward errors input-dependent
+        # (pretrained layers with massive activations exceed 2^-8), so lathe passes within 2^-8 or MEDIAN_RATIO x PyTorch's.
+        q16, k16, v16 = (t.detach().clone().requires_grad_() for t in f("qkv").to(torch.bfloat16).view(B, T, -1, cfg.head_dim)
+                         .transpose(1, 2).split([cfg.heads, cfg.kv_heads, cfg.kv_heads], 1))
+        F.scaled_dot_product_attention(q16, k16, v16, is_causal=True, enable_gqa=True).backward(
+            f("datt").to(torch.bfloat16).view(B, T, cfg.heads, cfg.head_dim).transpose(1, 2))
+        flat = lambda t: t.float().transpose(1, 2).reshape(B * T, -1)
+        torch16 = [unrope(flat(q16.grad)), unrope(flat(k16.grad)), flat(v16.grad)]
+        for name, got, w, t16 in zip(["dq", "dk", "dv"], f("dqkv_pre").split([hq, hk, hk], -1), [unrope(dq), unrope(dk), dv], torch16):
+            check(f"attention + rope bwd {name}", rel(got, w), max(KERNEL_TOL, MEDIAN_RATIO * rel(t16, w)))
         check("matmul qkv dX", rel(f("dln1"), f("dqkv_pre") @ wqkv), KERNEL_TOL)
         q, k, v = (f("dqkv_pre").T @ f("ln1")).split([hq, hk, hk])
         check("matmul qkv dW", rel(torch.cat([G("self_attn.q_proj.weight"), G("self_attn.k_proj.weight"),
