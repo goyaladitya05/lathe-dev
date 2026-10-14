@@ -352,7 +352,7 @@ def state8_check(d, cfg):
         g = d[f"gmat.{l}"].view(-1).float()
         gg = (g * g).double()
         m, v = (g.double() - b1 * g.double()).float(), (gg - b2 * gg).float()
-        for name, x in [("m", m), ("u", v.sqrt())]:
+        for name, x in [("m", m), ("u", v.double().sqrt().float())]:  # IEEE sqrtf on any CPU (torch's AVX-512 sqrt is not)
             blk = x.view(-1, 64)
             a = blk.abs().amax(1)
             sc = a / 448
