@@ -19,6 +19,9 @@ image = (modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_p
 vol = modal.Volume.from_name("lathe-data", create_if_missing=True)
 app = modal.App("lathe-l4", image=image)
 GPU = dict(gpu="L4", volumes={"/vol": vol}, cpu=8, memory=32768)
+# The L4 is power-capped (72 W): clocks fall from ~2 GHz to ~0.9-1.5 GHz as it heats, so every row warms up for
+# 400 steps (about 1-2 minutes) and is timed at the settled clock.
+TIMING = "--warmup 400 --steps 40 --runs 5"
 
 
 def setup(tree):
@@ -94,7 +97,7 @@ def bench():
     log = Log("bench.log")
     log.run("nvidia-smi -q -d CLOCK,POWER | grep -E 'Max Clocks|Graphics|Power Limit' | head -12", w)
     out = log.run("python ref/baseline.py --mode sol", w)
-    peak = float(re.search(r"16384\^3 \| ([\d.]+)", out).group(1))
+    peak = max(float(x) for x in re.findall(r"\d+\^3 \| ([\d.]+)", out))  # best size, as on the laptop
     h = w / "src/targets/sm89.h"
     h.write_text(re.sub(r"SOL_BF16_TFLOPS = [\d.]+", f"SOL_BF16_TFLOPS = {peak}", h.read_text()))
     log.say(f"# MFU below against {peak} TFLOPS (L4, measured)")
@@ -102,7 +105,7 @@ def bench():
         log.say(f"== sitting {sitting}")
         for m in ("smol135", "smol360"):
             for b, t in ((1, 2048), (2, 1024), (4, 512)):
-                rows = f"--model {m} --B {b} --T {t}"
+                rows = f"--model {m} --B {b} --T {t} {TIMING}"
                 for mode in ("eager", "compile"):
                     if "failed" in log.run(f"python ref/baseline.py --mode {mode} {rows}", w):
                         log.run(f"python ref/baseline.py --mode {mode} {rows}", w)  # first compile can die in capture
