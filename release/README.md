@@ -38,7 +38,7 @@ RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA
 | SmolLM2-360M | 2 x 1024 | 7,843 | 9,412 | 10,338 (+10%) | 11,381 (+21%) | **11,381 (+21%)** |
 | SmolLM2-360M | 4 x 512 | 7,968 | 9,766 | 10,528 (+8%) | 11,697 (+20%) | **12,027 (+23%)** |
 
-GPU memory at 360M: lathe 7.1 GiB (5.3 GiB with 8-bit state), torch.compile 8.1 GiB reserved, eager 10.1 GiB.
+GPU memory at 360M: lathe 7.0 GiB (5.3 GiB with 8-bit state), torch.compile 7.9 GiB reserved, eager 9.9 GiB reserved.
 
 **Largest batch that fits in 6 GB** (tokens per step):
 
