@@ -11,7 +11,7 @@ from pathlib import Path
 
 REV, OUT = sys.argv[1], Path(sys.argv[2])
 HERE = Path(__file__).resolve().parent
-SKIP = {"README.md", "release/export.py", "release/README.md", "release/LICENSE", "release/post.md"}
+SKIP = {"README.md"}  # and everything under release/ (private release tooling)
 
 EXACT = [  # (old, new), each must occur in the export at least once
     ("# ADAM8=1 -> build/..._adam8: 8-bit AdamW moments for the layer matrices (BENCH.md)",
@@ -54,7 +54,7 @@ tar = tarfile.open(fileobj=io.BytesIO(subprocess.run(["git", "-C", str(HERE.pare
                                                      capture_output=True).stdout))
 files = {}
 for m in tar.getmembers():
-    if m.isfile() and m.name not in SKIP:
+    if m.isfile() and m.name not in SKIP and not m.name.startswith("release/"):
         files[m.name.replace("src/chisel/", "src/sass/")] = (tar.extractfile(m).read().decode(), m.mode)
 used = {old: 0 for old, _ in EXACT}
 for name, (text, mode) in files.items():
