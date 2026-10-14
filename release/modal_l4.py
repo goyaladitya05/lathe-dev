@@ -124,3 +124,9 @@ def main(only: str = "all"):
     calls = [f.spawn() for f in ((tests, bench) if only == "all" else (tests,) if only == "tests" else (bench,))]
     for c in calls:
         c.get()
+
+
+@app.function(timeout=3600, **GPU)
+def sh(cmd: str, tree: str = "main"):
+    # One-off command in a fresh copy of a tree (debugging): modal run release/modal_l4.py::sh --cmd "..."
+    Log("sh.log").run(cmd, setup(tree))
