@@ -27,6 +27,19 @@ RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA
 |---|---|---|---|
 {T360_ROWS}
 
+**Also on an NVIDIA L4** (24 GB, sm_89, datacenter card power-capped at 72 W; Modal, CUDA 12.8, PyTorch 2.14.1). lathe was not retuned for the L4's 58 SMs (its pass schedules and SASS tiles are tuned for the laptop's 20). Each shape ran on one card, all stacks back to back, twice (the two sittings agree within 2%); the numbers are their mean. MFU against that card's measured bf16 peak (48.7-54.6 TFLOPS). Under load lathe holds the L4 at 100% utilization against its power cap, so on this card it is bound by energy per step. Tokens/s (vs torch.compile):
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned |
+|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 15,793 | 20,285 | 23,358 (+15%) | **24,486 (+21%)** | |
+| SmolLM2-135M | 2 x 1024 | 16,205 | 21,750 | 24,974 (+15%) | **25,935 (+19%)** | |
+| SmolLM2-135M | 4 x 512 | 16,349 | 22,191 | 25,843 (+16%) | **27,479 (+24%)** | |
+| SmolLM2-360M | 1 x 2048 | 7,880 | 9,501 | 10,255 (+8%) | 11,309 (+19%) | **11,433 (+20%)** |
+| SmolLM2-360M | 2 x 1024 | 7,843 | 9,412 | 10,338 (+10%) | 11,381 (+21%) | **11,381 (+21%)** |
+| SmolLM2-360M | 4 x 512 | 7,968 | 9,766 | 10,528 (+8%) | 11,697 (+20%) | **12,027 (+23%)** |
+
+GPU memory at 360M: lathe 7.1 GiB (5.3 GiB with 8-bit state), torch.compile 8.1 GiB reserved, eager 10.1 GiB.
+
 **Largest batch that fits in 6 GB** (tokens per step):
 
 | | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
