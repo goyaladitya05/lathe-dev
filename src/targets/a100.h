@@ -8,6 +8,7 @@ constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
 constexpr double SOL_BF16_TFLOPS = 269.03;      // best measured: ref/baseline.py --mode sol (8192^3, A100-SXM4-40GB)
 constexpr int GBM = 64, GWM = 16, GST = 4;       // fused-GEMM tiles (kernels.cuh): 4 stages +0.9% / +0.7% (135M / 360M 1x2048)
 constexpr bool FUSED_QKV_ROPE = true, FUSED_DOWN_DX = true;  // fused qkv + RoPE and down dX + SwiGLU GEMMs (else cuBLASLt + a pass)
+constexpr int ATT_SPLIT = 1;  // query-tile ranges per attention dK/dV block (kernels.cuh attention_bwd_dkv)
 
 // AdamW pass schedule and attention grids: see targets/rtx4050.h. Blocks without a note: rtx4050's values, untuned.
 #if defined(MODEL_smol135)

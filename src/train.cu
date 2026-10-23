@@ -145,7 +145,7 @@ struct Bwd {
     bf16* dgu;       // [N][2*FFN]
     bf16* dact;      // [N][FFN] grad of the SwiGLU output, !FUSED_DOWN_DX only
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
-    float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
+    float* part;     // [ATT_SPLIT][N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
     bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits)
@@ -240,7 +240,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
     g.dact = FUSED_DOWN_DX ? nullptr : ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
-    g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
+    g.part = ar.take<float>((size_t)ATT_SPLIT * N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
     g.gemb_rows = ar.take<float>(ND);
     g.gring = IN_LOGITS ? a.logits : ar.take<bf16>(RING_N);
@@ -624,7 +624,9 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
         bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
         if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
-        attention_bwd_dkv<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
+        dim3 grid = att_grid(GROUP);
+        grid.z *= ATT_SPLIT;
+        attention_bwd_dkv<<<grid, 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
         attention_bwd_dq<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
     }

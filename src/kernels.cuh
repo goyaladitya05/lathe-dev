@@ -532,12 +532,17 @@ __global__ void __launch_bounds__(128) attention_dsum(float* Dsum, const bf16* o
     if (!(threadIdx.x & 1)) Dsum[lrow + r] = acc;
 }
 
-// dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over all query tiles that
-// see them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). fp32 partials [N][HEADS][dk 64 | dv 64];
-// attention_bwd_finish sums the heads of each kv group.
+// dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over the query tiles that see
+// them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). The query tiles are cut into ATT_SPLIT
+// (targets/*.h) equal ranges, one block each (blockIdx.z = b * ATT_SPLIT + range), so no block walks all NT of them.
+// fp32 partials [ATT_SPLIT][N][HEADS][dk 64 | dv 64]; attention_bwd_finish sums the ranges and the group's heads.
+constexpr int SPLIT_NT = (NT + ATT_SPLIT - 1) / ATT_SPLIT;  // query tiles per range
 __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
                                                          const float* lse, const float* Dsum, int h0) {
-    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
+    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg;  // kt = 0 has the most work
+    const int b = blockIdx.z / ATT_SPLIT, sp = blockIdx.z % ATT_SPLIT;
+    const int q_lo = max(kt, sp * SPLIT_NT), q_hi = min(NT, (sp + 1) * SPLIT_NT);
+    if (q_lo >= q_hi) return;  // a range wholly before the key tile: attention_bwd_finish skips it
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
@@ -553,7 +558,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     };
     load_tile(qs[1], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);  // K and V staged in buffer 1
     load_tile(dos[1], kg + KV_HEADS * HEAD_DIM + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
-    load_q(kt, 0);
+    load_q(q_lo, 0);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
@@ -565,9 +570,9 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     const float scale = LOG2E / sqrtf((float)HEAD_DIM);
     const int k0 = kt * 64 + warp * 16 + g;
     float dk[8][4] = {}, dv[8][4] = {};
-    for (int qt = kt; qt < NT; qt++) {
-        const int buf = (qt - kt) & 1;
-        if (qt + 1 < NT) load_q(qt + 1, buf ^ 1);
+    for (int qt = q_lo; qt < q_hi; qt++) {
+        const int buf = (qt - q_lo) & 1;
+        if (qt + 1 < q_hi) load_q(qt + 1, buf ^ 1);
         cp_commit();
         cp_wait<1>();
         __syncthreads();
@@ -603,7 +608,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     const float k = scale / LOG2E;
 #pragma unroll
     for (int r = 0; r < 2; r++) {
-        float* row = part + (((size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
+        float* row = part + (((size_t)sp * N + (size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
             *(float2*)(row + 8 * j) = {dk[j][2 * r] * k, dk[j][2 * r + 1] * k};
@@ -661,11 +666,12 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
         x2 = __bfloat162float(y[d + HALF]);
     } else {
         const int kv = (u - HEADS) % KV_HEADS, off = u < HEADS + KV_HEADS ? 0 : HEAD_DIM;
-        for (int hh = kv * G; hh < (kv + 1) * G; hh++) {
-            const float* p = part + ((size_t)n * HEADS + hh) * 2 * HEAD_DIM + off;
-            x1 += p[d];
-            x2 += p[d + HALF];
-        }
+        for (int sp = n % T / 64 / SPLIT_NT; sp < ATT_SPLIT && sp * SPLIT_NT < NT; sp++)  // the ranges written for this key
+            for (int hh = kv * G; hh < (kv + 1) * G; hh++) {
+                const float* p = part + (((size_t)sp * N + n) * HEADS + hh) * 2 * HEAD_DIM + off;
+                x1 += p[d];
+                x2 += p[d + HALF];
+            }
     }
     if (u < HEADS + KV_HEADS) {  // inverse rotation
         const float2 c = cs[n % T * HALF + d];
