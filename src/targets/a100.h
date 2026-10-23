@@ -12,8 +12,9 @@ constexpr int ATT_SPLIT = 2;  // query-tile ranges per attention dK/dV block: +6
 
 // AdamW pass schedule and attention grids: see targets/rtx4050.h. Blocks without a note: rtx4050's values, untuned.
 #if defined(MODEL_smol135)
-// Pass beside the o dX GEMM on 54 blocks, best at 1x2048 and 4x512 (+4.7% and +14.5% over rtx4050's 2 / 14).
-constexpr int ADAMW_AT = 4;
+// Pass beside the o dW GEMM on 54 blocks: with the unfused GEMMs and the attention split, +0.7% over 4 (q64), which
+// was best before them (+4.7% at 1x2048, +14.5% at 4x512 over rtx4050's 2 / 14).
+constexpr int ADAMW_AT = 5;
 constexpr int ADAMW_BLOCKS = 54;
 constexpr bool ADAMW_SPLIT_LAST = false;
 constexpr int ADAMW_AT8 = ADAMW_AT;
@@ -23,7 +24,7 @@ constexpr bool ATT_HEAD_FASTEST = true;
 // At 1x2048: fp32 state beside the gate_up dX GEMM on 36 blocks (+26% over rtx4050's 0 / 14); 8-bit state from the
 // same kernel on 108 blocks. Head-fastest grids +2-3% at every schedule.
 constexpr int ADAMW_AT = 2;
-constexpr int ADAMW_BLOCKS = 36;
+constexpr int ADAMW_BLOCKS = 54;  // 36 before the unfused GEMMs and the attention split, 54 +0.25% after (q64)
 constexpr bool ADAMW_SPLIT_LAST = false;
 constexpr int ADAMW_AT8 = 2;
 constexpr int ADAMW_BLOCKS8 = 108;
