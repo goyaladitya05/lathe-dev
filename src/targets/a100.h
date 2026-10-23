@@ -17,12 +17,14 @@ constexpr int ADAMW_AT8 = ADAMW_AT;
 constexpr int ADAMW_BLOCKS8 = ADAMW_BLOCKS;
 constexpr bool ATT_HEAD_FASTEST = true;
 #elif defined(MODEL_smol360)
-constexpr int ADAMW_AT = 0;
-constexpr int ADAMW_BLOCKS = 14;
+// At 1x2048: fp32 state beside the gate_up dX GEMM on 36 blocks (+26% over rtx4050's 0 / 14); 8-bit state from the
+// same kernel on 108 blocks. Head-fastest grids +2-3% at every schedule.
+constexpr int ADAMW_AT = 2;
+constexpr int ADAMW_BLOCKS = 36;
 constexpr bool ADAMW_SPLIT_LAST = false;
-constexpr int ADAMW_AT8 = ADAMW_AT;
-constexpr int ADAMW_BLOCKS8 = BATCH * SEQ <= 1536 ? 16 : 14;
-constexpr bool ATT_HEAD_FASTEST = false;
+constexpr int ADAMW_AT8 = 2;
+constexpr int ADAMW_BLOCKS8 = 108;
+constexpr bool ATT_HEAD_FASTEST = true;
 #else
 #error "no schedule for this model on a100"
 #endif
