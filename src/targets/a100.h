@@ -5,7 +5,7 @@
 constexpr int TARGET_CC = 80, TARGET_SMS = 108;  // train.cu checks the device against these
 constexpr int CE_THREADS = 512;                 // threads per cross-entropy row
 constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
-constexpr double SOL_BF16_TFLOPS = 0;           // not measured yet: ref/baseline.py --mode sol on this GPU
+constexpr double SOL_BF16_TFLOPS = 269.03;      // best measured: ref/baseline.py --mode sol (8192^3, A100-SXM4-40GB)
 
 // AdamW pass schedule and attention grids: see targets/rtx4050.h. Untuned here: rtx4050's values until measured.
 #if defined(MODEL_smol135)
