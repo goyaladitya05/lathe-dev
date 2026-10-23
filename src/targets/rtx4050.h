@@ -9,7 +9,6 @@ constexpr double SOL_BF16_TFLOPS = 25.61;       // best measured: ref/baseline.p
 constexpr int GBM = 64, GWM = 16, GST = 3;       // fused-GEMM tiles (kernels.cuh), swept on sm89 (BENCH.md profiles)
 constexpr bool FUSED_QKV_ROPE = true, FUSED_DOWN_DX = true;  // fused qkv + RoPE and down dX + SwiGLU GEMMs (else cuBLASLt + a pass)
 constexpr int ATT_SPLIT = 1;  // query-tile ranges per attention dK/dV block (kernels.cuh attention_bwd_dkv)
-constexpr int ATT_SPLIT_FWD = 1;  // key-tile ranges per attention forward block (kernels.cuh attention_fwd)
 
 // AdamW pass schedule (train.cu backward). Layer l + 1's pass starts with kernel ADAMW_AT of layer l's backward:
 // 0 down dX + SwiGLU, 1 down dW, 2 gate_up dX, 3 gate_up dW, 4 o dX, 5 o dW, 6 attention, 7 qkv dX, 8 qkv dW; it runs
