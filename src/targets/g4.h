@@ -9,6 +9,7 @@ constexpr double SOL_BF16_TFLOPS = 0;           // not measured yet: ref/baselin
 constexpr int GBM = 64, GWM = 16, GST = 3;       // fused-GEMM tiles (kernels.cuh), rtx4050's until tuned
 constexpr bool FUSED_QKV_ROPE = true, FUSED_DOWN_DX = true;  // fused qkv + RoPE and down dX + SwiGLU GEMMs (else cuBLASLt + a pass)
 constexpr int ATT_SPLIT = 1;  // query-tile ranges per attention dK/dV block (kernels.cuh attention_bwd_dkv)
+constexpr int ATT_SPLIT_FWD = 1;  // key-tile ranges per attention forward block (kernels.cuh attention_fwd)
 
 // AdamW pass schedule and attention grids: see targets/rtx4050.h. Untuned here: rtx4050's values until measured.
 #if defined(MODEL_smol135)

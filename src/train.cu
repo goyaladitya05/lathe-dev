@@ -125,6 +125,8 @@ struct Acts {
     bf16* qkv;        // [LAYERS][N][QKV_DIM] post-RoPE
     bf16* att;        // [LAYERS][N][DIM]
     float* lse;       // [LAYERS][B][HEADS][T]
+    float* opart;     // [ATT_SPLIT_FWD][N][HEADS][HEAD_DIM] attention_fwd's per-range outputs (ATT_SPLIT_FWD > 1)
+    float2* mlpart;   // [ATT_SPLIT_FWD][N][HEADS] their row max and sum
     bf16* gu;         // [LAYERS][N][2*FFN]
     bf16* act;        // [LAYERS][N][FFN]
     bf16* lnf;        // [N][DIM]
@@ -223,6 +225,8 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     a.qkv = ar.take<bf16>((size_t)LAYERS * N * QKV_DIM);
     a.att = ar.take<bf16>(LAYERS * ND);
     a.lse = ar.take<float>((size_t)LAYERS * N * HEADS);
+    a.opart = ATT_SPLIT_FWD > 1 ? ar.take<float>((size_t)ATT_SPLIT_FWD * N * DIM) : nullptr;
+    a.mlpart = ATT_SPLIT_FWD > 1 ? ar.take<float2>((size_t)ATT_SPLIT_FWD * N * HEADS) : nullptr;
     a.gu = ar.take<bf16>((size_t)LAYERS * N * 2 * FFN);
     a.act = ar.take<bf16>((size_t)LAYERS * N * FFN);
     a.lnf = ar.take<bf16>(ND);
@@ -571,7 +575,11 @@ static void forward(State& s, const Lins& L, FILE* df) {
         }
         mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
-        attention_fwd<<<att_grid(HEADS), 128, 0, stream>>>(att, lse, qkv);
+        dim3 agrid = att_grid(HEADS);
+        agrid.z *= ATT_SPLIT_FWD;
+        attention_fwd<<<agrid, 128, 0, stream>>>(att, lse, qkv, a.opart, a.mlpart);
+        if constexpr (ATT_SPLIT_FWD > 1)
+            attention_fwd_combine<<<cdiv(N * HEADS * HEAD_DIM / 8, 256), 256, 0, stream>>>(att, lse, a.opart, a.mlpart);
         mark("fwd attention");
         put("att", att, 0, DIM);
         gemm(s, L.o, a.branch, w.o, att);
