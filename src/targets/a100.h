@@ -7,10 +7,11 @@ constexpr int CE_THREADS = 512;                 // threads per cross-entropy row
 constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
 constexpr double SOL_BF16_TFLOPS = 269.03;      // best measured: ref/baseline.py --mode sol (8192^3, A100-SXM4-40GB)
 
-// AdamW pass schedule and attention grids: see targets/rtx4050.h. Untuned here: rtx4050's values until measured.
+// AdamW pass schedule and attention grids: see targets/rtx4050.h. Blocks without a note: rtx4050's values, untuned.
 #if defined(MODEL_smol135)
-constexpr int ADAMW_AT = 2;
-constexpr int ADAMW_BLOCKS = 7;
+// Pass beside the o dX GEMM on 54 blocks, best at 1x2048 and 4x512 (+4.7% and +14.5% over rtx4050's 2 / 14).
+constexpr int ADAMW_AT = 4;
+constexpr int ADAMW_BLOCKS = 54;
 constexpr bool ADAMW_SPLIT_LAST = false;
 constexpr int ADAMW_AT8 = ADAMW_AT;
 constexpr int ADAMW_BLOCKS8 = ADAMW_BLOCKS;
