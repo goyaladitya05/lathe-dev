@@ -3,6 +3,7 @@
 #   python ref/model.py [--model smol135] --pretrained data/smol135_pretrained.bin   real SmolLM2 weights
 import argparse
 import json
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ from torch.utils.checkpoint import checkpoint
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
+# The GPU lathe is built for (make TARGET=..., src/targets/), from the environment like make itself reads it.
+TARGET = os.environ.get("TARGET", "rtx4050")
+TARGET_SUFFIX = "" if TARGET == "rtx4050" else f"_{TARGET}"
 MAGIC, VERSION = 0x4854414C, 1  # "LATH"
 
 

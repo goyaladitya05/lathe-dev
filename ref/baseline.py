@@ -15,13 +15,13 @@ import time
 import numpy as np
 import torch
 
-from model import DATA, ROOT, Config, Model, get_batch, init_weights, make_optimizer
+from model import DATA, ROOT, TARGET, TARGET_SUFFIX, Config, Model, get_batch, init_weights, make_optimizer
 
 SMI_QUERY = "clocks.sm,clocks.mem,temperature.gpu,power.draw"
 
 
 def sol_tflops():
-    return float(re.search(r"SOL_BF16_TFLOPS = ([\d.]+)", (ROOT / "src/targets/sm89.h").read_text()).group(1))
+    return float(re.search(r"SOL_BF16_TFLOPS = ([\d.]+)", (ROOT / f"src/targets/{TARGET}.h").read_text()).group(1))
 
 
 def flops_per_token(cfg, T):
@@ -191,7 +191,7 @@ def engine_train(args, stack, cmd, env, versions):
 def lathe_train(args):
     flags = (["ADAM8=1"] if args.adam8 else []) + (["DW_LT=1"] if args.dw_lt else [])
     subprocess.run(["make", "-s", f"MODEL={args.model}", f"BATCH={args.B}", f"SEQ={args.T}", *flags], cwd=ROOT, check=True)
-    exe = ROOT / f"build/train_{args.model}_b{args.B}_t{args.T}{'_adam8' if args.adam8 else ''}{'_dwlt' if args.dw_lt else ''}"
+    exe = ROOT / f"build/train_{args.model}_b{args.B}_t{args.T}{'_adam8' if args.adam8 else ''}{'_dwlt' if args.dw_lt else ''}{TARGET_SUFFIX}"
     tags = [t for t, on in (("8-bit state", args.adam8), ("tuned gemms", args.tuned), ("cuBLASLt dW", args.dw_lt)) if on]
     engine_train(args, "lathe" + (f" ({', '.join(tags)})" if tags else ""),
                  [exe, "--data", DATA / "train.bin", *(["--tuned", 1] if args.tuned else [])], {}, "CUDA 12.8")

@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #include MODEL_H  // models/<MODEL>.h, from the Makefile
-#include "targets/sm89.h"
+#include TARGET_H  // targets/<TARGET>.h, from the Makefile
 
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
 // AdamW, same as ref/model.py make_optimizer.
@@ -60,7 +60,8 @@ static_assert(!ADAM8 || (P_MAT % Q8_BLOCK == 0 && P_QKV % Q8_BLOCK == 0), "whole
 
 // Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header
 // per model and token count (CHISEL_DW_H, from the Makefile) with the cubins of the four matrix shapes. Shapes without
-// one use dw_bf16; the bits are the same either way (chisel e037).
+// one use dw_bf16; the bits are the same either way (chisel e037). sm_89 targets only (the Makefile).
+#if defined(CHISEL_DW_H)
 #if __has_include(CHISEL_DW_H)
 #include CHISEL_DW_H
 #define HAVE_CHISEL_DW 1
@@ -68,6 +69,7 @@ static_assert(chisel_dw_qkv_m == QKV_DIM && chisel_dw_qkv_n == DIM && chisel_dw_
                   chisel_dw_gu_m == 2 * FFN && chisel_dw_gu_n == DIM && chisel_dw_down_m == DIM && chisel_dw_down_n == FFN &&
                   chisel_dw_qkv_k == N && chisel_dw_o_k == N && chisel_dw_gu_k == N && chisel_dw_down_k == N,
               "chisel header built for another shape");
+#endif
 #endif
 
 #define CK(x) ck_cuda((x), #x, __LINE__)
@@ -621,14 +623,14 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
 }
 
 // Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is
-// adamw_stream on the side stream, started with a kernel of the next layer's backward (ADAMW_AT, models/*.h: a window
+// adamw_stream on the side stream, started with a kernel of the next layer's backward (ADAMW_AT, targets/*.h: a window
 // of compute-bound kernels; wider passes slow what they run beside, narrower ones spill into the memory-bound kernels
 // after it: chisel e048-e051, e054), and joined at the end of backward. The ring slot a layer writes was last read by
 // the pass of the layer RING above.
-static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
+static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see targets/*.h");
 // 8-bit state builds have their own start and width (the pass moves 16.25 instead of 28 bytes per parameter).
 constexpr int PASS_AT = ADAM8 ? ADAMW_AT8 : ADAMW_AT, PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
-static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see models/*.h");
+static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see targets/*.h");
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
@@ -675,7 +677,7 @@ static void backward(State& s, const Lins& L, FILE* df) {
         bf16* act = a.act + (size_t)l * N * FFN;
         float* lse = a.lse + (size_t)l * N * HEADS;
         const LayerDump put{df, l};
-        auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in models/*.h)
+        auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in targets/*.h)
             if (k == PASS_AT && l + 1 < LAYERS) adamw_pass(l + 1, 0, P_MAT);
             if (ADAMW_SPLIT_LAST && k == 6 && l == 0) adamw_pass(0, P_QKV, P_MAT);
         };
@@ -892,6 +894,11 @@ int main(int argc, char** argv) {
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
     CK(cudaSetDevice(0));
+    cudaDeviceProp prop;
+    CK(cudaGetDeviceProperties(&prop, 0));
+    if (prop.major * 10 + prop.minor != TARGET_CC) die("this build is for another GPU (make TARGET=..., src/targets/)");
+    if (prop.multiProcessorCount != TARGET_SMS)
+        printf("note: %d SMs, the target header assumes %d (schedules untuned here)\n", prop.multiProcessorCount, TARGET_SMS);
     int least, greatest;
     CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
     CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));

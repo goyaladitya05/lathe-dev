@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model import (DATA, ROOT, Config, Model, from_lathe, get_batch, init_weights, lathe_layout, load_lathe,
+from model import (DATA, ROOT, TARGET_SUFFIX, Config, Model, from_lathe, get_batch, init_weights, lathe_layout, load_lathe,
                    make_optimizer, rope, rope_table)
 
 KERNEL_TOL = 2 ** -8  # rel L2 for kernels with bf16 outputs: one bf16 unit roundoff
@@ -79,7 +79,7 @@ def build_lathe(B, T, adam8=None):
 
 def run_lathe(B, T, *args, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_dwlt' if DW_LT else ''}"
+    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_dwlt' if DW_LT else ''}{TARGET_SUFFIX}"
     out = subprocess.run([exe, *map(str, args), *(["--tuned", "1"] if TUNED else [])], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")

@@ -415,7 +415,7 @@ __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, cons
 // in those units. P (and dS in backward) are rounded to bf16 for the tensor-core products, as flash attention does.
 // Each thread owns rows g and g+8 of its warp's 16 rows and columns 8j + 2t + {0,1} of the 64-column block.
 constexpr int NT = T / 64;
-// Attention grids: (NT x heads, 1, B) with the head index fastest when ATT_HEAD_FASTEST (models/*.h), so every head's
+// Attention grids: (NT x heads, 1, B) with the head index fastest when ATT_HEAD_FASTEST (targets/*.h), so every head's
 // longest blocks dispatch first, else (NT, heads, B). att_tile: the block's tile in dispatch order; att_head: its head.
 template <int H> __device__ __forceinline__ int att_tile() { return ATT_HEAD_FASTEST ? blockIdx.x / H : blockIdx.x; }
 template <int H> __device__ __forceinline__ int att_head() { return ATT_HEAD_FASTEST ? blockIdx.x % H : blockIdx.y; }
