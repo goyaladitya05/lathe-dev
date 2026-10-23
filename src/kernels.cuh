@@ -336,7 +336,9 @@ __device__ __forceinline__ void gemm_nn_loop(float (&acc)[WM / 16][8][4], const 
     }
 }
 
-constexpr int GBM = 64, GWM = 16, GST = 3;  // fused-GEMM tiles, swept on sm89 (BENCH.md profiles)
+// GBM, GWM, GST: the fused GEMMs' block rows, warp rows and pipeline stages, per GPU in targets/*.h. The k order is the
+// same for every tile shape, so the results are too.
+static_assert(GBM % GWM == 0 && GWM % 16 == 0 && GST * (GBM + 64) * GBK * 2 <= 48 * 1024, "fused-GEMM tiles");
 static_assert(N % GBM == 0 && QKV_DIM % 64 == 0 && FFN % 64 == 0, "whole GEMM tiles");
 
 // qkv = ln1 . Wqkv^T, then RoPE on the q and k heads, rounding to bf16 before and after the rotation (PyTorch's
@@ -380,10 +382,10 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
 // Block = GBM tokens x 64 FFN columns. The block's gate and up lines, the epilogue's only DRAM reads, are prefetched
 // into L2 at the start so they arrive while the GEMM runs (chisel e052).
 __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
-    static_assert(GBM / GWM * 32 == 2 * GBM, "one 128-byte line per thread: GBM rows x (64 gate + 64 up columns)");
     __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
     const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
-    asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (threadIdx.x >> 1)) * 2 * FFN + (threadIdx.x & 1) * FFN + bn));
+    for (int i = threadIdx.x; i < 2 * GBM; i += GBM / GWM * 32)  // 128-byte lines: GBM rows x (64 gate + 64 up columns)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (i >> 1)) * 2 * FFN + (i & 1) * FFN + bn));
     float acc[GWM / 16][8][4] = {};
     gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
