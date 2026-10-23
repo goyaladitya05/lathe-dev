@@ -7,6 +7,7 @@ constexpr int CE_THREADS = 512;                 // threads per cross-entropy row
 constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
 constexpr double SOL_BF16_TFLOPS = 0;           // not measured yet: ref/baseline.py --mode sol on this GPU
 constexpr int GBM = 64, GWM = 16, GST = 3;       // fused-GEMM tiles (kernels.cuh), rtx4050's until tuned
+constexpr bool FUSED_QKV_ROPE = true, FUSED_DOWN_DX = true;  // fused qkv + RoPE and down dX + SwiGLU GEMMs (else cuBLASLt + a pass)
 
 // AdamW pass schedule and attention grids: see targets/rtx4050.h. Untuned here: rtx4050's values until measured.
 #if defined(MODEL_smol135)

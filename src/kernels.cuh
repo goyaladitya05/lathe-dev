@@ -677,6 +677,43 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
     }
 }
 
+// Unfused forms for targets where cuBLASLt plus a separate pass beats the fused GEMMs (FUSED_QKV_ROPE, FUSED_DOWN_DX
+// in targets/*.h). RoPE in place on cuBLASLt's bf16 qkv: one thread per rotation pair (token, q or k head, d < 32).
+__global__ void rope_qkv(bf16* qkv, const float2* cs) {
+    constexpr int ROT = HEADS + KV_HEADS;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * ROT * 32) return;
+    const int d = i % 32, u = i / 32 % ROT, n = i / (32 * ROT);
+    bf16* y = qkv + (size_t)n * QKV_DIM + u * 64 + d;
+    const float x1 = __bfloat162float(y[0]), x2 = __bfloat162float(y[32]);
+    const float2 c = cs[n % T * 32 + d];
+    y[0] = __float2bfloat16(x1 * c.x - x2 * c.y);
+    y[32] = __float2bfloat16(x2 * c.x + x1 * c.y);
+}
+
+// down_dx_swiglu's epilogue on cuBLASLt's bf16 dact = dmo . Wd, 8 FFN columns per thread.
+__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t)N * FFN) return;
+    const size_t n = i / FFN, c = i % FFN;
+    float da[8], gv[8], uv[8];
+    load8(da, dact + i);
+    load8(gv, gu + n * 2 * FFN + c);
+    load8(uv, gu + n * 2 * FFN + FFN + c);
+#pragma unroll
+    for (int e = 0; e < 8; e += 2) {
+        float dg[2], du[2];
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const float g = gv[e + k], sig = 1.f / (1.f + expf(-g));
+            du[k] = da[e + k] * round_bf16(g / (1.f + expf(-g)));
+            dg[k] = round_bf16(da[e + k] * uv[e + k]) * sig * (1.f + g * (1.f - sig));
+        }
+        *(bf162*)(dgu + n * 2 * FFN + c + e) = __floats2bfloat162_rn(dg[0], dg[1]);
+        *(bf162*)(dgu + n * 2 * FFN + FFN + c + e) = __floats2bfloat162_rn(du[0], du[1]);
+    }
+}
+
 // act = bf16(bf16(silu(g)) * u), with gu = [N][gate FFN | up FFN]. Two roundings, as PyTorch silu then mul.
 __global__ void swiglu(bf16* act, const bf16* gu) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

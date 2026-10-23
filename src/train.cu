@@ -143,6 +143,7 @@ struct Bwd {
     bf16* datt;      // [N][DIM]
     bf16* dqkv;      // [N][QKV_DIM]
     bf16* dgu;       // [N][2*FFN]
+    bf16* dact;      // [N][FFN] grad of the SwiGLU output, !FUSED_DOWN_DX only
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
     float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
@@ -237,6 +238,7 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.datt = ar.take<bf16>(ND);
     g.dqkv = ar.take<bf16>((size_t)N * QKV_DIM);
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
+    g.dact = FUSED_DOWN_DX ? nullptr : ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
     g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
@@ -333,7 +335,8 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 }
 
 // The cuBLASLt GEMMs of linears y = x W^T, W [out][in] row-major, x/y [N][features] row-major. The qkv forward,
-// the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw).
+// the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw), unless
+// the target unfuses the first two (FUSED_QKV_ROPE, FUSED_DOWN_DX) or DW_LT=1 takes the dWs.
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
 static Gemm make_fwd(const char* name, int out, int in) { return make_gemm(name, true, false, out, N, in); }
 // DW_LT=1: weight grad dW[out][in] = dy^T x by cuBLASLt into the gradient ring (A = x [N][in], B = dy [N][out]^T).
@@ -359,6 +362,7 @@ struct Lins {
     Gemm o, gu, down, head;             // forward
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
     Gemm qkv_dw, o_dw, gu_dw, down_dw;  // DW_LT: weight grads
+    Gemm qkv, down_dx;                  // !FUSED_QKV_ROPE, !FUSED_DOWN_DX
 };
 
 // cuBLASLt algorithm by measurement. --tune 1: for every GEMM, up to LT_CANDIDATES heuristic candidates are timed on
@@ -559,7 +563,12 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
-        qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        if constexpr (FUSED_QKV_ROPE) {
+            qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        } else {
+            gemm(s, L.qkv, qkv, w.qkv, ln1);
+            rope_qkv<<<cdiv(N * (HEADS + KV_HEADS) * 32, 256), 256, 0, stream>>>(qkv, s.rope);
+        }
         mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<att_grid(HEADS), 128, 0, stream>>>(att, lse, qkv);
@@ -684,7 +693,12 @@ static void backward(State& s, const Lins& L, FILE* df) {
 
         put("dres_out", g.dres, 1, DIM);
         at(0);
-        down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        if constexpr (FUSED_DOWN_DX) {
+            down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        } else {
+            gemm(s, L.down_dx, g.dact, w.down, g.dres_bf);
+            swiglu_bwd<<<cdiv((size_t)N * FFN / 8, 256), 256, 0, stream>>>(g.dgu, g.dact, gu);
+        }
         mark("bwd down dX GEMM + SwiGLU bwd");
         if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
         at(1);
@@ -928,9 +942,13 @@ int main(int argc, char** argv) {
               make_dx("qkv dX", QKV_DIM, DIM),        make_dx("o dX", DIM, DIM),
               make_dx("gate_up dX", 2 * FFN, DIM),    make_dx("head dX", VOCAB, DIM),
               DW_LT ? make_dw("qkv dW", QKV_DIM, DIM) : Gemm{}, DW_LT ? make_dw("o dW", DIM, DIM) : Gemm{},
-              DW_LT ? make_dw("gate_up dW", 2 * FFN, DIM) : Gemm{}, DW_LT ? make_dw("down dW", DIM, FFN) : Gemm{}};
+              DW_LT ? make_dw("gate_up dW", 2 * FFN, DIM) : Gemm{}, DW_LT ? make_dw("down dW", DIM, FFN) : Gemm{},
+              FUSED_QKV_ROPE ? Gemm{} : make_fwd("qkv fwd", QKV_DIM, DIM),
+              FUSED_DOWN_DX ? Gemm{} : make_dx("down dX", DIM, FFN)};
     std::vector<Gemm*> all = {&L.o, &L.gu, &L.down, &L.head, &L.qkv_dx, &L.o_dx, &L.gu_dx, &L.head_dx};
     if (DW_LT) all.insert(all.end(), {&L.qkv_dw, &L.o_dw, &L.gu_dw, &L.down_dw});
+    if (!FUSED_QKV_ROPE) all.push_back(&L.qkv);
+    if (!FUSED_DOWN_DX) all.push_back(&L.down_dx);
     if (tune) tune_gemms(all);
     else if (tuned) load_tuned(all);
 
