@@ -10,7 +10,7 @@ constexpr int GBM = 64, GWM = 16, GST = 3;       // fused-GEMM tiles (kernels.cu
 constexpr bool FUSED_QKV_ROPE = true, FUSED_DOWN_DX = true;  // fused qkv + RoPE and down dX + SwiGLU GEMMs (else cuBLASLt + a pass)
 constexpr int ATT_SPLIT = 1;  // query-tile ranges per attention dK/dV block (kernels.cuh attention_bwd_dkv)
 
-// AdamW pass schedule and attention grids: see targets/rtx4050.h. Untuned here: rtx4050's values until measured.
+// AdamW pass schedule and attention grids: see targets/rtx4050.h. Blocks without a note: rtx4050's values, untuned.
 #if defined(MODEL_smol135)
 // At 1x2048, own dW: beside the o dX GEMM on 29 blocks (+2.5% over rtx4050's 2 / 14).
 constexpr int ADAMW_AT = 4;
