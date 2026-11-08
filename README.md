@@ -34,7 +34,44 @@ MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, t
 
 torch.compile + AdamW8bit fits at most 1,536 tokens per step (one sequence), so it has no entry at the larger shapes.
 
-**Largest batch that fits in 6 GB** (tokens per step):
+**Also measured on other GPUs** (Colab, one card each, target headers `TARGET=l4|a100|g4`; tokens/s, MFU where recorded, against that card's measured bf16 peak):
+
+*NVIDIA L4*, measured 2026-11-04:
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 16,174 | 20,495 | 22,779 | 24,651 |  | +20.3% |
+| SmolLM2-135M | 2 x 1024 | 16,756 | 21,642 | 24,999 | 27,020 |  | +24.9% |
+| SmolLM2-135M | 4 x 512 | 17,014 | 22,304 | 26,601 | 28,699 |  | +28.7% |
+| SmolLM2-360M | 1 x 2048 | 7,762 | 9,306 | 10,115 | 10,882 | 11,554 | +24.2% |
+| SmolLM2-360M | 2 x 1024 | 7,942 | 9,631 | 11,157 | 11,737 | 12,453 | +29.3% |
+| SmolLM2-360M | 4 x 512 | 8,089 | 9,828 | 11,253 | 12,188 | 13,010 | +32.4% |
+
+*NVIDIA A100-SXM4-40GB*, measured 2026-10-23:
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 17,249 | 66,003 | 80,350 (30.4%) | 85,956 (32.6%) |  | +30.2% |
+| SmolLM2-135M | 2 x 1024 | 17,516 | 72,992 | 91,987 (31.2%) | 99,521 (33.8%) |  | +36.3% |
+| SmolLM2-135M | 4 x 512 | 17,157 | 76,047 | 99,395 (31.8%) | 106,559 (34.1%) |  | +40.1% |
+| SmolLM2-360M | 1 x 2048 | 16,110 | 34,662 | 40,528 (38.4%) | 43,790 (41.5%) | 42,003 | +26.3% |
+| SmolLM2-360M | 2 x 1024 | 16,157 | 37,235 | 44,863 (39.3%) | 48,875 (42.9%) | 46,223 | +31.3% |
+| SmolLM2-360M | 4 x 512 | 15,970 | 38,770 | 47,144 (39.7%) | 51,324 (43.2%) | 48,446 | +32.4% |
+
+*NVIDIA RTX PRO 6000 Blackwell Server Edition*, measured 2026-10-23:
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 54,617 | 97,810 | 113,531 (27.6%) | 112,242 |  | +16.1% |
+| SmolLM2-135M | 2 x 1024 | 58,202 | 108,252 | 125,252 (27.3%) | 123,340 |  | +15.7% |
+| SmolLM2-135M | 4 x 512 | 56,487 | 113,849 | 133,806 (27.5%) | 131,352 |  | +17.5% |
+| SmolLM2-360M | 1 x 2048 | 36,469 | 52,729 | 60,758 (37.0%) | 59,082 | 54,926 | +15.2% |
+| SmolLM2-360M | 2 x 1024 | 38,388 | 56,595 | 64,766 (36.5%) | 63,183 | 57,292 | +14.4% |
+| SmolLM2-360M | 4 x 512 | 39,375 | 58,759 | 68,124 (36.9%) | 65,872 | 59,794 | +15.9% |
+
+The A100 and G4 diagnostics (per-op step breakdowns, lathe and torch.compile) were never run, so the reasons for the lower MFU on those cards are not measured.
+
+**Largest batch that fits in 6 GB** (tokens per step; memory fronts measured from 2026-10-05 to 2026-10-13, the fused-optimizer PyTorch fronts on 2026-11-04):
 
 | | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
 |---|---|---|---|---|

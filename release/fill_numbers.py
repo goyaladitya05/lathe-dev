@@ -137,6 +137,63 @@ for model, label, st, m360, e8, t in (("SmolLM2-135M", "context >= 1024", "fp32"
 put("FAST_ROWS", "\n".join(fr), "BENCH 2026-10-13 rows of record, lathe tuned + cuBLASLt dW, fastest per group")
 put("FAST_DATE", rec[0]["date"], "BENCH 2026-10-13 rows of record")
 
+# Other GPUs: the final sitting table of each Colab card, cells copied as BENCH records them.
+def final_table(marker):
+    lines = BENCH.splitlines()
+    k = next(i for i, l in enumerate(lines) if marker in l)
+    date = None
+    for l in reversed(lines[:k + 1]):  # the nearest date at or above the marker, within its section
+        m = re.search(r"\d{4}-\d{2}-\d{2}", l)
+        if m and date is None:
+            date = m.group(0)
+        if l.startswith("## "):
+            break
+    tbl = []
+    for l in lines[k + 1:]:
+        if l.startswith("|"):
+            tbl.append([c.strip().replace("**", "") for c in l.strip("|").split("|")])
+        elif tbl:
+            break
+    head, rows = tbl[0], tbl[2:]
+    col = lambda pred: next((i for i, h in enumerate(head) if pred(h)), None)
+    cols = [col(lambda h: h == "eager"), col(lambda h: h == "compile"), col(lambda h: h == "lathe"),
+            col(lambda h: "tuned" in h and "8-bit" not in h), col(lambda h: "8-bit" in h and "tuned" in h),
+            col(lambda h: "vs compile" in h)]
+    out = ["| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |",
+           "|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        out.append("| SmolLM2-" + r[0] + " | " + shape(r[1]) + " | " + " | ".join(r[c] if c is not None else "" for c in cols) + " |")
+    return date, "\n".join(out), k + 1
+
+
+for key, marker in (("L4", "**L4 final sitting**"), ("A100", "**A100 final sitting**"), ("G4", "**G4 final sitting**")):
+    d, t, line = final_table(marker)
+    put(f"{key}_DATE", d, f"BENCH {marker} (line {line}): nearest date above it in its section")
+    put(f"{key}_ROWS", t, f"BENCH {marker} table, cells verbatim")
+
+# Memory fronts: the dates of the BENCH sections the front values come from.
+front_dates = []
+for anchor in ("SmolLM2-135M, largest tokens per step", "135M memory front, 8-bit state", "| 8-bit state | 2,304 (", "## Strongest PyTorch at 360M"):
+    k = BENCH.index(anchor)
+    m = list(re.finditer(r"\d{4}-\d{2}-\d{2}", BENCH[:k]))
+    front_dates.append(m[-1].group(0))
+put("FRONT_FIRST", min(front_dates), "BENCH: nearest date before each memory-front table (" + ", ".join(front_dates) + ")")
+put("FRONT_LAST", max(front_dates), "BENCH: nearest date before each memory-front table")
+
+# What was tried and dropped: BENCH rows of the reverted changes.
+def pcts(anchor):
+    line = next(l for l in BENCH.splitlines() if anchor in l)
+    cell = line.split("|")[2]
+    return [float(x) for x in re.findall(r"[+-]\d+\.\d+(?=%)", cell)]
+def span(v, digits=2):
+    lo, hi = sorted(v, key=abs)[0], sorted(v, key=abs)[-1]
+    return f"{lo:+.{digits}f} to {hi:+.{digits}f}%"
+put("DROP_HEADS", span(pcts("(e055) |")), "BENCH chisel follow-ups table, e055 row")
+put("DROP_DQ", span(pcts("(e061) |")), "BENCH chisel follow-ups table, e061 row")
+put("DROP_DSBUF", span(pcts("(e062) |")), "BENCH chisel follow-ups table, e062 row")
+atomic = [float(m) for m in re.findall(r"^\| \d+x\d+ \| [\d,]+ / [\d,]+ \| [\d,]+ / [\d,]+ \| ([+-]\d+\.\d+)%", BENCH, re.M)]
+put("DROP_ATOMIC", span(atomic, 1), "BENCH atomic-dq table, gain column")
+
 # ---- repository facts (not measurements)
 peak = re.search(r"SOL_BF16_TFLOPS = ([\d.]+)", (ROOT / "src/targets/rtx4050.h").read_text()).group(1)
 put("PEAK", peak, "src/targets/rtx4050.h SOL_BF16_TFLOPS")

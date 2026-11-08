@@ -30,7 +30,23 @@ MFU = tokens/s x model FLOPs per token (6N + causal attention) / {PEAK} TFLOPS, 
 
 torch.compile + AdamW8bit fits at most {F360_COMPILE} tokens per step (one sequence), so it has no entry at the larger shapes.
 
-**Largest batch that fits in 6 GB** (tokens per step):
+**Also measured on other GPUs** (Colab, one card each, target headers `TARGET=l4|a100|g4`; tokens/s, MFU where recorded, against that card's measured bf16 peak):
+
+*NVIDIA L4*, measured {L4_DATE}:
+
+{L4_ROWS}
+
+*NVIDIA A100-SXM4-40GB*, measured {A100_DATE}:
+
+{A100_ROWS}
+
+*NVIDIA RTX PRO 6000 Blackwell Server Edition*, measured {G4_DATE}:
+
+{G4_ROWS}
+
+The A100 and G4 diagnostics (per-op step breakdowns, lathe and torch.compile) were never run, so the reasons for the lower MFU on those cards are not measured.
+
+**Largest batch that fits in 6 GB** (tokens per step; memory fronts measured from {FRONT_FIRST} to {FRONT_LAST}, the fused-optimizer PyTorch fronts on {SITTING_DATE}):
 
 | | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
 |---|---|---|---|---|

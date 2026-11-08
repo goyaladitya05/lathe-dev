@@ -9,7 +9,7 @@ Shapes, the model and the GPU are compile-time constants. There is no op library
 
 ## Results
 
-RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA 12.8, PyTorch 2.14.1, torchao 0.18.0. All rows from one sitting at the release commit; each number is the median of 5 timed runs, accepted when two attempts agree within 0.5%, on an idle machine with the GPU below 55 C before each run. MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, the best bf16 GEMM rate measured on this GPU.
+RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA 12.8, PyTorch 2.14.1, torchao 0.18.0. All rows from one sitting (2026-11-04, commit 5479e35; the engine code is unchanged since); each number is the median of 5 timed runs, accepted when two attempts agree within 0.5%, on an idle machine with the GPU below 55 C before each run. MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, the best bf16 GEMM rate measured on this GPU.
 
 **SmolLM2-135M against PyTorch.** Same model, init, data, batch shape and precision recipe (bf16 compute, fp32 accumulation, fp32 master weights, AdamW). Tokens/s (MFU):
 
@@ -33,27 +33,51 @@ RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA
 
 torch.compile + AdamW8bit fits at most 1,536 tokens per step (one sequence), so it has no entry at the larger shapes.
 
-**Also on an NVIDIA L4** (24 GB, sm_89, datacenter card power-capped at 72 W; Modal, CUDA 12.8, PyTorch 2.14.1). lathe was not retuned for the L4's 58 SMs (its pass schedules and SASS tiles are tuned for the laptop's 20). Each shape ran on one card, all stacks back to back, twice (the two sittings agree within 2%); the numbers are their mean. MFU against that card's measured bf16 peak (48.7-54.6 TFLOPS). Under load lathe holds the L4 at 100% utilization against its power cap, so on this card it is bound by energy per step. Tokens/s (vs torch.compile):
+**Also measured on other GPUs** (Colab; one card of each type; all stacks back to back on that card; each GPU with its own target header, `make TARGET=...`). Tokens/s, with MFU where it was recorded (against that card's measured bf16 peak); the last column compares the faster lathe build with torch.compile.
 
-| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned |
-|---|---|---|---|---|---|---|
-| SmolLM2-135M | 1 x 2048 | 15,793 | 20,285 | 23,358 (+15%) | **24,486 (+21%)** | |
-| SmolLM2-135M | 2 x 1024 | 16,205 | 21,750 | 24,974 (+15%) | **25,935 (+19%)** | |
-| SmolLM2-135M | 4 x 512 | 16,349 | 22,191 | 25,843 (+16%) | **27,479 (+24%)** | |
-| SmolLM2-360M | 1 x 2048 | 7,880 | 9,501 | 10,255 (+8%) | 11,309 (+19%) | **11,433 (+20%)** |
-| SmolLM2-360M | 2 x 1024 | 7,843 | 9,412 | 10,338 (+10%) | 11,381 (+21%) | **11,381 (+21%)** |
-| SmolLM2-360M | 4 x 512 | 7,968 | 9,766 | 10,528 (+8%) | 11,697 (+20%) | **12,027 (+23%)** |
+*NVIDIA L4* (24 GB, sm_89, power-capped; `TARGET=l4`), measured 2026-11-04:
 
-GPU memory at 360M: lathe 7.0 GiB (5.3 GiB with 8-bit state), torch.compile 7.9 GiB reserved, eager 9.9 GiB reserved.
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 16,174 | 20,495 | 22,779 | 24,651 |  | +20.3% |
+| SmolLM2-135M | 2 x 1024 | 16,756 | 21,642 | 24,999 | 27,020 |  | +24.9% |
+| SmolLM2-135M | 4 x 512 | 17,014 | 22,304 | 26,601 | 28,699 |  | +28.7% |
+| SmolLM2-360M | 1 x 2048 | 7,762 | 9,306 | 10,115 | 10,882 | 11,554 | +24.2% |
+| SmolLM2-360M | 2 x 1024 | 7,942 | 9,631 | 11,157 | 11,737 | 12,453 | +29.3% |
+| SmolLM2-360M | 4 x 512 | 8,089 | 9,828 | 11,253 | 12,188 | 13,010 | +32.4% |
 
-**Largest batch that fits in 6 GB** (tokens per step):
+*NVIDIA A100-SXM4-40GB* (sm_80; `TARGET=a100`), measured 2026-10-23:
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 17,249 | 66,003 | 80,350 (30.4%) | 85,956 (32.6%) |  | +30.2% |
+| SmolLM2-135M | 2 x 1024 | 17,516 | 72,992 | 91,987 (31.2%) | 99,521 (33.8%) |  | +36.3% |
+| SmolLM2-135M | 4 x 512 | 17,157 | 76,047 | 99,395 (31.8%) | 106,559 (34.1%) |  | +40.1% |
+| SmolLM2-360M | 1 x 2048 | 16,110 | 34,662 | 40,528 (38.4%) | 43,790 (41.5%) | 42,003 | +26.3% |
+| SmolLM2-360M | 2 x 1024 | 16,157 | 37,235 | 44,863 (39.3%) | 48,875 (42.9%) | 46,223 | +31.3% |
+| SmolLM2-360M | 4 x 512 | 15,970 | 38,770 | 47,144 (39.7%) | 51,324 (43.2%) | 48,446 | +32.4% |
+
+*NVIDIA RTX PRO 6000 Blackwell Server Edition* (sm_120; `TARGET=g4`), measured 2026-10-23:
+
+| model | batch x context | PyTorch eager | torch.compile | lathe | lathe, tuned | lathe, 8-bit state, tuned | faster lathe vs torch.compile |
+|---|---|---|---|---|---|---|---|
+| SmolLM2-135M | 1 x 2048 | 54,617 | 97,810 | 113,531 (27.6%) | 112,242 |  | +16.1% |
+| SmolLM2-135M | 2 x 1024 | 58,202 | 108,252 | 125,252 (27.3%) | 123,340 |  | +15.7% |
+| SmolLM2-135M | 4 x 512 | 56,487 | 113,849 | 133,806 (27.5%) | 131,352 |  | +17.5% |
+| SmolLM2-360M | 1 x 2048 | 36,469 | 52,729 | 60,758 (37.0%) | 59,082 | 54,926 | +15.2% |
+| SmolLM2-360M | 2 x 1024 | 38,388 | 56,595 | 64,766 (36.5%) | 63,183 | 57,292 | +14.4% |
+| SmolLM2-360M | 4 x 512 | 39,375 | 58,759 | 68,124 (36.9%) | 65,872 | 59,794 | +15.9% |
+
+The diagnostics planned for the A100 and the G4 were never run: there is no breakdown of where a training step's GPU time goes on either card, for lathe or for torch.compile, so why lathe reaches a lower MFU there than on the laptop is not measured. On the G4, lathe's own weight-gradient kernel was faster than cuBLASLt's, so its default build is the faster one there.
+
+**Largest batch that fits in 6 GB** (tokens per step; memory fronts measured from 2026-10-05 to 2026-10-13, the fused-optimizer PyTorch fronts on 2026-11-04):
 
 | | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
 |---|---|---|---|---|
 | SmolLM2-135M | 2,048 | 3,584 | 5,632 | 6,656 |
 | SmolLM2-360M | 192 with fp32 AdamW in the backward; 1,152 with AdamW8bit | does not fit with fp32 AdamW; 1,536 with AdamW8bit | 704 | 2,304 |
 
-lathe keeps no fp32 gradients: each weight gradient goes from its GEMM to the optimizer as bf16, and AdamW runs inside the backward pass. Its fixed memory is 14 bytes per parameter with fp32 optimizer state and 8.1 with 8-bit state, against PyTorch's 16 (10 with AdamW8bit) plus its autocast copies.
+lathe keeps no full fp32 gradients: each layer's weight gradients go from their GEMM to the optimizer as bf16 (only the embedding gradient keeps fp32 rows, one per distinct token), and AdamW runs beside the backward pass. Its fixed memory is 14 bytes per parameter with fp32 optimizer state and 8.1 with 8-bit state, against PyTorch's 16 (10 with AdamW8bit) plus its autocast copies.
 
 **Fastest configurations** (lathe, tuned; measured 2026-10-13, before the release sitting, on the same engine code):
 
@@ -72,7 +96,7 @@ At a fixed number of tokens per step, shorter contexts are faster, since causal 
 - **No gradient tensors.** Each layer's weight gradients go into a small ring buffer, and an AdamW pass for that layer runs on a low-priority side stream while the next layer's backward runs. The embedding gradient keeps one fp32 row per distinct token in the batch.
 - **Hand-written kernels where they pay.** The qkv projection with RoPE in its epilogue; the down projection's input gradient with SwiGLU's backward; cross-entropy writing the logit gradients in place; the head and embedding gradients fused with their AdamW update. Flash-style causal GQA attention, forward and a deterministic backward. The other matmuls are cuBLASLt, with fp32 accumulation like PyTorch's bf16 autocast.
 - **8-bit optimizer state** (`make ADAM8=1`, a separate build). The AdamW moments of the layer matrices are stored as FP8 E4M3 in blocks of 64 with one fp32 scale per block (the second moment as its square root). The update runs in fp32 and the fp32 master weights are unchanged. This cuts optimizer memory from 8 to 2.1 bytes per parameter.
-- **Measured GEMM algorithms** (`--tune 1`, then `--tuned 1`). For every GEMM, lathe times up to 32 cuBLASLt candidates and keeps the fastest one that is run-to-run deterministic and numerically close to the default pick. Gains per GEMM range from 0% to 19%, and 2.5-3.5% per step at 360M.
+- **Measured GEMM algorithms** (`--tune 1`, then `--tuned 1`). For every GEMM, lathe times up to 32 cuBLASLt candidates and keeps the fastest one that is run-to-run deterministic and numerically close to the default pick. Gains per GEMM range from 0% to 19.2%, and 2.5-3.5% per step at 360M.
 - **Prebuilt SASS** (`src/sass/`) for the layer weight-gradient GEMMs at a few token counts: hand-scheduled sm_89 cubins, bit-identical to the CUDA version they replace. In the tuned build (`DW_LT=1`) cuBLASLt takes over these GEMMs.
 
 ## Correctness
@@ -112,7 +136,7 @@ build/train_smol360_b2_t1152_adam8_dwlt --tuned 1 --data data/train.bin --steps 
 
 `./reproduce.sh` runs everything above for both models, then the benchmarks behind the tables. `ref/baseline.py` runs one benchmark row (`--mode eager|compile|lathe|tinygrad`); `ref/torch_strong.py` runs the strongest PyTorch setups (torch.compile, activation checkpointing, torchao AdamW8bit, optimizer fused into backward).
 
-lathe is a training engine for measuring and checking, not a training framework: one GPU, two models, the batch shape fixed at build time, no checkpoint saving.
+lathe is a training engine for measuring and checking, not a training framework: one GPU, two models, the batch shape fixed at build time, a constant learning rate, no checkpoint saving.
 
 ## What was tried and dropped
 
@@ -122,9 +146,9 @@ lathe is a training engine for measuring and checking, not a training framework:
 | single-pass attention backward with atomic dq | +0.1 to +1.8%, but non-deterministic; deterministic backward kept |
 | fused gate/up GEMM + SwiGLU | no faster than cuBLASLt plus a separate SwiGLU kernel |
 | AdamW on a second stream as one big pass | no gain while the backward already filled all SMs; it paid off later as small per-layer passes beside compute-bound kernels |
-| one attention-backward pass over more heads | slower (-0.3 to -0.9%) |
-| attention dq as hand-scheduled SASS | no faster (-0.04 to -0.3%) |
-| one dS buffer per attention group | slower (-0.9 to -1.4%) |
+| one attention-backward pass over more heads | slower (-0.33 to -0.85%) |
+| attention dq as hand-scheduled SASS | no faster (-0.01 to -0.31%) |
+| one dS buffer per attention group | slower (-0.94 to -1.37%) |
 | PyTorch fp8 (torchao) as a baseline | rowwise: 12-22% slower than bf16 torch.compile on this GPU; tensorwise: faster, but diverges to NaN within 120 steps |
 | llm.c as a baseline | its CUDA trainer is GPT-2 only (no RoPE, RMSNorm, SwiGLU or GQA) |
 
@@ -132,4 +156,4 @@ In progress: FP8 (E4M3) GEMMs for the layer linears, +5.5-6% at 360M so far, not
 
 ## License
 
-MIT
+Apache-2.0 (see LICENSE)
