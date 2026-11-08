@@ -32,7 +32,7 @@ MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, t
 | 1 x 2048 | - | 4,431 | **7,479 (74.4%)** |
 | 9 x 256 | - | 5,023 | **8,798 (76.2%)** |
 
-torch.compile + AdamW8bit fits at most 1x1,536 tokens per step, so it has no entry at the larger shapes.
+torch.compile + AdamW8bit fits at most 1,536 tokens per step (one sequence), so it has no entry at the larger shapes.
 
 **Largest batch that fits in 6 GB** (tokens per step):
 

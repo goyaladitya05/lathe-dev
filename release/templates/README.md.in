@@ -1,0 +1,44 @@
+# lathe
+
+A training engine for one model on one GPU, written from scratch in C++/CUDA: SmolLM2-135M and SmolLM2-360M on an RTX 4050 Laptop GPU (6 GB). Same math as PyTorch (same initial weights, same batches, gradients within bf16 tolerance, matching loss curves), more training tokens per second, less memory.
+
+**Results:** on SmolLM2-135M, {CMP_COMPILE} faster than torch.compile and {CMP_EAGER} faster than PyTorch eager at {CMP_MFU} MFU (lathe tuned, depending on the batch shape); SmolLM2-360M trains at {H360_TOKS} tokens/s ({H360_MFU} MFU) with 8-bit optimizer state, {T360_RATIO} the speed of the fastest PyTorch setup that fits in 6 GB, shape for shape.
+
+Shapes, the model and the GPU are compile-time constants. There is no op library, no autograd, no allocator: one memory arena, hand-written forward and backward, one CUDA graph per training step. The engine is about {LOC} lines of C++/CUDA (`src/train.cu`, `src/kernels.cuh`), plus chisel's generated SASS for some weight-gradient GEMMs.
+
+## Results
+
+Measured on an RTX 4050 Laptop GPU (6 GB, laptop in its performance power profile), all stacks in one sitting ({SITTING_DATE}, commit {SITTING_COMMIT}); each number is the median of 5 timed runs on an idle machine, GPU below 55 C before each run. Same model, init, data, batch shape and precision recipe (bf16 compute with fp32 accumulation, fp32 master weights, AdamW). Tokens/s (MFU):
+
+| SmolLM2-135M | PyTorch eager | torch.compile (max-autotune) | lathe | lathe, tuned |
+|---|---|---|---|---|
+| 1x2048 | {E1} | {C1} | {L1} | **{LT1}** |
+| 2x1024 | {E2} | {C2} | {L2} | **{LT2}** |
+| 4x512 | {E3} | {C3} | {L3} | **{LT3}** |
+
+"lathe, tuned" is the same engine with cuBLASLt algorithms picked by measurement (`--tuned 1`) and the layer weight gradients through cuBLASLt (`DW_LT=1`).
+
+Per-process GPU memory at these shapes (nvidia-smi): lathe {MEM_L}, torch.compile {MEM_C}, eager {MEM_E}.
+
+MFU = tokens/s x model FLOPs per token (6N + causal attention) / {PEAK} TFLOPS, the best bf16 GEMM rate measured on this GPU with cuBLASLt.
+
+**SmolLM2-360M.** PyTorch's fp32 weights, gradients and AdamW moments alone take 5.4 GiB, so a standard PyTorch training loop does not fit even 1x64. It fits with torchao's 8-bit AdamW, or with fp32 AdamW run inside the backward (eager, up to 1x{F360_FUSED}). lathe here uses its own 8-bit optimizer state. Tokens/s against the PyTorch setups that fit:
+
+| SmolLM2-360M | torch.compile + AdamW8bit | torch.compile + checkpointing + AdamW8bit | lathe, 8-bit state, tuned |
+|---|---|---|---|
+{T360_ROWS}
+
+torch.compile + AdamW8bit fits at most {F360_COMPILE} tokens per step (one sequence), so it has no entry at the larger shapes.
+
+**Largest batch that fits in 6 GB** (tokens per step):
+
+| | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
+|---|---|---|---|---|
+| SmolLM2-135M | {M135_E} | {M135_C} | {M135_L} | {M135_L8} |
+| SmolLM2-360M | {F360_FUSED} with fp32 AdamW in the backward; {F360_EAGER} with AdamW8bit | does not fit with fp32 AdamW; {F360_COMPILE} with AdamW8bit | {M360_L} | {M360_L8} |
+
+lathe keeps no fp32 weight gradients: each layer's weight gradients go from the GEMM into a small ring of bf16 buffers that an AdamW pass on a side stream consumes during the backward, and the embedding gradient keeps one fp32 row per distinct token. Its fixed memory is 14 bytes per parameter (fp32 master, bf16 copy, two AdamW moments) against PyTorch's 16 (fp32 weight, gradient, two moments) plus its autocast copies.
+
+Correctness, checked by `ref/test.py` for both models: every kernel against fp32 math on its own inputs, logits and loss against an fp32 reference (at most 2x PyTorch bf16's own error), every one of the 272 (135M) / 290 (360M) parameter gradients, one AdamW step bit-exact against PyTorch's fused AdamW (the 8-bit state byte for byte), CUDA graph replay bit-identical to eager, and loss curves against PyTorch bf16 and fp32 (1,000 steps for 135M, 300 to 500 for 360M).
+
+The public README is `release/README.md`; `release/export.py` builds the public tree.

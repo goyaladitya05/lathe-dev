@@ -1,5 +1,6 @@
 # Fill the README placeholders ({NAME}) from the release sitting log and BENCH.md; no number is typed by hand.
 #   python3 release/fill_numbers.py LOG BENCH TEMPLATE OUT [TEMPLATE OUT ...]
+#   templates: release/templates/README.md.in -> README.md, release/templates/release_README.md.in -> release/README.md
 #   LOG    build/night/release_nov04.log (ROW / STRONG / front lines of the release sitting)
 #   BENCH  BENCH.md (memory fronts, PyTorch's 360M front, the 2026-10-13 tuned rows of record)
 # Prints every value with its source, fails on an unknown or unfilled placeholder, then lists any number in the output
