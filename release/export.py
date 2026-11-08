@@ -30,7 +30,7 @@ EXACT = [  # (old, new), each must occur in the export at least once
      "// with a prebuilt core run hand-scheduled SASS instead (src/sass/, same bits)."),
     ("(make ADAM8=1; format in BENCH.md \"8-bit AdamW state\")", "(make ADAM8=1)"),
     ("Tuned at 1x704 (chisel e054: 14 blocks", "Tuned at 1x704 (14 blocks"),
-    ("(chisel e066, 8-bit at 1xT)", "(8-bit at 1xT)"),
+    ("(chisel e066, 8-bit at\n// 1xT)", "(8-bit at\n// 1xT)"),  # wrapped in src/targets/rtx4050.h
     ("instead of chisel's / dw_bf16", "instead of the SASS cores / dw_bf16"),
     ("(adamw_stream8, BENCH.md)", "(adamw_stream8)"),
     ("// Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header",
