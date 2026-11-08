@@ -39,7 +39,7 @@ EXACT = [  # (old, new), each must occur in the export at least once
     ("\"chisel header built for another shape\"", "\"SASS header built for another shape\""),
     ("dw_bf16 / chisel's, head_dw_adamw", "dw_bf16 / SASS, head_dw_adamw"),
     ("the memory-bound kernels\n// after it: chisel e048-e051, e054), and", "the memory-bound kernels\n// after it), and"),
-    ("BENCH.md\nproject.md\n", ""),
+    ("BENCH.md\nproject.md\nFINDINGS.md\nREADME.draft.md\nreports/\nresearch_notes/\n", ""),
 ]
 REGEX = [  # generic rewrites after EXACT
     (r" \(chisel e\d+(?:[-,] ?e\d+)*\)", ""),
