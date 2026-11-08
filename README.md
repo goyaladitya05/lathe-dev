@@ -1,47 +1,44 @@
 # lathe
 
-A training engine for one model on one GPU, written from scratch in C++/CUDA: SmolLM2-135M (and SmolLM2-360M) on an RTX 4050 Laptop. Same math as PyTorch (same initial weights, same batches, gradients within bf16 tolerance, matching loss curves), more training tokens per second, less memory.
+A training engine for one model on one GPU, written from scratch in C++/CUDA: SmolLM2-135M and SmolLM2-360M on an RTX 4050 Laptop GPU (6 GB). Same math as PyTorch (same initial weights, same batches, gradients within bf16 tolerance, matching loss curves), more training tokens per second, less memory.
 
-**Results:** on SmolLM2-135M, 32-41% faster than torch.compile and 66-82% faster than PyTorch eager at 63-64% MFU (depending on the batch size), with room for 1.6x torch.compile's largest batch; SmolLM2-360M, which PyTorch cannot fit in 6 GB, trains at 5,257 tokens/s.
+**Results:** on SmolLM2-135M, {CMP_COMPILE} faster than torch.compile and {CMP_EAGER} faster than PyTorch eager at {CMP_MFU} MFU (lathe tuned, depending on the batch shape); SmolLM2-360M trains at {H360_TOKS} tokens/s ({H360_MFU} MFU) with 8-bit optimizer state, {T360_RATIO} the speed of the fastest PyTorch setup that fits in 6 GB, shape for shape.
 
-Shapes, the model and the GPU are compile-time constants. There is no op library, no autograd, no allocator: one memory arena, hand-written forward and backward, one CUDA graph per training step. The whole engine is 1,462 lines of C++/CUDA.
+Shapes, the model and the GPU are compile-time constants. There is no op library, no autograd, no allocator: one memory arena, hand-written forward and backward, one CUDA graph per training step. The engine is about {LOC} lines of C++/CUDA (`src/train.cu`, `src/kernels.cuh`), plus chisel's generated SASS for some weight-gradient GEMMs.
 
 ## Results
 
-Measured on an RTX 4050 Laptop GPU (6 GB, laptop in its performance power profile). Training throughput (tokens/s, higher is better) and MFU, all stacks measured in one sitting (commit 6d5bf8a, 2026-10-05), same model, init, data, batch shape and precision recipe (bf16 compute with fp32 accumulation, fp32 master weights, AdamW):
+Measured on an RTX 4050 Laptop GPU (6 GB, laptop in its performance power profile), all stacks in one sitting ({SITTING_DATE}, commit {SITTING_COMMIT}); each number is the median of 5 timed runs on an idle machine, GPU below 55 C before each run. Same model, init, data, batch shape and precision recipe (bf16 compute with fp32 accumulation, fp32 master weights, AdamW). Tokens/s (MFU):
 
-| SmolLM2-135M | PyTorch eager | torch.compile (max-autotune) | lathe |
+| SmolLM2-135M | PyTorch eager | torch.compile (max-autotune) | lathe | lathe, tuned |
+|---|---|---|---|---|
+| 1x2048 | {E1} | {C1} | {L1} | **{LT1}** |
+| 2x1024 | {E2} | {C2} | {L2} | **{LT2}** |
+| 4x512 | {E3} | {C3} | {L3} | **{LT3}** |
+
+"lathe, tuned" is the same engine with cuBLASLt algorithms picked by measurement (`--tuned 1`) and the layer weight gradients through cuBLASLt (`DW_LT=1`).
+
+Per-process GPU memory at these shapes (nvidia-smi): lathe {MEM_L}, torch.compile {MEM_C}, eager {MEM_E}.
+
+MFU = tokens/s x model FLOPs per token (6N + causal attention) / {PEAK} TFLOPS, the best bf16 GEMM rate measured on this GPU with cuBLASLt.
+
+**SmolLM2-360M.** PyTorch's fp32 weights, gradients and AdamW moments alone take 5.4 GiB, so a standard PyTorch training loop does not fit even 1x64. It fits with torchao's 8-bit AdamW, or with fp32 AdamW run inside the backward (eager, up to 1x{F360_FUSED}). lathe here uses its own 8-bit optimizer state. Tokens/s against the PyTorch setups that fit:
+
+| SmolLM2-360M | torch.compile + AdamW8bit | torch.compile + checkpointing + AdamW8bit | lathe, 8-bit state, tuned |
 |---|---|---|---|
-| 1x2048 | 9,555 (38.0%) | 12,034 (47.9%) | **15,853 (63.1%)** |
-| 2x1024 | 10,107 (36.0%) | 12,974 (46.3%) | **17,874 (63.7%)** |
-| 4x512 | 10,472 (35.2%) | 13,438 (45.1%) | **19,013 (63.9%)** |
+{T360_ROWS}
 
-lathe is 32-41% faster than torch.compile and 66-82% faster than eager at every shape.
+torch.compile + AdamW8bit fits at most 1x{F360_COMPILE} tokens per step, so it has no entry at the larger shapes.
 
-Per-process GPU memory at these shapes (nvidia-smi): lathe 3.2 GiB, torch.compile 4.1 GiB, eager 5.3 GiB.
+**Largest batch that fits in 6 GB** (tokens per step):
 
-MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, the best bf16 GEMM rate measured on this GPU with cuBLASLt (99% of its theoretical peak at 2.52 GHz).
-
-**Largest batch that fits in 6 GB** (SmolLM2-135M, tokens per step):
-
-| | max tokens per step | tokens/s, largest batch at T=512 | at T=1024 | at T=2048 |
+| | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
 |---|---|---|---|---|
-| PyTorch eager | 2,048 | 10,472 (4x512) | 10,107 (2x1024) | 9,555 (1x2048) |
-| torch.compile | 3,584 | 14,810 (7x512) | 13,952 (3x1024) | 12,034 (1x2048) |
-| lathe | 5,632 | **19,927 (11x512, 66.9% MFU)** | **18,663 (5x1024)** | **16,531 (2x2048)** |
+| SmolLM2-135M | {M135_E} | {M135_C} | {M135_L} | {M135_L8} |
+| SmolLM2-360M | {F360_FUSED} with fp32 AdamW in the backward; {F360_EAGER} with AdamW8bit | does not fit with fp32 AdamW; {F360_COMPILE} with AdamW8bit | {M360_L} | {M360_L8} |
 
-At each engine's own limit, lathe fits 1.6x the tokens per step of torch.compile and 2.75x those of eager, and trains 1.35x and 1.90x as many tokens per second.
+lathe keeps no fp32 weight gradients: each layer's weight gradients go from the GEMM into a small ring of bf16 buffers that an AdamW pass on a side stream consumes during the backward, and the embedding gradient keeps one fp32 row per distinct token. Its fixed memory is 14 bytes per parameter (fp32 master, bf16 copy, two AdamW moments) against PyTorch's 16 (fp32 weight, gradient, two moments) plus its autocast copies.
 
-lathe stores no matrix gradients (each one goes from the dW GEMM's registers straight into AdamW) and only one fp32 row per distinct token for the embedding gradient, so its fixed memory is 14 bytes per parameter (fp32 master, bf16 copy, two AdamW moments) against PyTorch's 16 (fp32 weight, gradient, two moments) plus its autocast copies.
+Correctness, checked by `ref/test.py` for both models: every kernel against fp32 math on its own inputs, logits and loss against an fp32 reference (at most 2x PyTorch bf16's own error), every one of the 272 (135M) / 290 (360M) parameter gradients, one AdamW step bit-exact against PyTorch's fused AdamW (the 8-bit state byte for byte), CUDA graph replay bit-identical to eager, and loss curves against PyTorch bf16 and fp32 (1,000 steps for 135M, 300 to 500 for 360M).
 
-**SmolLM2-360M** (fp32 weights, gradients and AdamW moments alone take 5.4 GiB in PyTorch):
-
-| | fits in 6 GB | largest step | tokens/s | MFU |
-|---|---|---|---|---|
-| PyTorch eager | no (out of memory at 1x64) | - | - | - |
-| torch.compile | no (out of memory at 1x64) | - | - | - |
-| lathe | yes | 1x704 | **5,257** | **47.2%** |
-
-At 1x512 and 1x256 lathe runs 4,461 and 2,738 tokens/s (39.5% and 23.7% MFU). MFU is lower than for 135M because AdamW still moves about 9.4 GB per step however few tokens the step trains on.
-
-Correctness, checked by `ref/test.py` for both models: every kernel against fp32 math on its own inputs, logits and loss against an fp32 reference (at most 2x PyTorch bf16's own error), every one of the 272 (135M) / 290 (360M) parameter gradients, one AdamW step bit-exact against PyTorch's fused AdamW, CUDA graph replay bit-identical to eager, and loss curves (1000 steps against PyTorch bf16 and fp32 for 135M; 100 steps against an fp32 CPU reference for 360M).
+The public README is `release/README.md`; `release/export.py` builds the public tree.

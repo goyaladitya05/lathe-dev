@@ -3,13 +3,13 @@
 A from-scratch C++/CUDA training engine for one model on one GPU: SmolLM2-135M and SmolLM2-360M, trained with AdamW on an RTX 4050 Laptop GPU (6 GB). Same math as PyTorch (same initial weights, same batches, gradients within bf16 tolerance, matching loss curves), more tokens per second, less memory.
 
 - **SmolLM2-135M:** {CMP_COMPILE} faster than torch.compile (max-autotune) and {CMP_EAGER} faster than PyTorch eager, at {CMP_MFU} MFU.
-- **SmolLM2-360M:** {H360_TOKS} tokens/s at a 2 x 1152 batch ({H360_MFU} MFU). PyTorch needs an 8-bit optimizer just to fit the model in 6 GB; its fastest configuration that fits runs {T360_BEST} tokens/s.
+- **SmolLM2-360M:** {H360_TOKS} tokens/s at a 2 x 1152 batch ({H360_MFU} MFU), {T360_RATIO} the speed of the fastest PyTorch setup that fits in 6 GB, shape for shape. PyTorch fits the model only with an 8-bit optimizer, or with fp32 AdamW run inside the backward at up to 1 x {F360_FUSED} tokens; its fastest configuration that fits runs {T360_BEST} tokens/s ({T360_BEST_AT}).
 
-Shapes, the model and the GPU are compile-time constants. There is no op library, no autograd and no allocator: one memory arena, a hand-written forward and backward, one CUDA graph per training step. The engine is about 2,100 lines of C++/CUDA, plus prebuilt SASS for some weight-gradient GEMMs.
+Shapes, the model and the GPU are compile-time constants. There is no op library, no autograd and no allocator: one memory arena, a hand-written forward and backward, one CUDA graph per training step. The engine is about {LOC} lines of C++/CUDA, plus prebuilt SASS for some weight-gradient GEMMs.
 
 ## Results
 
-RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA 12.8, PyTorch 2.14.1, torchao 0.18.0. All rows from one sitting at the release commit; each number is the median of 5 timed runs, accepted when two attempts agree within 0.5%, on an idle machine with the GPU below 55 C before each run. MFU = tokens/s x model FLOPs per token (6N + causal attention) / 25.61 TFLOPS, the best bf16 GEMM rate measured on this GPU.
+RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA 12.8, PyTorch 2.14.1, torchao 0.18.0. All rows from one sitting at the release commit; each number is the median of 5 timed runs, accepted when two attempts agree within 0.5%, on an idle machine with the GPU below 55 C before each run. MFU = tokens/s x model FLOPs per token (6N + causal attention) / {PEAK} TFLOPS, the best bf16 GEMM rate measured on this GPU.
 
 **SmolLM2-135M against PyTorch.** Same model, init, data, batch shape and precision recipe (bf16 compute, fp32 accumulation, fp32 master weights, AdamW). Tokens/s (MFU):
 
@@ -21,11 +21,13 @@ RTX 4050 Laptop GPU (6 GB, sm_89, laptop in its performance power profile), CUDA
 
 "lathe, tuned" is the same engine with cuBLASLt algorithms picked by measurement and the layer weight gradients through cuBLASLt (`--tuned 1` on a `DW_LT=1` build; see [Tuning](#tuning)).
 
-**SmolLM2-360M.** PyTorch's fp32 weights, gradients and two AdamW moments alone take 5.4 GiB, so plain PyTorch does not fit even a 1 x 64 batch. With torchao's 8-bit AdamW it fits, and activation checkpointing lets it reach long contexts. lathe here uses its own 8-bit optimizer state (below). Tokens/s (MFU):
+**SmolLM2-360M.** PyTorch's fp32 weights, gradients and two AdamW moments alone take 5.4 GiB, so a standard PyTorch training loop does not fit even a 1 x 64 batch. Running fp32 AdamW inside the backward (a per-parameter hook, so the gradients never all exist at once) fits up to 1 x {F360_FUSED} in eager mode. With torchao's 8-bit AdamW it fits more easily, and activation checkpointing lets it reach long contexts. lathe here uses its own 8-bit optimizer state (below). Tokens/s (MFU):
 
 | batch x context | torch.compile + torchao AdamW8bit | torch.compile + checkpointing + AdamW8bit | lathe, 8-bit state, tuned |
 |---|---|---|---|
 {T360_ROWS}
+
+torch.compile + AdamW8bit fits at most 1 x {F360_COMPILE} tokens per step, so it has no entry at the larger shapes.
 
 **Also on an NVIDIA L4** (24 GB, sm_89, datacenter card power-capped at 72 W; Modal, CUDA 12.8, PyTorch 2.14.1). lathe was not retuned for the L4's 58 SMs (its pass schedules and SASS tiles are tuned for the laptop's 20). Each shape ran on one card, all stacks back to back, twice (the two sittings agree within 2%); the numbers are their mean. MFU against that card's measured bf16 peak (48.7-54.6 TFLOPS). Under load lathe holds the L4 at 100% utilization against its power cap, so on this card it is bound by energy per step. Tokens/s (vs torch.compile):
 
@@ -44,19 +46,16 @@ GPU memory at 360M: lathe 7.0 GiB (5.3 GiB with 8-bit state), torch.compile 7.9 
 
 | | PyTorch eager | torch.compile | lathe | lathe, 8-bit state |
 |---|---|---|---|---|
-| SmolLM2-135M | 2,048 | 3,584 | 5,632 | 6,656 |
-| SmolLM2-360M | does not fit (fp32 AdamW); {F360_EAGER} with AdamW8bit | does not fit (fp32 AdamW); {F360_COMPILE} with AdamW8bit | 704 | 2,304 |
+| SmolLM2-135M | {M135_E} | {M135_C} | {M135_L} | {M135_L8} |
+| SmolLM2-360M | {F360_FUSED} with fp32 AdamW in the backward; {F360_EAGER} with AdamW8bit | does not fit with fp32 AdamW; {F360_COMPILE} with AdamW8bit | {M360_L} | {M360_L8} |
 
 lathe keeps no fp32 gradients: each weight gradient goes from its GEMM to the optimizer as bf16, and AdamW runs inside the backward pass. Its fixed memory is 14 bytes per parameter with fp32 optimizer state and 8.1 with 8-bit state, against PyTorch's 16 (10 with AdamW8bit) plus its autocast copies.
 
-**Fastest configurations** (lathe, tuned; measured the night before the release sitting, same engine code):
+**Fastest configurations** (lathe, tuned; measured {FAST_DATE}, before the release sitting, on the same engine code):
 
 | model | | optimizer state | batch x context | tokens/s | MFU |
 |---|---|---|---|---|---|
-| SmolLM2-135M | context >= 1024 | fp32 | 5 x 1024 | 19,480 | 69.5% |
-| SmolLM2-135M | any context | fp32 | 44 x 128 | 21,536 | 69.0% |
-| SmolLM2-360M | context >= 1024 | 8-bit | 2 x 1152 | 8,171 | 76.0% |
-| SmolLM2-360M | any context | 8-bit | 36 x 64 | 8,903 | 75.9% |
+{FAST_ROWS}
 
 At a fixed number of tokens per step, shorter contexts are faster, since causal attention costs less per token.
 
@@ -82,7 +81,7 @@ At a fixed number of tokens per step, shorter contexts are faster, since causal 
 
 ## Quick start
 
-Needs an sm_89 GPU (RTX 40 series, L4, L40) with 6 GB or more, Linux, CUDA 12.8 at `/usr/local/cuda`, and a Python with CUDA PyTorch (for data prep, the reference and the tests).
+Needs an NVIDIA GPU with 6 GB or more and a target header in `src/targets/`: any sm_89 card with the default `rtx4050` target (schedules tuned for its 20 SMs), or `make TARGET=l4`, `a100` or `g4` (RTX PRO 6000 Blackwell). Linux, CUDA 12.8 at `/usr/local/cuda`, and a Python with CUDA PyTorch (for data prep, the reference and the tests).
 
 ```bash
 python3 -m venv --system-site-packages .venv && .venv/bin/pip install tokenizers pyarrow torchao==0.18.0
