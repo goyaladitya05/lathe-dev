@@ -1,7 +1,0 @@
-// RTX 4050 Laptop: Ada sm_89, 20 SMs, 6 GB, 24 MB L2, 99 KB shared memory per block (opt-in).
-#pragma once
-#include <cstddef>
-
-constexpr int CE_THREADS = 512;                 // threads per cross-entropy row
-constexpr size_t CUBLAS_WORKSPACE = 32u << 20;  // cuBLASLt workspace bytes
-constexpr double SOL_BF16_TFLOPS = 25.61;       // best measured: ref/baseline.py --mode sol (16384^3, fp32 accumulate)

@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model import (DATA, ROOT, Config, Model, from_lathe, get_batch, init_weights, lathe_layout, load_lathe,
+from model import (DATA, ROOT, TARGET_SUFFIX, Config, Model, from_lathe, get_batch, init_weights, lathe_layout, load_lathe,
                    make_optimizer, rope, rope_table)
 
 KERNEL_TOL = 2 ** -8  # rel L2 for kernels with bf16 outputs: one bf16 unit roundoff
@@ -79,7 +79,7 @@ def build_lathe(B, T, adam8=None):
 
 def run_lathe(B, T, *args, adam8=None):
     adam8 = ADAM8 if adam8 is None else adam8
-    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_dwlt' if DW_LT else ''}"
+    exe = ROOT / f"build/train_{MODEL}_b{B}_t{T}{'_adam8' if adam8 else ''}{'_dwlt' if DW_LT else ''}{TARGET_SUFFIX}"
     out = subprocess.run([exe, *map(str, args), *(["--tuned", "1"] if TUNED else [])], capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"lathe failed: {' '.join(map(str, args))}\n{out.stderr}")
@@ -284,7 +284,8 @@ def grad_checks(grads, model, x, y, per_tensor):
     # per_tensor: each tensor within E2E_RATIO (random init: errors are stable, ratios ~1).
     # Otherwise the per-kind median over layers within MEDIAN_RATIO: with pretrained weights, single tensors
     # near massive activations swing several x between equally valid bf16 implementations (rounding luck after
-    # catastrophic cancellation), while the median over layers is stable.
+    # catastrophic cancellation), while the median over layers is stable. A kind with fewer than 3 tensors (the
+    # embedding, the final norm) has no such median: its worst tensor within E2E_RATIO, as with random init.
     x, y = x.cuda(), y.cuda()
     g32, g16 = ref_grads(model, x, y, False), ref_grads(model, x, y, True)
     model.zero_grad(set_to_none=True)
@@ -295,7 +296,7 @@ def grad_checks(grads, model, x, y, per_tensor):
     print(f" every parameter grad ({len(g32)} tensors) vs fp32: lathe / torch-bf16 error ratio by kind")
     for kind, rows in groups.items():
         ratios = [e_l / e_t for e_l, e_t, _ in rows]
-        if per_tensor:
+        if per_tensor or len(rows) < 3:
             e_l, e_t, k = rows[int(np.argmax(ratios))]
             check(f"{kind} ({len(rows)}) worst", e_l, E2E_RATIO * e_t)
         else:

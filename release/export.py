@@ -17,8 +17,8 @@ EXACT = [  # (old, new), each must occur in the export at least once
     ("# ADAM8=1 -> build/..._adam8: 8-bit AdamW moments for the layer matrices (BENCH.md)",
      "# ADAM8=1 -> build/..._adam8: 8-bit AdamW moments for the layer matrices"),
     ("layer weight grads by cuBLASLt instead of own / chisel kernels", "layer weight grads by cuBLASLt instead of own / SASS kernels"),
-    ("# chisel's SASS dW cores for this model and token count, when built (src/chisel/, from chisel's gen/lathe_export.py)",
-     "# prebuilt SASS dW cores for this model and token count, when there are any (src/sass/)"),
+    ("# chisel's SASS dW cores for this model and token count, when built (src/chisel/, from chisel's gen/lathe_export.py); sm_89 only",
+     "# prebuilt SASS dW cores for this model and token count, when there are any (src/sass/); sm_89 only"),
     ("Prints BENCH.md rows", "Prints markdown table rows"),
     (" (BENCH.md): rerun once", ": rerun once"),
     (" (tinygrad's NV backend fails BEAM here, see BENCH.md)", " (tinygrad's NV backend fails BEAM here)"),
@@ -30,7 +30,7 @@ EXACT = [  # (old, new), each must occur in the export at least once
      "// with a prebuilt core run hand-scheduled SASS instead (src/sass/, same bits)."),
     ("(make ADAM8=1; format in BENCH.md \"8-bit AdamW state\")", "(make ADAM8=1)"),
     ("Tuned at 1x704 (chisel e054: 14 blocks", "Tuned at 1x704 (14 blocks"),
-    ("(chisel e066, 8-bit at 1xT)", "(8-bit at 1xT)"),
+    ("(chisel e066, 8-bit at\n// 1xT)", "(8-bit at\n// 1xT)"),  # wrapped in src/targets/rtx4050.h
     ("instead of chisel's / dw_bf16", "instead of the SASS cores / dw_bf16"),
     ("(adamw_stream8, BENCH.md)", "(adamw_stream8)"),
     ("// Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header",
@@ -39,7 +39,7 @@ EXACT = [  # (old, new), each must occur in the export at least once
     ("\"chisel header built for another shape\"", "\"SASS header built for another shape\""),
     ("dw_bf16 / chisel's, head_dw_adamw", "dw_bf16 / SASS, head_dw_adamw"),
     ("the memory-bound kernels\n// after it: chisel e048-e051, e054), and", "the memory-bound kernels\n// after it), and"),
-    ("BENCH.md\nproject.md\n", ""),
+    ("BENCH.md\nproject.md\nFINDINGS.md\nREADME.draft.md\nreports/\nresearch_notes/\n", ""),
 ]
 REGEX = [  # generic rewrites after EXACT
     (r" \(chisel e\d+(?:[-,] ?e\d+)*\)", ""),

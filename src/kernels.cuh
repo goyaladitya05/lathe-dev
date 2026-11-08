@@ -336,7 +336,9 @@ __device__ __forceinline__ void gemm_nn_loop(float (&acc)[WM / 16][8][4], const 
     }
 }
 
-constexpr int GBM = 64, GWM = 16, GST = 3;  // fused-GEMM tiles, swept on sm89 (BENCH.md profiles)
+// GBM, GWM, GST: the fused GEMMs' block rows, warp rows and pipeline stages, per GPU in targets/*.h. The k order is the
+// same for every tile shape, so the results are too.
+static_assert(GBM % GWM == 0 && GWM % 16 == 0 && GST * (GBM + 64) * GBK * 2 <= 48 * 1024, "fused-GEMM tiles");
 static_assert(N % GBM == 0 && QKV_DIM % 64 == 0 && FFN % 64 == 0, "whole GEMM tiles");
 
 // qkv = ln1 . Wqkv^T, then RoPE on the q and k heads, rounding to bf16 before and after the rotation (PyTorch's
@@ -380,10 +382,10 @@ __global__ void __launch_bounds__(GBM / GWM * 32) qkv_rope(bf16* qkv, const bf16
 // Block = GBM tokens x 64 FFN columns. The block's gate and up lines, the epilogue's only DRAM reads, are prefetched
 // into L2 at the start so they arrive while the GEMM runs (chisel e052).
 __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, const bf16* dmo, const bf16* wd, const bf16* gu) {
-    static_assert(GBM / GWM * 32 == 2 * GBM, "one 128-byte line per thread: GBM rows x (64 gate + 64 up columns)");
     __shared__ __align__(128) bf16 sm[GST * (GBM + 64) * GBK];
     const int bm = blockIdx.y * GBM, bn = blockIdx.x * 64;
-    asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (threadIdx.x >> 1)) * 2 * FFN + (threadIdx.x & 1) * FFN + bn));
+    for (int i = threadIdx.x; i < 2 * GBM; i += GBM / GWM * 32)  // 128-byte lines: GBM rows x (64 gate + 64 up columns)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(gu + (size_t)(bm + (i >> 1)) * 2 * FFN + (i & 1) * FFN + bn));
     float acc[GWM / 16][8][4] = {};
     gemm_nn_loop<GBM, GWM, DIM, FFN, GST>(acc, dmo, bm, wd + bn, sm);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, wm0 = (threadIdx.x >> 5) * GWM;
@@ -415,7 +417,7 @@ __global__ void __launch_bounds__(GBM / GWM * 32) down_dx_swiglu(bf16* dgu, cons
 // in those units. P (and dS in backward) are rounded to bf16 for the tensor-core products, as flash attention does.
 // Each thread owns rows g and g+8 of its warp's 16 rows and columns 8j + 2t + {0,1} of the 64-column block.
 constexpr int NT = T / 64;
-// Attention grids: (NT x heads, 1, B) with the head index fastest when ATT_HEAD_FASTEST (models/*.h), so every head's
+// Attention grids: (NT x heads, 1, B) with the head index fastest when ATT_HEAD_FASTEST (targets/*.h), so every head's
 // longest blocks dispatch first, else (NT, heads, B). att_tile: the block's tile in dispatch order; att_head: its head.
 template <int H> __device__ __forceinline__ int att_tile() { return ATT_HEAD_FASTEST ? blockIdx.x / H : blockIdx.x; }
 template <int H> __device__ __forceinline__ int att_head() { return ATT_HEAD_FASTEST ? blockIdx.x % H : blockIdx.y; }
@@ -530,12 +532,17 @@ __global__ void __launch_bounds__(128) attention_dsum(float* Dsum, const bf16* o
     if (!(threadIdx.x & 1)) Dsum[lrow + r] = acc;
 }
 
-// dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over all query tiles that
-// see them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). fp32 partials [N][HEADS][dk 64 | dv 64];
-// attention_bwd_finish sums the heads of each kv group.
+// dk, dv contributions of query head h0 + att_head for 64 key rows (4 warps x 16 keys), over the query tiles that see
+// them, and every pair's dS^T tile into ds ([64 keys][64 queries] bf16). The query tiles are cut into ATT_SPLIT
+// (targets/*.h) equal ranges, one block each (blockIdx.z = b * ATT_SPLIT + range), so no block walks all NT of them.
+// fp32 partials [ATT_SPLIT][N][HEADS][dk 64 | dv 64]; attention_bwd_finish sums the ranges and the group's heads.
+constexpr int SPLIT_NT = (NT + ATT_SPLIT - 1) / ATT_SPLIT;  // query tiles per range
 __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, const bf16* qkv, const bf16* dout,
                                                          const float* lse, const float* Dsum, int h0) {
-    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg, b = blockIdx.z;  // kt = 0 has the most work
+    const int kt = att_tile<GROUP>(), hg = att_head<GROUP>(), h = h0 + hg;  // kt = 0 has the most work
+    const int b = blockIdx.z / ATT_SPLIT, sp = blockIdx.z % ATT_SPLIT;
+    const int q_lo = max(kt, sp * SPLIT_NT), q_hi = min(NT, (sp + 1) * SPLIT_NT);
+    if (q_lo >= q_hi) return;  // a range wholly before the key tile: attention_bwd_finish skips it
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const bf16* seq = qkv + (size_t)b * T * QKV_DIM;
     const bf16* kg = seq + (HEADS + h / GROUP) * HEAD_DIM;
@@ -551,7 +558,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     };
     load_tile(qs[1], kg + (size_t)kt * 64 * QKV_DIM, QKV_DIM);  // K and V staged in buffer 1
     load_tile(dos[1], kg + KV_HEADS * HEAD_DIM + (size_t)kt * 64 * QKV_DIM, QKV_DIM);
-    load_q(kt, 0);
+    load_q(q_lo, 0);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
@@ -563,9 +570,9 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     const float scale = LOG2E / sqrtf((float)HEAD_DIM);
     const int k0 = kt * 64 + warp * 16 + g;
     float dk[8][4] = {}, dv[8][4] = {};
-    for (int qt = kt; qt < NT; qt++) {
-        const int buf = (qt - kt) & 1;
-        if (qt + 1 < NT) load_q(qt + 1, buf ^ 1);
+    for (int qt = q_lo; qt < q_hi; qt++) {
+        const int buf = (qt - q_lo) & 1;
+        if (qt + 1 < q_hi) load_q(qt + 1, buf ^ 1);
         cp_commit();
         cp_wait<1>();
         __syncthreads();
@@ -601,7 +608,7 @@ __global__ void __launch_bounds__(128) attention_bwd_dkv(float* part, bf16* ds, 
     const float k = scale / LOG2E;
 #pragma unroll
     for (int r = 0; r < 2; r++) {
-        float* row = part + (((size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
+        float* row = part + (((size_t)sp * N + (size_t)b * T + k0 + 8 * r) * HEADS + h) * 2 * HEAD_DIM + 2 * t;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
             *(float2*)(row + 8 * j) = {dk[j][2 * r] * k, dk[j][2 * r + 1] * k};
@@ -659,11 +666,12 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
         x2 = __bfloat162float(y[d + HALF]);
     } else {
         const int kv = (u - HEADS) % KV_HEADS, off = u < HEADS + KV_HEADS ? 0 : HEAD_DIM;
-        for (int hh = kv * G; hh < (kv + 1) * G; hh++) {
-            const float* p = part + ((size_t)n * HEADS + hh) * 2 * HEAD_DIM + off;
-            x1 += p[d];
-            x2 += p[d + HALF];
-        }
+        for (int sp = n % T / 64 / SPLIT_NT; sp < ATT_SPLIT && sp * SPLIT_NT < NT; sp++)  // the ranges written for this key
+            for (int hh = kv * G; hh < (kv + 1) * G; hh++) {
+                const float* p = part + (((size_t)sp * N + n) * HEADS + hh) * 2 * HEAD_DIM + off;
+                x1 += p[d];
+                x2 += p[d + HALF];
+            }
     }
     if (u < HEADS + KV_HEADS) {  // inverse rotation
         const float2 c = cs[n % T * HALF + d];
@@ -672,6 +680,43 @@ __global__ void attention_bwd_finish(bf16* dqkv, const float* part, const float2
     } else {
         y[d] = __float2bfloat16(x1);
         y[d + HALF] = __float2bfloat16(x2);
+    }
+}
+
+// Unfused forms for targets where cuBLASLt plus a separate pass beats the fused GEMMs (FUSED_QKV_ROPE, FUSED_DOWN_DX
+// in targets/*.h). RoPE in place on cuBLASLt's bf16 qkv: one thread per rotation pair (token, q or k head, d < 32).
+__global__ void rope_qkv(bf16* qkv, const float2* cs) {
+    constexpr int ROT = HEADS + KV_HEADS;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * ROT * 32) return;
+    const int d = i % 32, u = i / 32 % ROT, n = i / (32 * ROT);
+    bf16* y = qkv + (size_t)n * QKV_DIM + u * 64 + d;
+    const float x1 = __bfloat162float(y[0]), x2 = __bfloat162float(y[32]);
+    const float2 c = cs[n % T * 32 + d];
+    y[0] = __float2bfloat16(x1 * c.x - x2 * c.y);
+    y[32] = __float2bfloat16(x2 * c.x + x1 * c.y);
+}
+
+// down_dx_swiglu's epilogue on cuBLASLt's bf16 dact = dmo . Wd, 8 FFN columns per thread.
+__global__ void swiglu_bwd(bf16* dgu, const bf16* dact, const bf16* gu) {
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t)N * FFN) return;
+    const size_t n = i / FFN, c = i % FFN;
+    float da[8], gv[8], uv[8];
+    load8(da, dact + i);
+    load8(gv, gu + n * 2 * FFN + c);
+    load8(uv, gu + n * 2 * FFN + FFN + c);
+#pragma unroll
+    for (int e = 0; e < 8; e += 2) {
+        float dg[2], du[2];
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const float g = gv[e + k], sig = 1.f / (1.f + expf(-g));
+            du[k] = da[e + k] * round_bf16(g / (1.f + expf(-g)));
+            dg[k] = round_bf16(da[e + k] * uv[e + k]) * sig * (1.f + g * (1.f - sig));
+        }
+        *(bf162*)(dgu + n * 2 * FFN + c + e) = __floats2bfloat162_rn(dg[0], dg[1]);
+        *(bf162*)(dgu + n * 2 * FFN + FFN + c + e) = __floats2bfloat162_rn(du[0], du[1]);
     }
 }
 

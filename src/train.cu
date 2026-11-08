@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #include MODEL_H  // models/<MODEL>.h, from the Makefile
-#include "targets/sm89.h"
+#include TARGET_H  // targets/<TARGET>.h, from the Makefile
 
 constexpr int B = BATCH, T = SEQ, N = B * T;  // kernels.cuh specializes on these
 // AdamW, same as ref/model.py make_optimizer.
@@ -60,7 +60,8 @@ static_assert(!ADAM8 || (P_MAT % Q8_BLOCK == 0 && P_QKV % Q8_BLOCK == 0), "whole
 
 // Layer dW cores in hand-scheduled SASS from chisel (github goyaladitya05/chisel, gen/lathe_export.py): one header
 // per model and token count (CHISEL_DW_H, from the Makefile) with the cubins of the four matrix shapes. Shapes without
-// one use dw_bf16; the bits are the same either way (chisel e037).
+// one use dw_bf16; the bits are the same either way (chisel e037). sm_89 targets only (the Makefile).
+#if defined(CHISEL_DW_H)
 #if __has_include(CHISEL_DW_H)
 #include CHISEL_DW_H
 #define HAVE_CHISEL_DW 1
@@ -68,6 +69,7 @@ static_assert(chisel_dw_qkv_m == QKV_DIM && chisel_dw_qkv_n == DIM && chisel_dw_
                   chisel_dw_gu_m == 2 * FFN && chisel_dw_gu_n == DIM && chisel_dw_down_m == DIM && chisel_dw_down_n == FFN &&
                   chisel_dw_qkv_k == N && chisel_dw_o_k == N && chisel_dw_gu_k == N && chisel_dw_down_k == N,
               "chisel header built for another shape");
+#endif
 #endif
 
 #define CK(x) ck_cuda((x), #x, __LINE__)
@@ -141,8 +143,9 @@ struct Bwd {
     bf16* datt;      // [N][DIM]
     bf16* dqkv;      // [N][QKV_DIM]
     bf16* dgu;       // [N][2*FFN]
+    bf16* dact;      // [N][FFN] grad of the SwiGLU output, !FUSED_DOWN_DX only
     float* dsum;     // [B][HEADS][T] rowsum(dO * O)
-    float* part;     // [N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
+    float* part;     // [ATT_SPLIT][N][HEADS][2*HEAD_DIM] per-head dk | dv, summed by attention_bwd_finish
     float* dw_part;  // [N / NORM_ROWS][DIM] per-block norm weight grads
     float* gemb_rows;  // [N][DIM] fp32 head grads of the batch's embedding rows, by segment
     bf16* gring;     // [RING][P_MAT] matrix grads of the last RING layers, until their AdamW pass (in a.logits)
@@ -235,8 +238,9 @@ static void carve(Arena& ar, State& s, bool dumping) {  // test-only buffers exi
     g.datt = ar.take<bf16>(ND);
     g.dqkv = ar.take<bf16>((size_t)N * QKV_DIM);
     g.dgu = ar.take<bf16>((size_t)N * 2 * FFN);
+    g.dact = FUSED_DOWN_DX ? nullptr : ar.take<bf16>((size_t)N * FFN);
     g.dsum = ar.take<float>((size_t)N * HEADS);
-    g.part = ar.take<float>((size_t)N * HEADS * 2 * HEAD_DIM);
+    g.part = ar.take<float>((size_t)ATT_SPLIT * N * HEADS * 2 * HEAD_DIM);
     g.dw_part = ar.take<float>((size_t)N / NORM_ROWS * DIM);
     g.gemb_rows = ar.take<float>(ND);
     g.gring = IN_LOGITS ? a.logits : ar.take<bf16>(RING_N);
@@ -331,7 +335,8 @@ static void gemm(const State& s, const Gemm& g, void* d, const bf16* a, const bf
 }
 
 // The cuBLASLt GEMMs of linears y = x W^T, W [out][in] row-major, x/y [N][features] row-major. The qkv forward,
-// the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw).
+// the down dX and every dW are own kernels (qkv_rope, down_dx_swiglu, dw_bf16 / chisel's, head_dw_adamw), unless
+// the target unfuses the first two (FUSED_QKV_ROPE, FUSED_DOWN_DX) or DW_LT=1 takes the dWs.
 // Forward y[N][out] = x W^T (A = W, B = x); input grad dx[N][in] = dy W (A = W, B = dy).
 static Gemm make_fwd(const char* name, int out, int in) { return make_gemm(name, true, false, out, N, in); }
 // DW_LT=1: weight grad dW[out][in] = dy^T x by cuBLASLt into the gradient ring (A = x [N][in], B = dy [N][out]^T).
@@ -357,6 +362,7 @@ struct Lins {
     Gemm o, gu, down, head;             // forward
     Gemm qkv_dx, o_dx, gu_dx, head_dx;  // input grads
     Gemm qkv_dw, o_dw, gu_dw, down_dw;  // DW_LT: weight grads
+    Gemm qkv, down_dx;                  // !FUSED_QKV_ROPE, !FUSED_DOWN_DX
 };
 
 // cuBLASLt algorithm by measurement. --tune 1: for every GEMM, up to LT_CANDIDATES heuristic candidates are timed on
@@ -557,7 +563,12 @@ static void forward(State& s, const Lins& L, FILE* df) {
 
         put("res", res, 1, DIM);
         put("ln1", ln1, 0, DIM);
-        qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        if constexpr (FUSED_QKV_ROPE) {
+            qkv_rope<<<dim3(QKV_DIM / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(qkv, ln1, w.qkv, s.rope);
+        } else {
+            gemm(s, L.qkv, qkv, w.qkv, ln1);
+            rope_qkv<<<cdiv(N * (HEADS + KV_HEADS) * 32, 256), 256, 0, stream>>>(qkv, s.rope);
+        }
         mark("fwd qkv GEMM + RoPE");
         put("qkv", qkv, 0, QKV_DIM);
         attention_fwd<<<att_grid(HEADS), 128, 0, stream>>>(att, lse, qkv);
@@ -613,7 +624,9 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
         bf16* buf = ds + (size_t)(k % 2) * DS_GROUP;
         CK(cudaStreamWaitEvent(att_stream[k], ev_fork));
         if (k >= 2) CK(cudaStreamWaitEvent(att_stream[k], ev_att[k - 2]));
-        attention_bwd_dkv<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
+        dim3 grid = att_grid(GROUP);
+        grid.z *= ATT_SPLIT;
+        attention_bwd_dkv<<<grid, 128, 0, att_stream[k]>>>(part, buf, qkv, dout, lse, dsum, k * GROUP);
         attention_bwd_dq<<<att_grid(GROUP), 128, 0, att_stream[k]>>>(dqkv, buf, qkv, k * GROUP);
         CK(cudaEventRecord(ev_att[k], att_stream[k]));
     }
@@ -621,14 +634,14 @@ static void attention_backward(float* part, bf16* dqkv, float* dsum, bf16* ds, c
 }
 
 // Layer weight grads go to a ring of RING per-layer buffers (dW cores on the main stream); each layer's AdamW is
-// adamw_stream on the side stream, started with a kernel of the next layer's backward (ADAMW_AT, models/*.h: a window
+// adamw_stream on the side stream, started with a kernel of the next layer's backward (ADAMW_AT, targets/*.h: a window
 // of compute-bound kernels; wider passes slow what they run beside, narrower ones spill into the memory-bound kernels
 // after it: chisel e048-e051, e054), and joined at the end of backward. The ring slot a layer writes was last read by
 // the pass of the layer RING above.
-static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see models/*.h");
+static_assert(ADAMW_AT >= 0 && ADAMW_AT <= 8 && ADAMW_BLOCKS > 0, "ADAMW_AT: 0..8, see targets/*.h");
 // 8-bit state builds have their own start and width (the pass moves 16.25 instead of 28 bytes per parameter).
 constexpr int PASS_AT = ADAM8 ? ADAMW_AT8 : ADAMW_AT, PASS_BLOCKS = ADAM8 ? ADAMW_BLOCKS8 : ADAMW_BLOCKS;
-static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see models/*.h");
+static_assert(PASS_AT >= 0 && PASS_AT <= 8 && PASS_BLOCKS > 0, "ADAMW_AT8: 0..8, see targets/*.h");
 static void backward(State& s, const Lins& L, FILE* df) {
     Acts& a = s.a;
     Bwd& g = s.g;
@@ -675,14 +688,19 @@ static void backward(State& s, const Lins& L, FILE* df) {
         bf16* act = a.act + (size_t)l * N * FFN;
         float* lse = a.lse + (size_t)l * N * HEADS;
         const LayerDump put{df, l};
-        auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in models/*.h)
+        auto at = [&](int k) {  // before kernel k of this layer's backward (numbering in targets/*.h)
             if (k == PASS_AT && l + 1 < LAYERS) adamw_pass(l + 1, 0, P_MAT);
             if (ADAMW_SPLIT_LAST && k == 6 && l == 0) adamw_pass(0, P_QKV, P_MAT);
         };
 
         put("dres_out", g.dres, 1, DIM);
         at(0);
-        down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        if constexpr (FUSED_DOWN_DX) {
+            down_dx_swiglu<<<dim3(FFN / 64, N / GBM), GBM / GWM * 32, 0, stream>>>(g.dgu, g.dres_bf, w.down, gu);
+        } else {
+            gemm(s, L.down_dx, g.dact, w.down, g.dres_bf);
+            swiglu_bwd<<<cdiv((size_t)N * FFN / 8, 256), 256, 0, stream>>>(g.dgu, g.dact, gu);
+        }
         mark("bwd down dX GEMM + SwiGLU bwd");
         if (l + RING < LAYERS) CK(cudaStreamWaitEvent(stream, ev_ring[l % RING]));  // the slot's previous pass is done
         at(1);
@@ -892,6 +910,11 @@ int main(int argc, char** argv) {
     if ((steps > 0) == (evals > 0)) die("pass exactly one of --steps or --eval");
 
     CK(cudaSetDevice(0));
+    cudaDeviceProp prop;
+    CK(cudaGetDeviceProperties(&prop, 0));
+    if (prop.major * 10 + prop.minor != TARGET_CC) die("this build is for another GPU (make TARGET=..., src/targets/)");
+    if (prop.multiProcessorCount != TARGET_SMS)
+        printf("note: %d SMs, the target header assumes %d (schedules untuned here)\n", prop.multiProcessorCount, TARGET_SMS);
     int least, greatest;
     CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
     CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
@@ -921,9 +944,13 @@ int main(int argc, char** argv) {
               make_dx("qkv dX", QKV_DIM, DIM),        make_dx("o dX", DIM, DIM),
               make_dx("gate_up dX", 2 * FFN, DIM),    make_dx("head dX", VOCAB, DIM),
               DW_LT ? make_dw("qkv dW", QKV_DIM, DIM) : Gemm{}, DW_LT ? make_dw("o dW", DIM, DIM) : Gemm{},
-              DW_LT ? make_dw("gate_up dW", 2 * FFN, DIM) : Gemm{}, DW_LT ? make_dw("down dW", DIM, FFN) : Gemm{}};
+              DW_LT ? make_dw("gate_up dW", 2 * FFN, DIM) : Gemm{}, DW_LT ? make_dw("down dW", DIM, FFN) : Gemm{},
+              FUSED_QKV_ROPE ? Gemm{} : make_fwd("qkv fwd", QKV_DIM, DIM),
+              FUSED_DOWN_DX ? Gemm{} : make_dx("down dX", DIM, FFN)};
     std::vector<Gemm*> all = {&L.o, &L.gu, &L.down, &L.head, &L.qkv_dx, &L.o_dx, &L.gu_dx, &L.head_dx};
     if (DW_LT) all.insert(all.end(), {&L.qkv_dw, &L.o_dw, &L.gu_dw, &L.down_dw});
+    if (!FUSED_QKV_ROPE) all.push_back(&L.qkv);
+    if (!FUSED_DOWN_DX) all.push_back(&L.down_dx);
     if (tune) tune_gemms(all);
     else if (tuned) load_tuned(all);
 

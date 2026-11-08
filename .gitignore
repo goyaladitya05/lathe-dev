@@ -5,6 +5,10 @@ data/*
 !data/prep.py
 BENCH.md
 project.md
+FINDINGS.md
+README.draft.md
+reports/
+research_notes/
 *.nsys-rep
 *.sqlite
 .venv-tinygrad/

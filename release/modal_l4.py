@@ -102,12 +102,12 @@ SHAPES = [(m, b, t) for m in ("smol135", "smol360") for b, t in ((1, 2048), (2, 
 @app.function(timeout=3 * 3600, **GPU)
 def bench(m: str, b: int, t: int):
     # One shape per container, every stack on the same card (Modal L4s differ by ~10% in measured peak), two sittings.
-    # MFU against this card's measured bf16 GEMM peak (written into this copy's targets/sm89.h).
+    # MFU against this card's measured bf16 GEMM peak (written into this copy's targets/rtx4050.h).
     w = setup("main")
     log = Log(f"bench_{m}_{b}x{t}.log")
     out = log.run("python ref/baseline.py --mode sol", w)
     peak = max(float(x) for x in re.findall(r"\d+\^3 \| ([\d.]+)", out))  # best size, as on the laptop
-    h = w / "src/targets/sm89.h"
+    h = w / "src/targets/rtx4050.h"
     h.write_text(re.sub(r"SOL_BF16_TFLOPS = [\d.]+", f"SOL_BF16_TFLOPS = {peak}", h.read_text()))
     log.say(f"# MFU below against {peak} TFLOPS (this L4, measured)")
     tune(log, w, m, b, t, "DW_LT=1")
